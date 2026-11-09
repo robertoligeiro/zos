@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -43,7 +43,7 @@ def cargo(*args: str) -> None:
 
 
 def build(case: str | None = None) -> Path:
-    args = ["build", "--release", "--package", "zos-kernel", "--no-default-features"]
+    args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     if case:
         args += ["--features", CASES[case][0]]
     cargo(*args)
@@ -70,7 +70,7 @@ def image(kernel: Path, case: str | None = None) -> Path:
     return destination
 
 
-def qemu_command(disk: Path, firmware: str) -> list[str]:
+def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False) -> list[str]:
     directory = TOOLS / "qemu"
     executable = directory / "qemu-system-x86_64.exe"
     if not executable.is_file():
@@ -82,8 +82,10 @@ def qemu_command(disk: Path, firmware: str) -> list[str]:
         str(executable), "-L", str(bios.parent), "-accel", "tcg", "-machine", "pc",
         "-cpu", "max", "-smp", "1", "-m", "256M", "-nic", "none",
         "-drive", f"file={disk},format=raw,if=ide,snapshot=on",
-        "-no-reboot", "-no-shutdown",
+        "-no-reboot",
     ]
+    if not exit_on_shutdown:
+        command.append("-no-shutdown")
     if firmware == "uefi":
         code = next(directory.rglob("edk2-x86_64-code.fd"), None)
         variables = next(directory.rglob("edk2-i386-vars.fd"), None)
@@ -121,7 +123,7 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     stderr = BUILD / f"{firmware}-{case}.qemu.log"
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware) + [
+    command = qemu_command(disk, firmware, exit_on_shutdown=True) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     ]
@@ -142,45 +144,6 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     print(f"PASS {firmware}/{case}: serial, framebuffer initialized, timer, expected exit", flush=True)
 
 
-class Qmp:
-    def __init__(self, process: subprocess.Popen, port: int, timeout: int) -> None:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                self.connection = socket.create_connection(("127.0.0.1", port), timeout=1)
-                break
-            except (ConnectionRefusedError, TimeoutError):
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError("QEMU did not open its local QMP endpoint")
-                time.sleep(0.1)
-        self.connection.settimeout(timeout)
-        self.stream = self.connection.makefile("rwb")
-        greeting = self.receive()
-        if "QMP" not in greeting:
-            raise RuntimeError(f"Unexpected QMP greeting: {greeting}")
-        self.execute("qmp_capabilities")
-
-    def receive(self) -> dict:
-        line = self.stream.readline()
-        if not line:
-            raise RuntimeError("QMP connection closed unexpectedly")
-        return json.loads(line)
-
-    def execute(self, command: str, arguments: dict | None = None) -> dict:
-        self.stream.write(json.dumps({"execute": command, "arguments": arguments or {}}).encode() + b"\n")
-        self.stream.flush()
-        while True:
-            response = self.receive()
-            if "error" in response:
-                raise RuntimeError(f"QMP {command}: {response['error']}")
-            if "return" in response:
-                return response
-
-    def close(self) -> None:
-        self.stream.close()
-        self.connection.close()
-
-
 def screenshot(disk: Path, firmware: str, timeout: int) -> None:
     log = BUILD / f"{firmware}-screen.serial.log"
     stderr = BUILD / f"{firmware}-screen.qemu.log"
@@ -188,19 +151,16 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
     picture.unlink(missing_ok=True)
-    # Bind an ephemeral local port rather than assuming a globally available one.
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
     command = qemu_command(disk, firmware) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
-        "-qmp", f"tcp:127.0.0.1:{port},server=on,wait=off",
+        "-qmp", "stdio",
     ]
     with stderr.open("wb") as errors:
-        process = subprocess.Popen(command, cwd=ROOT, stdout=errors, stderr=errors)
-        qmp = None
+        process = subprocess.Popen(
+            command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
+        )
+        reader = ThreadPoolExecutor(max_workers=1)
         try:
-            qmp = Qmp(process, port, timeout)
             deadline = time.monotonic() + timeout
             while True:
                 text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
@@ -214,19 +174,50 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             for marker in (*COMMON_MARKERS, f"FIRMWARE: {firmware.upper()}"):
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: screenshot boot log missing {marker}")
-            qmp.execute("screendump", {"filename": str(picture)})
+            requests = [
+                {"execute": "qmp_capabilities", "id": "capabilities"},
+                {"execute": "screendump", "arguments": {"filename": str(picture)}, "id": "capture"},
+                {"execute": "quit", "id": "quit"},
+            ]
+            with (BUILD / f"{firmware}-screen.qmp.log").open("wb") as protocol_log:
+                def receive() -> dict:
+                    try:
+                        line = reader.submit(process.stdout.readline).result(timeout=timeout)
+                    except TimeoutError as error:
+                        raise RuntimeError("QMP response timed out") from error
+                    if not line:
+                        raise RuntimeError("QMP closed before capture completed")
+                    protocol_log.write(line)
+                    protocol_log.flush()
+                    return json.loads(line)
+
+                if "QMP" not in receive():
+                    raise RuntimeError("Missing QMP greeting")
+                for request in requests:
+                    # Complete capability negotiation before submitting later commands.
+                    process.stdin.write(json.dumps(request).encode() + b"\n")
+                    process.stdin.flush()
+                    while True:
+                        response = receive()
+                        if "error" in response:
+                            raise RuntimeError(f"QMP capture failed: {response['error']}")
+                        if response.get("id") == request["id"] and "return" in response:
+                            break
+            process.wait(timeout=timeout)
             pixels = picture.read_bytes()
             if not pixels.startswith(b"P6\n") or len(pixels) < 1024:
                 raise RuntimeError("Invalid QEMU framebuffer dump")
-            qmp.execute("quit")
-            if process.wait(timeout=10) != 0:
+            if process.returncode != 0:
                 raise RuntimeError("Screenshot QEMU did not shut down cleanly")
         finally:
-            if qmp is not None:
-                qmp.close()
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            reader.shutdown(wait=True)
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
     print(f"CAPTURE {firmware}: {picture} (inspect text visually)", flush=True)
 
 
@@ -235,7 +226,7 @@ def check() -> None:
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
     for case in [None, *CASES]:
-        args = ["clippy", "--release", "--package", "zos-kernel", "--no-default-features"]
+        args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
         if case:
             args += ["--features", CASES[case][0]]
         cargo(*args, "--", "-D", "warnings")

@@ -22,8 +22,12 @@ const TIMER_VECTOR: u8 = 32;
 struct Stack {
     _bytes: [u8; 32 * 1024],
 }
-static mut DOUBLE_FAULT_STACK: Stack = Stack { _bytes: [0; 32 * 1024] };
-static mut PRIVILEGE_STACK: Stack = Stack { _bytes: [0; 32 * 1024] };
+static mut DOUBLE_FAULT_STACK: Stack = Stack {
+    _bytes: [0; 32 * 1024],
+};
+static mut PRIVILEGE_STACK: Stack = Stack {
+    _bytes: [0; 32 * 1024],
+};
 
 static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
@@ -31,8 +35,7 @@ static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let privilege = core::ptr::addr_of!(PRIVILEGE_STACK) as u64;
     tss.interrupt_stack_table[DOUBLE_FAULT_IST as usize] =
         VirtAddr::new(double_fault + core::mem::size_of::<Stack>() as u64);
-    tss.privilege_stack_table[0] =
-        VirtAddr::new(privilege + core::mem::size_of::<Stack>() as u64);
+    tss.privilege_stack_table[0] = VirtAddr::new(privilege + core::mem::size_of::<Stack>() as u64);
     tss
 });
 
@@ -105,7 +108,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.invalid_tss.set_handler_fn(invalid_tss);
     idt.segment_not_present.set_handler_fn(segment_missing);
     idt.stack_segment_fault.set_handler_fn(stack_fault);
-    idt.general_protection_fault.set_handler_fn(general_protection);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection);
     idt.page_fault.set_handler_fn(page_fault);
     idt.x87_floating_point.set_handler_fn(x87);
     idt.alignment_check.set_handler_fn(alignment);

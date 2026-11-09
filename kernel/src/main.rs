@@ -41,11 +41,7 @@ pub fn finish_test(success: bool) -> ! {
     ))]
     // SAFETY: this test-only QEMU device is configured at port 0xf4 by the harness.
     unsafe {
-        x86_64::instructions::port::Port::<u32>::new(0xf4).write(if success {
-            0x10
-        } else {
-            0x11
-        });
+        x86_64::instructions::port::Port::<u32>::new(0xf4).write(if success { 0x10 } else { 0x11 });
     }
     let _ = success;
     halt()
@@ -57,7 +53,10 @@ pub extern "C" fn _start() -> ! {
     serial::init();
     logln!("ZOS - Zombie OS");
     logln!("ZOS booting");
-    assert!(boot::BASE_REVISION.is_supported(), "Unsupported Limine revision");
+    assert!(
+        boot::BASE_REVISION.is_supported(),
+        "Unsupported Limine revision"
+    );
     framebuffer::init();
     logln!("ZOS - Zombie OS");
     logln!("ZOS booting");

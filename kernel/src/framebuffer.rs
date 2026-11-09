@@ -75,8 +75,13 @@ impl Write for Terminal {
 }
 
 pub fn init() {
-    let response = crate::boot::FRAMEBUFFER.response().expect("Framebuffer missing");
-    let fb = response.framebuffers().first().expect("No framebuffer returned");
+    let response = crate::boot::FRAMEBUFFER
+        .response()
+        .expect("Framebuffer missing");
+    let fb = response
+        .framebuffers()
+        .first()
+        .expect("No framebuffer returned");
     assert_eq!(fb.bpp, 32, "Boot console requires RGB32");
     assert_eq!(fb.memory_model, limine::framebuffer::FRAMEBUFFER_RGB);
     assert!(fb.width >= 8 && fb.height >= 16);
@@ -105,14 +110,20 @@ pub fn init() {
     };
     terminal.clear();
     *TERMINAL.lock() = Some(terminal);
-    crate::logln!("FRAMEBUFFER ready: {}x{}, embedded 8x16 font", fb.width, fb.height);
+    crate::logln!(
+        "FRAMEBUFFER ready: {}x{}, embedded 8x16 font",
+        fb.width,
+        fb.height
+    );
 }
 
 pub fn print(args: fmt::Arguments<'_>) {
     // Fault-time screen output is best effort; never deadlock on an interrupted writer.
     if let Some(mut terminal) = TERMINAL.try_lock() {
         if let Some(terminal) = terminal.as_mut() {
-            terminal.write_fmt(args).expect("Framebuffer formatting failed");
+            terminal
+                .write_fmt(args)
+                .expect("Framebuffer formatting failed");
         }
     }
 }

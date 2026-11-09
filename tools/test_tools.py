@@ -1,12 +1,16 @@
+import json
 import struct
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
 import zlib
 
 from mkimage import (
     BIOS_END, BIOS_START, BUILD, ESP_END, ESP_START, SECTOR, SECTORS,
     create_image, image_path, long_entries, short_name,
 )
-from zos import CASES, COMMON_MARKERS, validate_log
+from zos import CASES, COMMON_MARKERS, qemu_command, screenshot, validate_log
 
 
 class ImageTests(unittest.TestCase):
@@ -151,6 +155,67 @@ class ImageTests(unittest.TestCase):
 
 
 class AcceptanceHarnessTests(unittest.TestCase):
+    def test_screenshot_negotiates_stdio_qmp_before_capture_and_quit(self):
+        BUILD.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=BUILD) as directory:
+            output = Path(directory)
+            serial_text = "\n".join(
+                (*COMMON_MARKERS, "FIRMWARE: BIOS", "ZOS ready: boot checkpoint")
+            )
+            replies = iter([
+                b'{"QMP": {}}\n',
+                b'{"return": {}, "id": "capabilities"}\n',
+                b'{"return": {}, "id": "capture"}\n',
+                b'{"return": {}, "id": "quit"}\n',
+            ])
+            process = Mock(returncode=0)
+            process.poll.return_value = 0
+            read_count = 0
+            commands = []
+
+            def receive():
+                nonlocal read_count
+                read_count += 1
+                return next(replies)
+
+            def send(payload):
+                request = json.loads(payload)
+                self.assertEqual(read_count, len(commands) + 1)
+                commands.append(request["id"])
+                if request["id"] == "capture":
+                    Path(request["arguments"]["filename"]).write_bytes(
+                        b"P6\n32 32\n255\n" + bytes(32 * 32 * 3)
+                    )
+
+            process.stdout.readline.side_effect = receive
+            process.stdin.write.side_effect = send
+
+            def launch_process(*args, **kwargs):
+                (output / "bios-screen.serial.log").write_text(serial_text, encoding="utf-8")
+                return process
+
+            with patch("zos.BUILD", output), patch("zos.qemu_command", return_value=["qemu"]), \
+                    patch("zos.subprocess.Popen", side_effect=launch_process) as launch:
+                screenshot(BUILD / "zos.img", "bios", 5)
+            self.assertEqual(commands, ["capabilities", "capture", "quit"])
+            self.assertEqual(launch.call_args.args[0][-2:], ["-qmp", "stdio"])
+            process.kill.assert_not_called()
+
+    def test_guest_shutdown_exits_acceptance_vm_but_preserves_interactive_vm(self):
+        BUILD.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=BUILD) as directory:
+            tools = Path(directory)
+            qemu = tools / "qemu"
+            qemu.mkdir()
+            (qemu / "qemu-system-x86_64.exe").touch()
+            (qemu / "bios-256k.bin").touch()
+            with patch("zos.TOOLS", tools):
+                normal = qemu_command(BUILD / "zos.img", "bios")
+                acceptance = qemu_command(BUILD / "zos-boot.img", "bios", exit_on_shutdown=True)
+            self.assertIn("-no-shutdown", normal)
+            self.assertNotIn("-no-shutdown", acceptance)
+            self.assertIn("-no-reboot", acceptance)
+
     def valid_log(self, firmware, case):
         result = "\n".join((*COMMON_MARKERS, f"FIRMWARE: {firmware}", CASES[case][1]))
         result = result.replace("TIMER PASS:", "TIMER PASS: ticks=100")

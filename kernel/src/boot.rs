@@ -43,7 +43,9 @@ static END: limine::RequestsEndMarker = limine::RequestsEndMarker::new();
 pub fn report() {
     let memory = MEMORY_MAP.response().expect("Limine memory map missing");
     let hhdm = HHDM.response().expect("Limine HHDM missing");
-    let executable = EXECUTABLE.response().expect("Limine executable address missing");
+    let executable = EXECUTABLE
+        .response()
+        .expect("Limine executable address missing");
     let firmware = FIRMWARE.response().expect("Limine firmware type missing");
     let mode = match firmware.firmware_type {
         0 => "BIOS",
