@@ -1,0 +1,183 @@
+import struct
+import unittest
+import zlib
+
+from mkimage import (
+    BIOS_END, BIOS_START, BUILD, ESP_END, ESP_START, SECTOR, SECTORS,
+    create_image, image_path, long_entries, short_name,
+)
+from zos import CASES, COMMON_MARKERS, validate_log
+
+
+class ImageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.path = image_path("unittest-layout.img")
+        cls.payload = bytes(range(256)) * 9
+        create_image(cls.path, {
+            "limine.conf": b"ZOS test configuration",
+            "limine-bios.sys": cls.payload,
+            "EFI/BOOT/BOOTX64.EFI": b"mock EFI executable",
+            "boot/zos.elf": b"mock kernel",
+        })
+        cls.stream = cls.path.open("rb")
+        cls.stream.seek(ESP_START * SECTOR)
+        cls.boot = cls.stream.read(SECTOR)
+        cls.fat_sectors = struct.unpack_from("<I", cls.boot, 36)[0]
+        cls.data_start = ESP_START + 32 + 2 * cls.fat_sectors
+        cls.stream.seek((ESP_START + 32) * SECTOR)
+        cls.fat = cls.stream.read(cls.fat_sectors * SECTOR)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stream.close()
+        cls.path.unlink()
+
+    def read_at(self, offset, count):
+        self.stream.seek(offset)
+        return self.stream.read(count)
+
+    def chain(self, cluster):
+        seen = set()
+        result = bytearray()
+        while cluster < 0x0FFFFFF8:
+            self.assertNotIn(cluster, seen, "FAT cluster chain loops")
+            self.assertGreaterEqual(cluster, 2)
+            seen.add(cluster)
+            result.extend(self.read_at((self.data_start + cluster - 2) * SECTOR, SECTOR))
+            cluster = struct.unpack_from("<I", self.fat, cluster * 4)[0] & 0x0FFFFFFF
+        return bytes(result)
+
+    def directory(self, cluster):
+        result = {}
+        long_parts = {}
+        expected_checksum = None
+        for offset in range(0, len(data := self.chain(cluster)), 32):
+            entry = data[offset:offset + 32]
+            if entry[0] == 0:
+                break
+            if entry[11] == 0x0F:
+                if entry[0] & 0x40:
+                    long_parts = {}
+                    expected_checksum = entry[13]
+                self.assertEqual(entry[13], expected_checksum)
+                long_parts[entry[0] & 0x1F] = entry[1:11] + entry[14:26] + entry[28:32]
+                continue
+            if long_parts:
+                checksum = 0
+                for byte in entry[:11]:
+                    checksum = (((checksum & 1) << 7) + (checksum >> 1) + byte) & 0xFF
+                self.assertEqual(checksum, expected_checksum)
+                encoded = b"".join(long_parts[index] for index in sorted(long_parts))
+                name = encoded.decode("utf-16le").split("\0", 1)[0]
+            else:
+                name = entry[:8].decode().strip()
+                extension = entry[8:11].decode().strip()
+                if extension:
+                    name += "." + extension
+            first = (struct.unpack_from("<H", entry, 20)[0] << 16) | struct.unpack_from("<H", entry, 26)[0]
+            result[name] = (first, struct.unpack_from("<I", entry, 28)[0], entry[11])
+            long_parts = {}
+        return result
+
+    def test_primary_and_backup_gpt_crc_and_partition_extents(self):
+        self.assertEqual(self.path.stat().st_size, SECTORS * SECTOR)
+        self.assertEqual(self.read_at(510, 2), b"\x55\xaa")
+        self.assertEqual(self.read_at(450, 1), b"\xee")
+        for current, backup in [(1, SECTORS - 1), (SECTORS - 1, 1)]:
+            header = bytearray(self.read_at(current * SECTOR, 92))
+            self.assertEqual(header[:8], b"EFI PART")
+            self.assertEqual(struct.unpack_from("<QQ", header, 24), (current, backup))
+            expected = struct.unpack_from("<I", header, 16)[0]
+            struct.pack_into("<I", header, 16, 0)
+            self.assertEqual(zlib.crc32(header), expected)
+            table_lba = struct.unpack_from("<Q", header, 72)[0]
+            entries = self.read_at(table_lba * SECTOR, 16384)
+            self.assertEqual(zlib.crc32(entries), struct.unpack_from("<I", header, 88)[0])
+            self.assertEqual(struct.unpack_from("<QQ", entries, 32), (BIOS_START, BIOS_END))
+            self.assertEqual(struct.unpack_from("<QQ", entries, 160), (ESP_START, ESP_END))
+
+    def test_fat32_geometry_backups_and_mirrored_tables(self):
+        self.assertEqual(self.boot[510:512], b"\x55\xaa")
+        self.assertEqual(self.boot[82:90], b"FAT32   ")
+        self.assertEqual(struct.unpack_from("<H", self.boot, 11)[0], SECTOR)
+        self.assertEqual(self.boot[13], 1)
+        total = struct.unpack_from("<I", self.boot, 32)[0]
+        clusters = total - 32 - 2 * self.fat_sectors
+        self.assertGreaterEqual(clusters, 65525)
+        self.assertGreaterEqual(len(self.fat) // 4, clusters + 2)
+        self.assertEqual(self.read_at((ESP_START + 6) * SECTOR, SECTOR), self.boot)
+        self.assertEqual(self.read_at((ESP_START + 32 + self.fat_sectors) * SECTOR, len(self.fat)), self.fat)
+        info = self.read_at((ESP_START + 1) * SECTOR, SECTOR)
+        self.assertEqual(struct.unpack_from("<I", info, 0)[0], 0x41615252)
+        self.assertEqual(struct.unpack_from("<I", info, 484)[0], 0x61417272)
+        self.assertEqual(info, self.read_at((ESP_START + 7) * SECTOR, SECTOR))
+
+    def test_bootloader_long_filenames_and_multi_cluster_payload(self):
+        root = self.directory(2)
+        cluster, length, attributes = root["limine-bios.sys"]
+        self.assertEqual(attributes, 0x20)
+        self.assertEqual(self.chain(cluster)[:length], self.payload)
+        cluster, length, _ = root["limine.conf"]
+        self.assertEqual(self.chain(cluster)[:length], b"ZOS test configuration")
+
+    def test_uefi_boot_path_and_directory_parents(self):
+        root = self.directory(2)
+        efi = self.directory(root["EFI"][0])
+        self.assertEqual(efi[".."][0], 0)
+        boot = self.directory(efi["BOOT"][0])
+        self.assertEqual(boot[".."][0], root["EFI"][0])
+        cluster, length, _ = boot["BOOTX64.EFI"]
+        self.assertEqual(self.chain(cluster)[:length], b"mock EFI executable")
+        kernel_dir = self.directory(root["boot"][0])
+        cluster, length, _ = kernel_dir["zos.elf"]
+        self.assertEqual(self.chain(cluster)[:length], b"mock kernel")
+
+    def test_image_targets_cannot_escape_build(self):
+        for name in ("../disk.img", "..\\disk.img", "C:\\disk.img", "C:disk.img", "disk.bin", ""):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                image_path(name)
+        self.assertEqual(image_path("zos.img"), (BUILD / "zos.img").resolve())
+
+    def test_long_name_aliases_are_unique(self):
+        used = set()
+        first = short_name("limine-bios.sys", used)
+        second = short_name("limine-bios-cd.sys", used)
+        self.assertNotEqual(first, second)
+        entries = long_entries("limine-bios.sys", first)
+        self.assertEqual(len(entries), 64)
+        self.assertEqual(entries[0], 0x42)
+        self.assertEqual(entries[32], 1)
+
+
+class AcceptanceHarnessTests(unittest.TestCase):
+    def valid_log(self, firmware, case):
+        result = "\n".join((*COMMON_MARKERS, f"FIRMWARE: {firmware}", CASES[case][1]))
+        result = result.replace("TIMER PASS:", "TIMER PASS: ticks=100")
+        if case == "divide":
+            result += "\nEXCEPTION: DIVIDE ERROR"
+        elif case == "page-fault":
+            result += "\nEXCEPTION: PAGE FAULT"
+        return result
+
+    def test_expected_markers_for_each_firmware_and_case(self):
+        for firmware in ("BIOS", "UEFI"):
+            for case in CASES:
+                with self.subTest(firmware=firmware, case=case):
+                    validate_log(self.valid_log(firmware, case), firmware.lower(), case)
+
+    def test_missing_timer_wrong_firmware_and_panics_fail(self):
+        valid = self.valid_log("BIOS", "boot")
+        for invalid in (
+            valid.replace("TIMER PASS:", ""),
+            valid.replace("ticks=100", "ticks=0"),
+            valid.replace("FIRMWARE: BIOS", "FIRMWARE: UEFI"),
+            valid + "\nKERNEL PANIC",
+            valid + "\nEXCEPTION: GENERAL PROTECTION",
+        ):
+            with self.subTest(log=invalid), self.assertRaises(RuntimeError):
+                validate_log(invalid, "bios", "boot")
+
+
+if __name__ == "__main__":
+    unittest.main()
