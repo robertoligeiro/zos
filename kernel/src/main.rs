@@ -1,11 +1,15 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
 #![deny(unsafe_op_in_unsafe_fn)]
+
+extern crate alloc;
 
 mod boot;
 mod framebuffer;
 mod interrupts;
+mod memory;
 mod serial;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +23,17 @@ macro_rules! logln {
     ($($arg:tt)*) => { $crate::serial::print(format_args!("{}\n", format_args!($($arg)*))) };
 }
 
-#[cfg(any(
-    all(feature = "test-boot", feature = "test-divide"),
-    all(feature = "test-boot", feature = "test-page-fault"),
-    all(feature = "test-divide", feature = "test-page-fault")
-))]
-compile_error!("Select only one QEMU acceptance-test feature at a time");
+const ACCEPTANCE_FEATURES: u8 = cfg!(feature = "test-boot") as u8
+    + cfg!(feature = "test-divide") as u8
+    + cfg!(feature = "test-page-fault") as u8
+    + cfg!(feature = "test-memory") as u8
+    + cfg!(feature = "test-memory-protection") as u8
+    + cfg!(feature = "test-memory-unmap") as u8
+    + cfg!(feature = "test-memory-execute") as u8;
+const _: () = match ACCEPTANCE_FEATURES {
+    0 | 1 => (),
+    _ => panic!("Select only one QEMU acceptance-test feature at a time"),
+};
 
 pub fn halt() -> ! {
     cpu_interrupts::disable();
@@ -34,16 +43,16 @@ pub fn halt() -> ! {
 }
 
 pub fn finish_test(success: bool) -> ! {
-    #[cfg(any(
-        feature = "test-boot",
-        feature = "test-divide",
-        feature = "test-page-fault"
-    ))]
-    // SAFETY: this test-only QEMU device is configured at port 0xf4 by the harness.
-    unsafe {
-        x86_64::instructions::port::Port::<u32>::new(0xf4).write(if success { 0x10 } else { 0x11 });
+    if ACCEPTANCE_FEATURES != 0 {
+        // SAFETY: this test-only QEMU device is configured at port 0xf4 by the harness.
+        unsafe {
+            x86_64::instructions::port::Port::<u32>::new(0xf4).write(if success {
+                0x10
+            } else {
+                0x11
+            });
+        }
     }
-    let _ = success;
     halt()
 }
 
@@ -63,6 +72,7 @@ pub extern "C" fn _start() -> ! {
     boot::report();
     interrupts::init();
     logln!("GDT/TSS/IDT ready");
+    memory::init();
     interrupts::start_timer();
     logln!("PIT ready: 100 Hz");
     cpu_interrupts::enable();
@@ -72,8 +82,18 @@ pub extern "C" fn _start() -> ! {
     }
     logln!("TIMER PASS: ticks={}", TICKS.load(Ordering::Relaxed));
 
-    #[cfg(feature = "test-divide")]
-    {
+    if cfg!(feature = "test-memory") {
+        memory::acceptance();
+    }
+    if cfg!(any(
+        feature = "test-memory-protection",
+        feature = "test-memory-unmap",
+        feature = "test-memory-execute"
+    )) {
+        memory::fault_acceptance();
+    }
+
+    if cfg!(feature = "test-divide") {
         logln!("TEST: deliberate divide by zero");
         // SAFETY: the installed #DE handler terminates this dedicated test image.
         unsafe {
@@ -89,8 +109,7 @@ pub extern "C" fn _start() -> ! {
         panic!("Divide-by-zero exception did not fire");
     }
 
-    #[cfg(feature = "test-page-fault")]
-    {
+    if cfg!(feature = "test-page-fault") {
         logln!("TEST: deliberate page fault");
         // SAFETY: only this test image dereferences an unmapped canonical user address.
         unsafe {
@@ -99,22 +118,14 @@ pub extern "C" fn _start() -> ! {
         panic!("Page-fault exception did not fire");
     }
 
-    #[cfg(feature = "test-boot")]
-    {
+    if cfg!(feature = "test-boot") {
         logln!("BOOT ACCEPTANCE PASS");
         finish_test(true);
     }
 
-    #[cfg(not(any(
-        feature = "test-boot",
-        feature = "test-divide",
-        feature = "test-page-fault"
-    )))]
-    {
-        logln!("ZOS ready: boot checkpoint; no user-space shell yet.");
-        loop {
-            hlt();
-        }
+    logln!("ZOS ready: memory checkpoint; no user-space shell yet.");
+    loop {
+        hlt();
     }
 }
 

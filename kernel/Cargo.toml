@@ -13,9 +13,14 @@ bench = false
 test-boot = []
 test-divide = []
 test-page-fault = []
+test-memory = []
+test-memory-protection = []
+test-memory-unmap = []
+test-memory-execute = []
 
 [dependencies]
 limine = "=0.6.5"
 x86_64 = "=0.15.2"
 spin = "=0.9.9"
 font8x8 = { version = "=0.3.1", default-features = false, features = ["unicode"] }
+linked_list_allocator = { version = "=0.10.5", default-features = false }

@@ -211,5 +211,28 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         crate::serial::emergency(format_args!("PAGE FAULT ACCEPTANCE PASS\n"));
         crate::finish_test(true);
     }
+    if address.as_u64() == crate::memory::TEST_ADDRESS {
+        let expected = if cfg!(feature = "test-memory-protection") {
+            Some((
+                PageFaultErrorCode::PROTECTION_VIOLATION | PageFaultErrorCode::CAUSED_BY_WRITE,
+                "MEMORY PROTECTION ACCEPTANCE PASS",
+            ))
+        } else if cfg!(feature = "test-memory-unmap") {
+            Some((PageFaultErrorCode::empty(), "MEMORY UNMAP ACCEPTANCE PASS"))
+        } else if cfg!(feature = "test-memory-execute") {
+            Some((
+                PageFaultErrorCode::PROTECTION_VIOLATION | PageFaultErrorCode::INSTRUCTION_FETCH,
+                "MEMORY EXECUTE ACCEPTANCE PASS",
+            ))
+        } else {
+            None
+        };
+        if let Some((expected_code, marker)) = expected {
+            if code == expected_code {
+                crate::serial::emergency(format_args!("{marker}\n"));
+                crate::finish_test(true);
+            }
+        }
+    }
     crate::finish_test(false)
 }

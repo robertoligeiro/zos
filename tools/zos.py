@@ -20,9 +20,18 @@ CASES = {
     "boot": ("test-boot", "BOOT ACCEPTANCE PASS"),
     "divide": ("test-divide", "DIVIDE ACCEPTANCE PASS"),
     "page-fault": ("test-page-fault", "PAGE FAULT ACCEPTANCE PASS"),
+    "memory": ("test-memory", "MEMORY ACCEPTANCE PASS"),
+    "memory-protection": ("test-memory-protection", "MEMORY PROTECTION ACCEPTANCE PASS"),
+    "memory-unmap": ("test-memory-unmap", "MEMORY UNMAP ACCEPTANCE PASS"),
+    "memory-execute": ("test-memory-execute", "MEMORY EXECUTE ACCEPTANCE PASS"),
 }
 COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
-                  "GDT/TSS/IDT ready", "PIT ready: 100 Hz", "TIMER PASS:")
+                  "GDT/TSS/IDT ready", "PAGING ready:", "HEAP ready:",
+                  "HEAP PASS:", "PAGING PASS:", "MEMORY ready:",
+                  "PIT ready: 100 Hz", "TIMER PASS:")
+MEMORY_MARKERS = ("FRAMES PASS: 100000 simultaneous pages", "FRAMES OOM PASS:",
+                  "HEAP STRESS PASS:")
+READY_MARKER = "ZOS ready: memory checkpoint"
 
 
 def environment() -> dict[str, str]:
@@ -70,7 +79,8 @@ def image(kernel: Path, case: str | None = None) -> Path:
     return destination
 
 
-def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False) -> list[str]:
+def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
+                 memory_mib: int = 256) -> list[str]:
     directory = TOOLS / "qemu"
     executable = directory / "qemu-system-x86_64.exe"
     if not executable.is_file():
@@ -80,7 +90,7 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False) -
         raise RuntimeError("QEMU firmware directory is missing bios-256k.bin")
     command = [
         str(executable), "-L", str(bios.parent), "-accel", "tcg", "-machine", "pc",
-        "-cpu", "max", "-smp", "1", "-m", "256M", "-nic", "none",
+        "-cpu", "max", "-smp", "1", "-m", f"{memory_mib}M", "-nic", "none",
         "-drive", f"file={disk},format=raw,if=ide,snapshot=on",
         "-no-reboot",
     ]
@@ -102,6 +112,8 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False) -
 
 def validate_log(text: str, firmware: str, case: str) -> None:
     expected = (*COMMON_MARKERS, f"FIRMWARE: {firmware.upper()}", CASES[case][1])
+    if case == "memory":
+        expected += MEMORY_MARKERS
     missing = [marker for marker in expected if marker not in text]
     if missing:
         raise RuntimeError(f"Missing serial markers: {', '.join(missing)}")
@@ -112,9 +124,10 @@ def validate_log(text: str, firmware: str, case: str) -> None:
         raise RuntimeError("Kernel panic appeared in acceptance log")
     if case == "divide" and "EXCEPTION: DIVIDE ERROR" not in text:
         raise RuntimeError("Divide test did not report the expected CPU exception")
-    if case == "page-fault" and "EXCEPTION: PAGE FAULT" not in text:
+    if case in ("page-fault", "memory-protection", "memory-unmap", "memory-execute") \
+            and "EXCEPTION: PAGE FAULT" not in text:
         raise RuntimeError("Page-fault test did not report the expected CPU exception")
-    if case == "boot" and "EXCEPTION:" in text:
+    if case in ("boot", "memory") and "EXCEPTION:" in text:
         raise RuntimeError("Boot image raised an unexpected exception")
 
 
@@ -123,7 +136,9 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     stderr = BUILD / f"{firmware}-{case}.qemu.log"
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware, exit_on_shutdown=True) + [
+    command = qemu_command(
+        disk, firmware, exit_on_shutdown=True, memory_mib=1024 if case == "memory" else 256,
+    ) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
     ]
@@ -164,7 +179,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             deadline = time.monotonic() + timeout
             while True:
                 text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-                if "ZOS ready: boot checkpoint" in text:
+                if READY_MARKER in text:
                     break
                 if "KERNEL PANIC" in text or "EXCEPTION:" in text or process.poll() is not None:
                     raise RuntimeError(f"{firmware}: normal kernel failed; inspect {log}")
@@ -233,7 +248,7 @@ def check() -> None:
 
 
 def accept(timeout: int) -> None:
-    result = BUILD / "phase-2-acceptance.json"
+    result = BUILD / "phase-3-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
     check()
@@ -245,13 +260,13 @@ def accept(timeout: int) -> None:
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout)
     result.write_text(json.dumps({
-        "phase": 2,
+        "phase": 3,
         "automated_checks": "passed",
         "visual_review": "pending: inspect bios-screen.ppm and uefi-screen.ppm",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED PHASE 2 PASS. Inspect both screenshots before starting Step 3.", flush=True)
+    print("AUTOMATED STEP 3 PASS. Inspect both screenshots before starting Step 4.", flush=True)
 
 
 def main() -> None:

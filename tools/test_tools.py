@@ -10,7 +10,7 @@ from mkimage import (
     BIOS_END, BIOS_START, BUILD, ESP_END, ESP_START, SECTOR, SECTORS,
     create_image, image_path, long_entries, short_name,
 )
-from zos import CASES, COMMON_MARKERS, qemu_command, screenshot, validate_log
+from zos import CASES, COMMON_MARKERS, MEMORY_MARKERS, READY_MARKER, qemu_command, screenshot, validate_log
 
 
 class ImageTests(unittest.TestCase):
@@ -160,7 +160,7 @@ class AcceptanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=BUILD) as directory:
             output = Path(directory)
             serial_text = "\n".join(
-                (*COMMON_MARKERS, "FIRMWARE: BIOS", "ZOS ready: boot checkpoint")
+                (*COMMON_MARKERS, "FIRMWARE: BIOS", READY_MARKER)
             )
             replies = iter([
                 b'{"QMP": {}}\n',
@@ -212,17 +212,22 @@ class AcceptanceHarnessTests(unittest.TestCase):
             with patch("zos.TOOLS", tools):
                 normal = qemu_command(BUILD / "zos.img", "bios")
                 acceptance = qemu_command(BUILD / "zos-boot.img", "bios", exit_on_shutdown=True)
+                memory = qemu_command(BUILD / "zos-memory.img", "bios", memory_mib=1024)
             self.assertIn("-no-shutdown", normal)
             self.assertNotIn("-no-shutdown", acceptance)
             self.assertIn("-no-reboot", acceptance)
+            self.assertEqual(normal[normal.index("-m") + 1], "256M")
+            self.assertEqual(memory[memory.index("-m") + 1], "1024M")
 
     def valid_log(self, firmware, case):
         result = "\n".join((*COMMON_MARKERS, f"FIRMWARE: {firmware}", CASES[case][1]))
         result = result.replace("TIMER PASS:", "TIMER PASS: ticks=100")
         if case == "divide":
             result += "\nEXCEPTION: DIVIDE ERROR"
-        elif case == "page-fault":
+        elif case in ("page-fault", "memory-protection", "memory-unmap", "memory-execute"):
             result += "\nEXCEPTION: PAGE FAULT"
+        elif case == "memory":
+            result += "\n" + "\n".join(MEMORY_MARKERS)
         return result
 
     def test_expected_markers_for_each_firmware_and_case(self):
@@ -242,6 +247,24 @@ class AcceptanceHarnessTests(unittest.TestCase):
         ):
             with self.subTest(log=invalid), self.assertRaises(RuntimeError):
                 validate_log(invalid, "bios", "boot")
+
+    def test_memory_requires_all_stress_checks_and_no_unexpected_faults(self):
+        valid = self.valid_log("BIOS", "memory")
+        for marker in (*MEMORY_MARKERS, "PAGING PASS:", "HEAP PASS:"):
+            with self.subTest(marker=marker), self.assertRaises(RuntimeError):
+                validate_log(valid.replace(marker, ""), "bios", "memory")
+        with self.assertRaises(RuntimeError):
+            validate_log(valid + "\nEXCEPTION: PAGE FAULT", "bios", "memory")
+
+    def test_memory_fault_cases_require_expected_exception_and_their_own_marker(self):
+        for case in ("memory-protection", "memory-unmap", "memory-execute"):
+            valid = self.valid_log("UEFI", case)
+            for invalid in (
+                valid.replace("EXCEPTION: PAGE FAULT", ""),
+                valid.replace(CASES[case][1], CASES["page-fault"][1]),
+            ):
+                with self.subTest(case=case), self.assertRaises(RuntimeError):
+                    validate_log(invalid, "uefi", case)
 
 
 if __name__ == "__main__":
