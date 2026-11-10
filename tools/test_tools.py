@@ -10,7 +10,10 @@ from mkimage import (
     BIOS_END, BIOS_START, BUILD, ESP_END, ESP_START, SECTOR, SECTORS,
     create_image, image_path, long_entries, short_name,
 )
-from zos import CASES, COMMON_MARKERS, MEMORY_MARKERS, READY_MARKER, qemu_command, screenshot, validate_log
+from zos import (
+    CASES, COMMON_MARKERS, IPC_MARKERS, MEMORY_MARKERS, READY_MARKER, USER_PROGRAMS,
+    image, qemu_command, screenshot, user_environment, validate_log,
+)
 
 
 class ImageTests(unittest.TestCase):
@@ -23,6 +26,9 @@ class ImageTests(unittest.TestCase):
             "limine-bios.sys": cls.payload,
             "EFI/BOOT/BOOTX64.EFI": b"mock EFI executable",
             "boot/zos.elf": b"mock kernel",
+            "boot/echo-server.elf": b"mock server",
+            "boot/echo-client.elf": b"mock client",
+            "boot/fault-probe.elf": b"mock fault probe",
         })
         cls.stream = cls.path.open("rb")
         cls.stream.seek(ESP_START * SECTOR)
@@ -136,6 +142,12 @@ class ImageTests(unittest.TestCase):
         kernel_dir = self.directory(root["boot"][0])
         cluster, length, _ = kernel_dir["zos.elf"]
         self.assertEqual(self.chain(cluster)[:length], b"mock kernel")
+        for program, payload in (
+            ("echo-server", b"mock server"), ("echo-client", b"mock client"),
+            ("fault-probe", b"mock fault probe"),
+        ):
+            cluster, length, _ = kernel_dir[f"{program}.elf"]
+            self.assertEqual(self.chain(cluster)[:length], payload)
 
     def test_image_targets_cannot_escape_build(self):
         for name in ("../disk.img", "..\\disk.img", "C:\\disk.img", "C:disk.img", "disk.bin", ""):
@@ -160,7 +172,7 @@ class AcceptanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=BUILD) as directory:
             output = Path(directory)
             serial_text = "\n".join(
-                (*COMMON_MARKERS, "FIRMWARE: BIOS", READY_MARKER)
+                (self.valid_log("BIOS", "ipc"), READY_MARKER)
             )
             replies = iter([
                 b'{"QMP": {}}\n',
@@ -228,7 +240,49 @@ class AcceptanceHarnessTests(unittest.TestCase):
             result += "\nEXCEPTION: PAGE FAULT"
         elif case == "memory":
             result += "\n" + "\n".join(MEMORY_MARKERS)
+        elif case == "ipc":
+            result += "\n" + "\n".join(
+                marker for marker in IPC_MARKERS
+                if marker != "client: cross-process echo and priority inheritance verified"
+            )
+            for index, kind in enumerate(("PAGE FAULT", "GENERAL PROTECTION", "INVALID OPCODE",
+                                          "GENERAL PROTECTION", "INVALID RETURN"), 3):
+                result += f"\nUSER FAULT: tid={index} kind={kind} address=0x400000"
+            result += "\nclient: cross-process echo and priority inheritance verified"
+            result += "\npeer: timer preemption and SSE context verified"
+            for index in range(6):
+                result += f"\nUSER EXIT: tid={index + 1} status=0"
         return result
+
+    def test_ipc_requires_isolation_then_echo_and_both_preempted_peers(self):
+        valid = self.valid_log("BIOS", "ipc")
+        for marker in IPC_MARKERS:
+            with self.subTest(marker=marker), self.assertRaises(RuntimeError):
+                validate_log(valid.replace(marker, ""), "bios", "ipc")
+        for invalid in (
+            valid.replace("kind=INVALID RETURN", "kind=GENERAL PROTECTION"),
+            valid + "\nUSER FAULT: tid=99 kind=PAGE FAULT address=0",
+            valid.replace("status=0", "status=101", 1),
+            valid + "\nEXCEPTION: GENERAL PROTECTION",
+            valid.replace("\npeer: timer preemption and SSE context verified", "", 1),
+        ):
+            with self.subTest(log=invalid), self.assertRaises(RuntimeError):
+                validate_log(invalid, "bios", "ipc")
+
+    def test_user_flags_override_kernel_linker_and_use_separate_artifacts(self):
+        env = user_environment()
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+        self.assertIn("link-arg=-Tservers/demo/linker.ld", flags)
+        self.assertNotIn("link-arg=-Tkernel/linker.ld", flags)
+        self.assertEqual(Path(env["CARGO_TARGET_DIR"]).parts[-2:], ("target", "user"))
+
+    def test_image_packages_every_configured_user_module(self):
+        with patch("zos.Path.read_bytes", return_value=b"ELF payload"), \
+                patch("zos.create_image") as create, patch("zos.subprocess.run"):
+            image(Path("kernel.elf"), "ipc")
+        payloads = create.call_args.args[1]
+        for program in USER_PROGRAMS:
+            self.assertEqual(payloads[f"boot/{program}.elf"], b"ELF payload")
 
     def test_expected_markers_for_each_firmware_and_case(self):
         for firmware in ("BIOS", "UEFI"):

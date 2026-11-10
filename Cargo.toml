@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel"]
+members = ["kernel", "libos", "servers/demo"]
 resolver = "2"
 
 [workspace.package]

@@ -13,21 +13,25 @@ A single-core x86-64 microkernel project following the supplied
 - Host tests: GPT CRCs, primary/backup structures, FAT32 geometry/mirrors,
   bootloader long filenames, file cluster chains, EFI paths, output-path
   restrictions, acceptance-log validation, test VM exit behavior, sequential
-  QMP capture negotiation, memory-test RAM sizing, and memory acceptance gates.
-  All 12 host tests, Rustfmt, Clippy in all eight configurations, and all 14
+  QMP capture negotiation, memory-test RAM sizing, user ELF packaging, separate
+  user linker flags, and memory/IPC acceptance gates.
+  All 15 host tests, Rustfmt, Clippy in ten configurations, and all 16
   BIOS/UEFI acceptance cases pass. Both normal framebuffer captures have been
-  visually inspected at the memory checkpoint.
+  visually inspected at the IPC checkpoint.
 - Step 3: bitmap physical-frame allocation from Limine's usable regions;
   ZOS-owned page tables; 4 KiB map/unmap/protect; per-process lower halves
   sharing supervisor-only kernel mappings; an 8 MiB coalescing kernel heap
   supporting `Box`/`Vec`; and usable/free/used memory accounting.
-- Steps 4-8: deferred. There are no user-space servers, shell, filesystem,
-  persistence, or hardware USB support.
+- Step 4: ring-3 ELF processes, per-thread kernel stacks, preemptive priority
+  scheduling with round-robin peers, synchronous IPC with transitive priority
+  inheritance, checked syscalls, `libos`, and an echo server/client demonstration.
+- Steps 5-8: deferred. There is no keyboard input, interactive shell, filesystem,
+  filesystem persistence, or hardware USB support.
 
 The `phase-2` tag preserves the verified boot checkpoint. The `phase-3` memory
-checkpoint corresponds to **Step 3 / Phase 2** in the supplied plan; repository
-tags follow step numbers. Threads, user-mode execution and IPC are the next step,
-not part of this checkpoint.
+checkpoint preserves **Step 3 / Phase 2** in the supplied plan. The current
+`phase-4` tag corresponds to **Step 4 / Phase 3**; repository tags follow step
+numbers. Console/input is Step 5; the interactive shell is Step 7.
 
 The frame bitmap and copied page tables are reserved from usable RAM. Bootloader
 reclaimable memory stays reserved: boot responses and the initial kernel stack
@@ -39,6 +43,44 @@ run with interrupts disabled under their respective locks on this single CPU.
 Memory statistics count initially usable RAM, including ZOS allocations, not
 firmware-reserved RAM or the whole installed-memory capacity. The heap is fixed
 at 8 MiB for this phase.
+
+User processes enter initially through IRETQ, issue SYSCALL, and return from
+syscalls through SYSRETQ. Timer switches restore full general-register and
+x87/SSE state; AVX/XSAVE execution is deliberately disabled until its state is
+supported. Each thread has a 32 KiB kernel stack, a 64 KiB user stack separated
+from other stacks by an unmapped guard gap, and a priority from 0 (highest) to 31.
+Kernel dispatch runs with interrupts disabled and never suspends a kernel call
+stack. An independent idle stack permits safe final address-space/stack cleanup.
+User faults terminate only the offending thread; other threads continue.
+
+The syscall ABI uses RAX for the call/result and RDI/RSI/RDX/R10/R8 for arguments;
+Receive also returns message length in RDX. The nine planned syscalls are
+implemented, plus a bounded `DebugWrite` used by this checkpoint instead of a
+console server. Small messages and replies are copied, at most **64 bytes**;
+oversized buffers return an error, never truncated data. Large shared-message
+mapping is deferred, as allowed by the plan's start-with-copy decision. Send
+blocks until a server-owned, generation-checked Reply or an explicit channel
+closure error. Dependency cycles are rejected; donation propagates transitively
+while queued and while awaiting a reply. All user buffers are checked page by
+page and copied through kernel physical aliases, including cross-page buffers.
+
+The boot policy grants only the trusted echo-server process eligibility for
+**IRQ0 and port 0x80**. IrqAttach delivers coalesced PIT notifications through
+an owned channel, reserving reply token 0 for notifications. IoPortGrant enables
+only that approved port in the requesting thread's TSS I/O bitmap; IOPL remains
+zero and all other ports stay denied. Other device IRQs/ports are not supported
+yet. MapMemory supplies individual zeroed pages in a restricted user range,
+rejects writable-executable mappings and overlaps, and caps dynamic allocations
+at 128 pages per process. This boot demonstration allows 32 thread IDs,
+16 channel IDs and 8 stacks per process; IDs/stacks are not recycled until final
+demo teardown. It is not yet a general-purpose process manager.
+
+Three freestanding user ELFs are loaded from Limine modules. The loader checks
+ELF64/x86-64 headers, file bounds/overflow, page-separated load segments,
+executable entry points, overlap, image limits and W^X. User builds use their
+own lower-half linker script and `target\user` artifacts. Their code model
+matches the prebuilt freestanding Rust core for LTO compatibility, with all ELF
+symbols below 2 GiB. No new external Rust dependencies were needed for Step 4.
 
 ## Windows setup (no WSL or administrator installation)
 
@@ -78,14 +120,15 @@ stage-2 partition and a FAT32 EFI System Partition, then invokes the pinned
 below are the primary interface; the Makefile is optional if Windows Make is
 already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
 
-## Step 3 acceptance gate
+## Step 4 acceptance gate
 
 `python tools\zos.py test` must exit successfully. It performs:
 
 1. Host unit tests, Rustfmt check, and Clippy with warnings denied for normal,
    boot, divide, page-fault, memory, read-only-write, unmap, and NX-execute test
-   configurations (eight configurations total).
-2. BIOS and UEFI boots for each of seven isolated test images. Each must
+   configurations plus IPC (nine kernel configurations), and the user programs
+   (ten configurations total).
+2. BIOS and UEFI boots for each of eight isolated test images. Each must
    report the correct firmware, framebuffer initialization, GDT/TSS/IDT, and
    at least 100 timer interrupts; then exit through QEMU's test device with
    host status 33. A panic, unexpected exit, missing marker, or timeout fails.
@@ -99,6 +142,16 @@ already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
    failure without leaks. Three dedicated fault images check the CPU's exact
    page-fault address and error bits for a read-only write, a read after unmap
    (including TLB invalidation), and an instruction fetch from an NX page.
+   The IPC image runs real ring-3 code in seven address spaces: an echo server,
+   client, and five disposable fault probes. It checks cross-process messages,
+   blocked request/reply, priority donation ahead of a medium-priority competitor,
+   syscall-free peer loops requiring timer preemption, SSE state preservation,
+   IRQ notification, allowed/denied I/O, invalid pointers and priorities,
+   cross-page copies, small-buffer errors, stale/forged reply tokens, deadlock
+   rejection, and closure while queued or awaiting a reply. Supervisor writes,
+   CLI, UD2, denied OUT and a noncanonical syscall stack must be contained;
+   the echo must complete after these faults. All six surviving threads must
+   exit successfully. Final frame/heap totals must return exactly to baseline.
 3. Normal BIOS and UEFI boots, each with a framebuffer screenshot. These do
    not enable the test exit device. The harness stops each VM through QMP over
    standard input/output, without opening a network listener.
@@ -113,13 +166,16 @@ bios-memory.serial.log          uefi-memory.serial.log
 bios-memory-protection.serial.log uefi-memory-protection.serial.log
 bios-memory-unmap.serial.log     uefi-memory-unmap.serial.log
 bios-memory-execute.serial.log   uefi-memory-execute.serial.log
+bios-ipc.serial.log              uefi-ipc.serial.log
 bios-screen.ppm                 uefi-screen.ppm
-phase-3-acceptance.json          (created only after automated success)
+phase-4-acceptance.json          (created only after automated success)
 zos.img                         (normal image, never a deliberate-fault image)
 ```
 
-Inspect both screenshots to confirm the ZOS banner, readable text, and timer
-line. The JSON explicitly records visual review as pending. Alternatively,
+Inspect both screenshots to confirm readable text, successful IPC/isolation
+summaries and the final IPC-ready line. The completion summary clears the
+wrapping boot display; earlier diagnostics remain in the serial log.
+The JSON explicitly records visual review as pending. Alternatively,
 verify the screen interactively, closing each QEMU window before the next:
 
 ```powershell
@@ -142,7 +198,16 @@ PAGING PASS: map/unmap/protect, CR3 isolation, shared kernel, teardown
 MEMORY ready: usable=... free=... used=... heap_used=0 bytes
 PIT ready: 100 Hz
 TIMER PASS: ticks=100
-ZOS ready: memory checkpoint; no user-space shell yet.
+RING3 ready: SYSCALL/SYSRET, per-thread kernel stacks, FXSAVE
+ELF VALIDATION PASS: ...
+USER FAULT: ...                  (five intentional, contained probes)
+client: cross-process echo and priority inheritance verified
+SCHEDULER PASS: ...
+IPC PASS: ...
+IRQ/IO PASS: ...
+USER ISOLATION PASS: 5 faults contained; echo completed afterwards
+PROCESS CLEANUP PASS: all address spaces, threads, channels released
+ZOS ready: IPC checkpoint; no user-space shell yet.
 ```
 
 UEFI reports `FIRMWARE: UEFI`; resolution and tick count can differ.
@@ -154,8 +219,9 @@ The memory stress case additionally reports `FRAMES PASS: 100000 simultaneous
 pages`, `FRAMES OOM PASS`, `HEAP STRESS PASS` and `MEMORY ACCEPTANCE PASS`.
 The hardware-fault cases report `MEMORY PROTECTION ACCEPTANCE PASS`,
 `MEMORY UNMAP ACCEPTANCE PASS` and `MEMORY EXECUTE ACCEPTANCE PASS`, respectively.
-Step 3's automated and visual acceptance gates have passed. Step 4 remains
-deferred until this checkpoint is reviewed.
+The IPC image additionally reports `IPC ACCEPTANCE PASS`. Normal boots run the
+same user demonstration and then idle; they do not present a command prompt.
+Review this checkpoint before implementing Step 5.
 
 ## Development commands
 

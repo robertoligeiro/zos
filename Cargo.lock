@@ -81,6 +81,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zos-demo"
+version = "0.1.0"
+dependencies = [
+ "zos-libos",
+]
+
+[[package]]
 name = "zos-kernel"
 version = "0.1.0"
 dependencies = [
@@ -89,4 +96,9 @@ dependencies = [
  "linked_list_allocator",
  "spin",
  "x86_64",
+ "zos-libos",
 ]
+
+[[package]]
+name = "zos-libos"
+version = "0.1.0"

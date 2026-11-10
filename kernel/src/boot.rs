@@ -1,6 +1,6 @@
 use limine::request::{
     ExecutableAddressRequest, FirmwareTypeRequest, FramebufferRequest, HhdmRequest, MemmapRequest,
-    StackSizeRequest,
+    ModulesRequest, StackSizeRequest,
 };
 
 #[used]
@@ -27,6 +27,10 @@ pub static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 pub static EXECUTABLE: ExecutableAddressRequest = ExecutableAddressRequest::new();
+
+#[used]
+#[link_section = ".limine_requests"]
+pub static MODULES: ModulesRequest = ModulesRequest::new();
 
 #[used]
 #[link_section = ".limine_requests"]

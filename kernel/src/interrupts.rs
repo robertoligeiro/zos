@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::{cell::UnsafeCell, sync::atomic::Ordering};
 use spin::Lazy;
 use x86_64::{
     instructions::{
@@ -29,14 +29,27 @@ static mut PRIVILEGE_STACK: Stack = Stack {
     _bytes: [0; 32 * 1024],
 };
 
-static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
+#[repr(C)]
+struct Tss {
+    state: UnsafeCell<TaskStateSegment>,
+    bitmap: UnsafeCell<[u8; 8193]>,
+}
+
+// SAFETY: this single CPU mutates the TSS only with interrupts disabled. Hardware
+// reads it only on a subsequent privilege transition; no shared Rust references persist.
+unsafe impl Sync for Tss {}
+
+static TSS: Lazy<Tss> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
     let double_fault = core::ptr::addr_of!(DOUBLE_FAULT_STACK) as u64;
     let privilege = core::ptr::addr_of!(PRIVILEGE_STACK) as u64;
     tss.interrupt_stack_table[DOUBLE_FAULT_IST as usize] =
         VirtAddr::new(double_fault + core::mem::size_of::<Stack>() as u64);
     tss.privilege_stack_table[0] = VirtAddr::new(privilege + core::mem::size_of::<Stack>() as u64);
-    tss
+    Tss {
+        state: UnsafeCell::new(tss),
+        bitmap: UnsafeCell::new([0xff; 8193]),
+    }
 });
 
 struct Selectors {
@@ -51,7 +64,19 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
     let data = table.append(Descriptor::kernel_data_segment());
     table.append(Descriptor::user_data_segment());
     table.append(Descriptor::user_code_segment());
-    let tss = table.append(Descriptor::tss_segment(&TSS));
+    assert_eq!(core::mem::offset_of!(Tss, bitmap), 104);
+    // SAFETY: the TSS and following bitmap are static and laid out as required
+    // by the CPU. Extend the descriptor limit to include the deny-all sentinel.
+    let descriptor = unsafe { Descriptor::tss_segment(&*TSS.state.get()) };
+    let Descriptor::SystemSegment(low, high) = descriptor else {
+        unreachable!()
+    };
+    let limit = (104 + 8193 - 1) as u64;
+    let descriptor = Descriptor::SystemSegment(
+        (low & !0xffff & !(0xf << 48)) | (limit & 0xffff) | ((limit & 0xf0000) << 32),
+        high,
+    );
+    let tss = table.append(descriptor);
     (table, Selectors { code, data, tss })
 });
 
@@ -117,7 +142,13 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt.simd_floating_point.set_handler_fn(simd);
     idt.virtualization.set_handler_fn(virtualization);
     idt.security_exception.set_handler_fn(security);
-    idt[TIMER_VECTOR].set_handler_fn(timer);
+    // SAFETY: assembly saves all registers and SSE state before dispatching user
+    // interrupts; kernel-mode ticks tail-jump to the x86-interrupt ABI handler.
+    unsafe {
+        idt[TIMER_VECTOR].set_handler_addr(VirtAddr::new(
+            crate::process::arch::zos_timer_entry as usize as u64,
+        ));
+    }
     idt[39].set_handler_fn(spurious_master);
     idt[47].set_handler_fn(spurious_slave);
     idt
@@ -166,10 +197,28 @@ pub fn start_timer() {
     }
 }
 
-extern "x86-interrupt" fn timer(_: InterruptStackFrame) {
+#[no_mangle]
+pub extern "x86-interrupt" fn zos_boot_timer(_: InterruptStackFrame) {
     crate::TICKS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: this handler services master-PIC IRQ0 and must acknowledge it.
     unsafe { Port::<u8>::new(0x20).write(0x20) };
+    crate::process::idle_tick();
+}
+
+pub fn select_stack(top: u64, port: bool) {
+    assert!(!x86_64::instructions::interrupts::are_enabled());
+    // SAFETY: no hardware privilege transition or other TSS mutation can occur
+    // until the scheduler returns to user mode. All ungranted ports stay denied.
+    unsafe {
+        core::ptr::addr_of_mut!((*TSS.state.get()).privilege_stack_table)
+            .cast::<VirtAddr>()
+            .write_unaligned(VirtAddr::new(top));
+        let bitmap = &mut *TSS.bitmap.get();
+        bitmap.fill(0xff);
+        if port {
+            bitmap[0x80 / 8] &= !(1 << (0x80 % 8));
+        }
+    }
 }
 
 extern "x86-interrupt" fn spurious_master(_: InterruptStackFrame) {}
@@ -179,7 +228,10 @@ extern "x86-interrupt" fn spurious_slave(_: InterruptStackFrame) {
     unsafe { Port::<u8>::new(0x20).write(0x20) };
 }
 
-fn fatal(name: &str, frame: &InterruptStackFrame, code: Option<u64>) -> ! {
+fn fatal(name: &'static str, frame: &InterruptStackFrame, code: Option<u64>) -> ! {
+    if frame.code_segment.0 & 3 == 3 && !matches!(name, "NMI" | "DOUBLE FAULT" | "MACHINE CHECK") {
+        crate::process::user_fault(name, frame.instruction_pointer.as_u64());
+    }
     crate::serial::emergency(format_args!(
         "EXCEPTION: {name}, error={code:?}\n{frame:#?}\n"
     ));
@@ -201,6 +253,9 @@ extern "x86-interrupt" fn machine_check(frame: InterruptStackFrame) -> ! {
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
     let address = Cr2::read().expect("Noncanonical CR2");
+    if frame.code_segment.0 & 3 == 3 {
+        crate::process::user_fault("PAGE FAULT", address.as_u64());
+    }
     crate::serial::emergency(format_args!(
         "EXCEPTION: PAGE FAULT, address={address:?}, error={code:?}\n{frame:#?}\n"
     ));

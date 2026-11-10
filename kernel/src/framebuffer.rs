@@ -117,6 +117,14 @@ pub fn init() {
     );
 }
 
+pub fn clear() {
+    TERMINAL
+        .lock()
+        .as_mut()
+        .expect("Framebuffer not initialized")
+        .clear();
+}
+
 pub fn print(args: fmt::Arguments<'_>) {
     // Fault-time screen output is best effort; never deadlock on an interrupted writer.
     if let Some(mut terminal) = TERMINAL.try_lock() {

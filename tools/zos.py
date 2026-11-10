@@ -24,6 +24,7 @@ CASES = {
     "memory-protection": ("test-memory-protection", "MEMORY PROTECTION ACCEPTANCE PASS"),
     "memory-unmap": ("test-memory-unmap", "MEMORY UNMAP ACCEPTANCE PASS"),
     "memory-execute": ("test-memory-execute", "MEMORY EXECUTE ACCEPTANCE PASS"),
+    "ipc": ("test-ipc", "IPC ACCEPTANCE PASS"),
 }
 COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
                   "GDT/TSS/IDT ready", "PAGING ready:", "HEAP ready:",
@@ -31,7 +32,19 @@ COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
                   "PIT ready: 100 Hz", "TIMER PASS:")
 MEMORY_MARKERS = ("FRAMES PASS: 100000 simultaneous pages", "FRAMES OOM PASS:",
                   "HEAP STRESS PASS:")
-READY_MARKER = "ZOS ready: memory checkpoint"
+IPC_MARKERS = (
+    "RING3 ready: SYSCALL/SYSRET", "ELF VALIDATION PASS:",
+    "client: syscall validation and denied capabilities verified",
+    "client: cross-process echo and priority inheritance verified",
+    "client: cross-page buffers and channel closure verified",
+    "worker: receive/reply and stale token rejection verified",
+    "server: IRQ notification and port grant verified",
+    "peer: timer preemption and SSE context verified",
+    "SCHEDULER PASS:", "IPC PASS:", "IRQ/IO PASS:", "USER ISOLATION PASS:",
+    "PROCESS CLEANUP PASS:",
+)
+USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe")
+READY_MARKER = "ZOS ready: IPC checkpoint"
 
 
 def environment() -> dict[str, str]:
@@ -44,14 +57,28 @@ def environment() -> dict[str, str]:
     return env
 
 
-def cargo(*args: str) -> None:
+def user_environment() -> dict[str, str]:
+    env = environment()
+    env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "user")
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([
+        "-C", "link-arg=-Tservers/demo/linker.ld",
+        # Match the prebuilt freestanding core's LTO model. All user ELF symbols
+        # lie below 2 GiB, which is also supported by the kernel code model.
+        "-C", "relocation-model=static", "-C", "code-model=kernel", "-C", "no-redzone=yes",
+    ])
+    return env
+
+
+def cargo(*args: str, user: bool = False) -> None:
     executable = TOOLS / "cargo" / "bin" / "cargo.exe"
     if not executable.is_file():
         raise RuntimeError("Rust unavailable. Run tools\\bootstrap.ps1 after allowing it in sandbox policy.")
-    subprocess.run([str(executable), *args], cwd=ROOT, env=environment(), check=True)
+    subprocess.run([str(executable), *args], cwd=ROOT,
+                   env=user_environment() if user else environment(), check=True)
 
 
 def build(case: str | None = None) -> Path:
+    cargo("build", "--locked", "--release", "--package", "zos-demo", user=True)
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     if case:
         args += ["--features", CASES[case][0]]
@@ -65,12 +92,17 @@ def build(case: str | None = None) -> Path:
 def image(kernel: Path, case: str | None = None) -> Path:
     limine = TOOLS / "limine"
     destination = image_path(f"zos-{case}.img" if case else "zos.img")
-    create_image(destination, {
+    payloads = {
         "limine.conf": (ROOT / "boot" / "limine.conf").read_bytes(),
         "limine-bios.sys": (limine / "limine-bios.sys").read_bytes(),
         "EFI/BOOT/BOOTX64.EFI": (limine / "BOOTX64.EFI").read_bytes(),
         "boot/zos.elf": kernel.read_bytes(),
-    })
+    }
+    for program in USER_PROGRAMS:
+        payloads[f"boot/{program}.elf"] = (
+            ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / program
+        ).read_bytes()
+    create_image(destination, payloads)
     subprocess.run(
         [str(limine / "limine.exe"), "bios-install", str(destination), "1"],
         cwd=ROOT, check=True,
@@ -114,6 +146,8 @@ def validate_log(text: str, firmware: str, case: str) -> None:
     expected = (*COMMON_MARKERS, f"FIRMWARE: {firmware.upper()}", CASES[case][1])
     if case == "memory":
         expected += MEMORY_MARKERS
+    if case == "ipc":
+        expected += IPC_MARKERS
     missing = [marker for marker in expected if marker not in text]
     if missing:
         raise RuntimeError(f"Missing serial markers: {', '.join(missing)}")
@@ -127,8 +161,28 @@ def validate_log(text: str, firmware: str, case: str) -> None:
     if case in ("page-fault", "memory-protection", "memory-unmap", "memory-execute") \
             and "EXCEPTION: PAGE FAULT" not in text:
         raise RuntimeError("Page-fault test did not report the expected CPU exception")
-    if case in ("boot", "memory") and "EXCEPTION:" in text:
+    if case in ("boot", "memory", "ipc") and "EXCEPTION:" in text:
         raise RuntimeError("Boot image raised an unexpected exception")
+    if case == "ipc":
+        validate_ipc(text)
+
+
+def validate_ipc(text: str) -> None:
+    for marker in IPC_MARKERS:
+        if marker not in text:
+            raise RuntimeError(f"Missing IPC proof: {marker}")
+    expected_faults = ("PAGE FAULT", "GENERAL PROTECTION", "INVALID OPCODE",
+                       "GENERAL PROTECTION", "INVALID RETURN")
+    faults = re.findall(r"^USER FAULT: tid=\d+ kind=(.*?) address=", text, re.MULTILINE)
+    if sorted(faults) != sorted(expected_faults):
+        raise RuntimeError("Expected exactly five isolated user faults")
+    if text.count("peer: timer preemption and SSE context verified") != 2:
+        raise RuntimeError("Both preempted peer threads must verify their SSE state")
+    if text.index("client: cross-process echo") < text.rindex("USER FAULT:"):
+        raise RuntimeError("Echo must complete after all isolated faults")
+    exits = re.findall(r"^USER EXIT: tid=\d+ status=(-?\d+)$", text, re.MULTILINE)
+    if len(exits) != 6 or any(status != "0" for status in exits):
+        raise RuntimeError("All six non-faulting threads must exit successfully")
 
 
 def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
@@ -189,6 +243,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             for marker in (*COMMON_MARKERS, f"FIRMWARE: {firmware.upper()}"):
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: screenshot boot log missing {marker}")
+            validate_ipc(text)
             requests = [
                 {"execute": "qmp_capabilities", "id": "capabilities"},
                 {"execute": "screendump", "arguments": {"filename": str(picture)}, "id": "capture"},
@@ -240,6 +295,8 @@ def check() -> None:
     subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tools"),
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
+    cargo("clippy", "--locked", "--release", "--package", "zos-demo",
+          "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
         if case:
@@ -248,7 +305,7 @@ def check() -> None:
 
 
 def accept(timeout: int) -> None:
-    result = BUILD / "phase-3-acceptance.json"
+    result = BUILD / "phase-4-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
     check()
@@ -260,13 +317,13 @@ def accept(timeout: int) -> None:
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout)
     result.write_text(json.dumps({
-        "phase": 3,
+        "phase": 4,
         "automated_checks": "passed",
         "visual_review": "pending: inspect bios-screen.ppm and uefi-screen.ppm",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED STEP 3 PASS. Inspect both screenshots before starting Step 4.", flush=True)
+    print("AUTOMATED STEP 4 PASS. Inspect both screenshots before starting Step 5.", flush=True)
 
 
 def main() -> None:

@@ -1,0 +1,25 @@
+[package]
+name = "zos-demo"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "echo-server"
+path = "src/server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "echo-client"
+path = "src/client.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fault-probe"
+path = "src/probe.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }

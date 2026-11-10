@@ -32,13 +32,13 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy)]
-struct Permissions {
-    writable: bool,
-    executable: bool,
+pub struct Permissions {
+    pub writable: bool,
+    pub executable: bool,
 }
 
 impl Permissions {
-    const DATA: Self = Self {
+    pub const DATA: Self = Self {
         writable: true,
         executable: false,
     };
@@ -277,12 +277,12 @@ impl Memory {
     }
 }
 
-struct AddressSpace {
+pub struct AddressSpace {
     root: u64,
 }
 
 impl AddressSpace {
-    fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         with(|memory| {
             let root = memory.allocate_zeroed()?;
             // SAFETY: root is distinct and private. Only upper-level entries are
@@ -305,27 +305,107 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn map(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {
+    pub fn map(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {
         Self::user_address(address)?;
         with(|memory| memory.map(self.root, address, permissions))
     }
 
-    fn protect(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {
+    pub fn protect(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {
         Self::user_address(address)?;
         with(|memory| memory.protect(self.root, address, permissions))
     }
 
-    fn unmap(&mut self, address: u64) -> Result<(), Error> {
+    pub fn unmap(&mut self, address: u64) -> Result<(), Error> {
         Self::user_address(address)?;
         with(|memory| memory.unmap(self.root, address))
     }
 
     // SAFETY: callers must execute entirely in the shared kernel half, with no
     // live references into the previous lower half, until restoring that root.
-    unsafe fn activate(&self) {
+    pub unsafe fn activate(&self) {
         // SAFETY: every AddressSpace contains a live root with shared kernel maps.
         unsafe { activate(self.root) };
     }
+
+    pub fn check(&self, address: u64, length: usize, write: bool) -> Result<(), Error> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(length as u64)
+            .ok_or(Error::InvalidAddress)?;
+        if address < PAGE_SIZE || end > 0x0000_8000_0000_0000 {
+            return Err(Error::InvalidAddress);
+        }
+        with(|memory| {
+            for page in (address & !(PAGE_SIZE - 1)..end).step_by(PAGE_SIZE as usize) {
+                let (_, flags) = memory.mapping(self.root, page)?;
+                if !flags.contains(Flags::USER_ACCESSIBLE)
+                    || (write && !flags.contains(Flags::WRITABLE))
+                {
+                    return Err(Error::InvalidAddress);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn executable(&self, address: u64) -> bool {
+        self.check(address, 1, false).is_ok()
+            && with(|memory| {
+                memory
+                    .mapping(self.root, address & !(PAGE_SIZE - 1))
+                    .is_ok_and(|(_, flags)| !flags.contains(Flags::NO_EXECUTE))
+            })
+    }
+
+    pub fn read_user(&self, address: u64, output: &mut [u8]) -> Result<(), Error> {
+        self.check(address, output.len(), false)?;
+        self.copy_user(address, output.as_mut_ptr(), output.len(), false)
+    }
+
+    pub fn write_user(&self, address: u64, input: &[u8]) -> Result<(), Error> {
+        self.check(address, input.len(), true)?;
+        self.copy_user(address, input.as_ptr().cast_mut(), input.len(), true)
+    }
+
+    fn copy_user(
+        &self,
+        mut address: u64,
+        buffer: *mut u8,
+        length: usize,
+        write: bool,
+    ) -> Result<(), Error> {
+        with(|memory| {
+            let mut offset = 0;
+            while offset < length {
+                let within = (address % PAGE_SIZE) as usize;
+                let count = (PAGE_SIZE as usize - within).min(length - offset);
+                let (frame, _) = memory.mapping(self.root, address & !(PAGE_SIZE - 1))?;
+                let physical = (memory.hhdm + frame + within as u64) as *mut u8;
+                // SAFETY: check validated the entire range and permissions.
+                // The caller's kernel buffer and these owned user frames are
+                // disjoint; single-core interrupts-off locking prevents changes.
+                unsafe {
+                    if write {
+                        core::ptr::copy_nonoverlapping(buffer.add(offset), physical, count);
+                    } else {
+                        core::ptr::copy_nonoverlapping(physical, buffer.add(offset), count);
+                    }
+                }
+                address += count as u64;
+                offset += count;
+            }
+            Ok(())
+        })
+    }
+}
+
+pub fn activate_kernel() {
+    with(|memory| {
+        // SAFETY: all callers run on a shared kernel stack without user references.
+        unsafe { activate(memory.kernel_root) };
+    });
 }
 
 impl Drop for AddressSpace {
