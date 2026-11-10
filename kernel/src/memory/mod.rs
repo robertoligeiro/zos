@@ -123,7 +123,7 @@ impl Memory {
             }
             if level > 1 && !entry.flags().contains(Flags::HUGE_PAGE) {
                 self.release_tree(entry.addr().as_u64(), level - 1, release_data);
-            } else if release_data {
+            } else if release_data && !entry.flags().contains(Flags::BIT_9) {
                 assert_eq!(level, 1, "Owned user mapping must be 4 KiB");
                 self.frames.release(entry.addr().as_u64()).unwrap();
             }
@@ -221,7 +221,8 @@ impl Memory {
             if !(*leaf).flags().contains(Flags::PRESENT) {
                 return Err(Error::NotMapped);
             }
-            (*leaf).set_flags(permissions.flags(address < 0x0000_8000_0000_0000));
+            let borrowed = (*leaf).flags() & (Flags::BIT_9 | Flags::NO_CACHE);
+            (*leaf).set_flags(permissions.flags(address < 0x0000_8000_0000_0000) | borrowed);
         }
         tlb::flush(VirtAddr::new(address));
         Ok(())
@@ -231,16 +232,19 @@ impl Memory {
         let indices = Self::indices(address)?;
         let leaf = self.leaf(root, address, false)?;
         // SAFETY: this owned 4 KiB mapping can be detached under the lock.
-        let frame = unsafe {
+        let (frame, borrowed) = unsafe {
             if !(*leaf).flags().contains(Flags::PRESENT) {
                 return Err(Error::NotMapped);
             }
             let frame = (*leaf).addr().as_u64();
+            let borrowed = (*leaf).flags().contains(Flags::BIT_9);
             (*leaf).set_unused();
-            frame
+            (frame, borrowed)
         };
         tlb::flush(VirtAddr::new(address));
-        self.frames.release(frame)?;
+        if !borrowed {
+            self.frames.release(frame)?;
+        }
         let mut path = [(0_u64, 0_usize, 0_u64); 3];
         let mut table = root;
         for (depth, index) in indices[..3].iter().copied().enumerate() {
@@ -308,6 +312,61 @@ impl AddressSpace {
     pub fn map(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {
         Self::user_address(address)?;
         with(|memory| memory.map(self.root, address, permissions))
+    }
+
+    /// Map only the boot framebuffer; BIT_9 distinguishes borrowed device memory
+    /// from allocator-owned frames during unmap and address-space destruction.
+    pub fn map_framebuffer(&mut self) -> Result<zos_libos::Framebuffer, Error> {
+        let fb = crate::boot::FRAMEBUFFER.response().unwrap().framebuffers()[0];
+        let offset = crate::boot::HHDM.response().unwrap().offset;
+        let physical = (fb.address() as u64)
+            .checked_sub(offset)
+            .ok_or(Error::InvalidAddress)?;
+        let length = fb
+            .pitch
+            .checked_mul(fb.height)
+            .ok_or(Error::InvalidAddress)?;
+        if length == 0 || length > 16 * 1024 * 1024 {
+            return Err(Error::InvalidAddress);
+        }
+        let base = 0x2000_0000;
+        let within = physical % PAGE_SIZE;
+        let pages = (length + within).div_ceil(PAGE_SIZE);
+        with(|memory| {
+            for index in 0..pages {
+                let result = (|| {
+                    let leaf = memory.leaf(self.root, base + index * PAGE_SIZE, true)?;
+                    // SAFETY: serialized private page table; framebuffer frames
+                    // are reserved by Limine and never enter our RAM allocator.
+                    unsafe {
+                        if !(*leaf).is_unused() {
+                            return Err(Error::AlreadyMapped);
+                        }
+                        (*leaf).set_addr(
+                            PhysAddr::new(physical - within + index * PAGE_SIZE),
+                            Permissions::DATA.flags(true) | Flags::BIT_9 | Flags::NO_CACHE,
+                        );
+                    }
+                    tlb::flush(VirtAddr::new(base + index * PAGE_SIZE));
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    for mapped in 0..index {
+                        memory.unmap(self.root, base + mapped * PAGE_SIZE).unwrap();
+                    }
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(zos_libos::Framebuffer {
+            address: base + within,
+            width: fb.width as usize,
+            height: fb.height as usize,
+            pitch: fb.pitch as usize,
+            shifts: [fb.red_mask_shift, fb.green_mask_shift, fb.blue_mask_shift],
+            length: length as usize,
+        })
     }
 
     pub fn protect(&mut self, address: u64, permissions: Permissions) -> Result<(), Error> {

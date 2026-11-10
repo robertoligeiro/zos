@@ -11,8 +11,9 @@ from mkimage import (
     create_image, image_path, long_entries, short_name,
 )
 from zos import (
-    CASES, COMMON_MARKERS, IPC_MARKERS, MEMORY_MARKERS, READY_MARKER, USER_PROGRAMS,
-    image, qemu_command, screenshot, user_environment, validate_log,
+    CASES, COMMON_MARKERS, CONSOLE_LINES, CONSOLE_MARKERS, IPC_MARKERS,
+    MEMORY_MARKERS, READY_MARKER, USER_PROGRAMS,
+    image, qemu_command, screenshot, user_environment, validate_log, wait_serial,
 )
 
 
@@ -172,7 +173,7 @@ class AcceptanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=BUILD) as directory:
             output = Path(directory)
             serial_text = "\n".join(
-                (self.valid_log("BIOS", "ipc"), READY_MARKER)
+                (self.valid_log("BIOS", "ipc"), *CONSOLE_MARKERS)
             )
             replies = iter([
                 b'{"QMP": {}}\n',
@@ -232,6 +233,13 @@ class AcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(memory[memory.index("-m") + 1], "1024M")
 
     def valid_log(self, firmware, case):
+        if case == "console":
+            return self.valid_log(firmware, "ipc") + "\n" + "\n".join((
+                *CONSOLE_MARKERS, *(f"TTY LINE: {line}" for line in CONSOLE_LINES),
+                "TTY PASS: real keys, editing, modifiers and history",
+                "MOUSE: x=592 y=354 buttons=1", "MOUSE: x=592 y=354 buttons=0",
+                "CONSOLE CLEANUP PASS:", "CONSOLE ACCEPTANCE PASS",
+            ))
         result = "\n".join((*COMMON_MARKERS, f"FIRMWARE: {firmware}", CASES[case][1]))
         result = result.replace("TIMER PASS:", "TIMER PASS: ticks=100")
         if case == "divide":
@@ -275,6 +283,26 @@ class AcceptanceHarnessTests(unittest.TestCase):
         self.assertIn("link-arg=-Tservers/demo/linker.ld", flags)
         self.assertNotIn("link-arg=-Tkernel/linker.ld", flags)
         self.assertEqual(Path(env["CARGO_TARGET_DIR"]).parts[-2:], ("target", "user"))
+
+    def test_console_requires_actual_edits_mouse_and_cleanup(self):
+        valid = self.valid_log("BIOS", "console")
+        validate_log(valid, "bios", "console")
+        for marker in (*CONSOLE_MARKERS, "TTY LINE: ab!c", "buttons=0", "CONSOLE CLEANUP PASS:"):
+            with self.subTest(marker=marker), self.assertRaises(RuntimeError):
+                validate_log(valid.replace(marker, ""), "bios", "console")
+        for broken in (valid + "\nCONSOLE SERVICE FAILURE", valid + "\nEXCEPTION: BAD",
+                       valid.replace("TTY LINE: ZOS", "TTY LINE: zos"),
+                       valid + "\nUSER FAULT: tid=3 kind=PAGE FAULT address=0"):
+            with self.subTest(log=broken), self.assertRaises(RuntimeError):
+                validate_log(broken, "bios", "console")
+
+    def test_console_wait_rejects_failure_even_when_ready_marker_is_present(self):
+        BUILD.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=BUILD) as directory:
+            log = Path(directory) / "serial.log"
+            log.write_text(f"{READY_MARKER}\nCONSOLE SERVICE FAILURE", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                wait_serial(Mock(), log, READY_MARKER, 1)
 
     def test_image_packages_every_configured_user_module(self):
         with patch("zos.Path.read_bytes", return_value=b"ELF payload"), \

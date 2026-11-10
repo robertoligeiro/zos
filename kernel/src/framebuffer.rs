@@ -125,6 +125,10 @@ pub fn clear() {
         .clear();
 }
 
+pub fn handoff() {
+    *TERMINAL.lock() = None;
+}
+
 pub fn print(args: fmt::Arguments<'_>) {
     // Fault-time screen output is best effort; never deadlock on an interrupted writer.
     if let Some(mut terminal) = TERMINAL.try_lock() {

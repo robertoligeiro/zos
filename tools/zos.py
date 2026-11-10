@@ -25,6 +25,7 @@ CASES = {
     "memory-unmap": ("test-memory-unmap", "MEMORY UNMAP ACCEPTANCE PASS"),
     "memory-execute": ("test-memory-execute", "MEMORY EXECUTE ACCEPTANCE PASS"),
     "ipc": ("test-ipc", "IPC ACCEPTANCE PASS"),
+    "console": ("test-console", "CONSOLE ACCEPTANCE PASS"),
 }
 COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
                   "GDT/TSS/IDT ready", "PAGING ready:", "HEAP ready:",
@@ -43,8 +44,13 @@ IPC_MARKERS = (
     "SCHEDULER PASS:", "IPC PASS:", "IRQ/IO PASS:", "USER ISOLATION PASS:",
     "PROCESS CLEANUP PASS:",
 )
-USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe")
-READY_MARKER = "ZOS ready: IPC checkpoint"
+USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe",
+                 "console-server", "input-server", "tty-server")
+READY_MARKER = "ZOS ready: console checkpoint"
+CONSOLE_MARKERS = ("CONSOLE PASS: cursor, colors, backspace, scrolling",
+                   "PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12",
+                   "CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated", READY_MARKER)
+CONSOLE_LINES = ["zombie", "zombie!", "zombie!", "ZOS", "ab!c", "~finish"]
 
 
 def environment() -> dict[str, str]:
@@ -78,7 +84,8 @@ def cargo(*args: str, user: bool = False) -> None:
 
 
 def build(case: str | None = None) -> Path:
-    cargo("build", "--locked", "--release", "--package", "zos-demo", user=True)
+    cargo("build", "--locked", "--release", "--package", "zos-demo",
+          "--package", "zos-console", user=True)
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     if case:
         args += ["--features", CASES[case][0]]
@@ -161,10 +168,12 @@ def validate_log(text: str, firmware: str, case: str) -> None:
     if case in ("page-fault", "memory-protection", "memory-unmap", "memory-execute") \
             and "EXCEPTION: PAGE FAULT" not in text:
         raise RuntimeError("Page-fault test did not report the expected CPU exception")
-    if case in ("boot", "memory", "ipc") and "EXCEPTION:" in text:
+    if case in ("boot", "memory", "ipc", "console") and "EXCEPTION:" in text:
         raise RuntimeError("Boot image raised an unexpected exception")
     if case == "ipc":
         validate_ipc(text)
+    if case == "console":
+        validate_console(text)
 
 
 def validate_ipc(text: str) -> None:
@@ -184,8 +193,165 @@ def validate_ipc(text: str) -> None:
     if len(exits) != 6 or any(status != "0" for status in exits):
         raise RuntimeError("All six non-faulting threads must exit successfully")
 
+def validate_console(text: str) -> None:
+    validate_ipc(text)
+    for marker in (*CONSOLE_MARKERS, "TTY PASS: real keys, editing, modifiers and history",
+                   "CONSOLE CLEANUP PASS:", "CONSOLE ACCEPTANCE PASS",
+                   "MOUSE: x=592 y=354 buttons=1", "MOUSE: x=592 y=354 buttons=0"):
+        if marker not in text:
+            raise RuntimeError(f"Missing console proof: {marker}")
+    if re.findall(r"TTY LINE: ([^\r\n]*)", text) != CONSOLE_LINES:
+        raise RuntimeError("Actual typed/edited/history lines do not match console script")
+    if "CONSOLE SERVICE FAILURE" in text or "KERNEL PANIC" in text or "EXCEPTION:" in text:
+        raise RuntimeError("Console service or kernel failed")
+
+
+class Qmp:
+    """Bounded, sequential QMP over pipes; no listening socket."""
+
+    def __init__(self, process, path: Path, timeout: int):
+        self.process = process
+        self.timeout = timeout
+        self.reader = ThreadPoolExecutor(max_workers=1)
+        self.log = path.open("wb")
+        self.sequence = 0
+
+    def receive(self) -> dict:
+        try:
+            line = self.reader.submit(self.process.stdout.readline).result(timeout=self.timeout)
+        except TimeoutError as error:
+            raise RuntimeError("QMP response timed out") from error
+        if not line:
+            raise RuntimeError("QMP closed before command completed")
+        self.log.write(line)
+        self.log.flush()
+        return json.loads(line)
+
+    def negotiate(self) -> None:
+        if "QMP" not in self.receive():
+            raise RuntimeError("Missing QMP greeting")
+        self.execute("qmp_capabilities", identity="capabilities")
+
+    def execute(self, command: str, arguments: dict | None = None,
+                *, identity: str | None = None) -> None:
+        self.sequence += 1
+        request = {"execute": command, "id": identity or str(self.sequence)}
+        if arguments is not None:
+            request["arguments"] = arguments
+        self.process.stdin.write(json.dumps(request).encode() + b"\n")
+        self.process.stdin.flush()
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            response = self.receive()
+            if "error" in response:
+                raise RuntimeError(f"QMP {command} failed: {response['error']}")
+            if response.get("id") == request["id"] and "return" in response:
+                return
+        raise RuntimeError(f"QMP {command} timed out")
+
+    def close(self) -> None:
+        # Kill/wait the VM before closing so a timed-out pipe reader cannot hang.
+        self.reader.shutdown(wait=True)
+        self.log.close()
+
+
+def wait_serial(process, log: Path, marker: str, timeout: int) -> str:
+    deadline = time.monotonic() + timeout
+    while True:
+        text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+        if any(failure in text for failure in ("KERNEL PANIC", "EXCEPTION:", "CONSOLE SERVICE FAILURE")):
+            raise RuntimeError(f"Guest failed; inspect {log}")
+        if marker in text:
+            return text
+        if process.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError(f"Waiting for {marker!r} failed; inspect {log}")
+        time.sleep(0.01)
+
+
+def console_case(disk: Path, firmware: str, timeout: int) -> None:
+    log = BUILD / f"{firmware}-console.serial.log"
+    stderr = BUILD / f"{firmware}-console.qemu.log"
+    picture = BUILD / f"{firmware}-console.ppm"
+    for path in (log, stderr, picture):
+        path.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, exit_on_shutdown=True) + [
+        "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-qmp", "stdio",
+    ]
+    with stderr.open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-console.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            wait_serial(process, log, READY_MARKER, timeout)
+            keys = 0
+
+            def event_key(code, down):
+                return {"type": "key", "data": {"down": down,
+                        "key": {"type": "qcode", "data": code}}}
+
+            def key(code, *, shift=False, counted=True, finish=False):
+                nonlocal keys
+                events = [event_key(code, True), event_key(code, False)]
+                if shift:
+                    events = [event_key("shift", True), *events, event_key("shift", False)]
+                qmp.execute("input-send-event", {"events": events})
+                if counted and not finish:
+                    keys += 1
+                    wait_serial(process, log, f"TTY KEY: {keys}\n", timeout)
+
+            # Backspace, Home/End, Delete, insertion, modifier release and history.
+            qmp.execute("input-send-event", {"events": [
+                event_key(code, down) for code in "zxombiex" for down in (True, False)
+            ]})
+            keys += len("zxombiex")
+            wait_serial(process, log, f"TTY KEY: {keys}\n", timeout)
+            for code in ("backspace", "home", "right", "delete", "end", "ret"):
+                key(code)
+            key("up"); key("1", shift=True); key("ret")
+            key("x"); key("up"); key("down"); key("backspace"); key("up"); key("ret")
+            key("caps_lock", counted=False)
+            for code in "zos":
+                key(code)
+            key("ret"); key("caps_lock", counted=False)
+            key("a"); key("c"); key("left"); key("b")
+            key("1", shift=True); key("end"); key("ret")
+            qmp.execute("input-send-event", {"events": [
+                {"type": "rel", "data": {"axis": "x", "value": 80}},
+                {"type": "rel", "data": {"axis": "y", "value": -30}},
+                {"type": "btn", "data": {"button": "left", "down": True}},
+            ]})
+            wait_serial(process, log, "MOUSE: x=592 y=354 buttons=1", timeout)
+            qmp.execute("input-send-event", {"events": [
+                {"type": "btn", "data": {"button": "left", "down": False}},
+            ]})
+            wait_serial(process, log, "MOUSE: x=592 y=354 buttons=0", timeout)
+            qmp.execute("screendump", {"filename": str(picture)})
+            if not picture.read_bytes().startswith(b"P6\n"):
+                raise RuntimeError("Console framebuffer capture failed")
+            key("grave_accent", shift=True)
+            for code in "finish":
+                key(code)
+            key("ret", finish=True)
+            code = process.wait(timeout=timeout)
+            if code != 33:
+                raise RuntimeError(f"{firmware}/console expected exit 33, got {code}; inspect {log}")
+            validate_log(log.read_text(encoding="utf-8", errors="replace"), firmware, "console")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    print(f"PASS {firmware}/console: real keyboard/mouse, editing/history, rendering, cleanup", flush=True)
+
 
 def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
+    if case == "console":
+        console_case(disk, firmware, timeout)
+        return
     log = BUILD / f"{firmware}-{case}.serial.log"
     stderr = BUILD / f"{firmware}-{case}.qemu.log"
     log.unlink(missing_ok=True)
@@ -228,7 +394,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
         process = subprocess.Popen(
             command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
         )
-        reader = ThreadPoolExecutor(max_workers=1)
+        qmp = Qmp(process, BUILD / f"{firmware}-screen.qmp.log", timeout)
         try:
             deadline = time.monotonic() + timeout
             while True:
@@ -244,35 +410,12 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: screenshot boot log missing {marker}")
             validate_ipc(text)
-            requests = [
-                {"execute": "qmp_capabilities", "id": "capabilities"},
-                {"execute": "screendump", "arguments": {"filename": str(picture)}, "id": "capture"},
-                {"execute": "quit", "id": "quit"},
-            ]
-            with (BUILD / f"{firmware}-screen.qmp.log").open("wb") as protocol_log:
-                def receive() -> dict:
-                    try:
-                        line = reader.submit(process.stdout.readline).result(timeout=timeout)
-                    except TimeoutError as error:
-                        raise RuntimeError("QMP response timed out") from error
-                    if not line:
-                        raise RuntimeError("QMP closed before capture completed")
-                    protocol_log.write(line)
-                    protocol_log.flush()
-                    return json.loads(line)
-
-                if "QMP" not in receive():
-                    raise RuntimeError("Missing QMP greeting")
-                for request in requests:
-                    # Complete capability negotiation before submitting later commands.
-                    process.stdin.write(json.dumps(request).encode() + b"\n")
-                    process.stdin.flush()
-                    while True:
-                        response = receive()
-                        if "error" in response:
-                            raise RuntimeError(f"QMP capture failed: {response['error']}")
-                        if response.get("id") == request["id"] and "return" in response:
-                            break
+            for marker in CONSOLE_MARKERS:
+                if marker not in text:
+                    raise RuntimeError(f"{firmware}: normal console missing {marker}")
+            qmp.negotiate()
+            qmp.execute("screendump", {"filename": str(picture)}, identity="capture")
+            qmp.execute("quit", identity="quit")
             process.wait(timeout=timeout)
             pixels = picture.read_bytes()
             if not pixels.startswith(b"P6\n") or len(pixels) < 1024:
@@ -283,7 +426,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            reader.shutdown(wait=True)
+            qmp.close()
             if process.stdin is not None:
                 process.stdin.close()
             if process.stdout is not None:
@@ -295,7 +438,10 @@ def check() -> None:
     subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tools"),
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
+    cargo("test", "--locked", "--package", "zos-console", "--lib",
+          "--target", "x86_64-pc-windows-gnu")
     cargo("clippy", "--locked", "--release", "--package", "zos-demo",
+          "--package", "zos-console",
           "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
@@ -305,7 +451,7 @@ def check() -> None:
 
 
 def accept(timeout: int) -> None:
-    result = BUILD / "phase-4-acceptance.json"
+    result = BUILD / "phase-5-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
     check()
@@ -317,13 +463,13 @@ def accept(timeout: int) -> None:
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout)
     result.write_text(json.dumps({
-        "phase": 4,
+        "phase": 5,
         "automated_checks": "passed",
-        "visual_review": "pending: inspect bios-screen.ppm and uefi-screen.ppm",
+        "visual_review": "pending: inspect bios/uefi-screen.ppm and bios/uefi-console.ppm",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED STEP 4 PASS. Inspect both screenshots before starting Step 5.", flush=True)
+    print("AUTOMATED STEP 5 PASS. Inspect normal and console screenshots before Step 6.", flush=True)
 
 
 def main() -> None:

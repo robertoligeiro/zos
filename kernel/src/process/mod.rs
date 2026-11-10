@@ -4,7 +4,7 @@ mod elf;
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use arch::{Context, Frame, FxState};
 use spin::Mutex;
-use x86_64::instructions::{interrupts as cpu_interrupts, port::Port};
+use x86_64::instructions::interrupts as cpu_interrupts;
 use zos_libos::{Call, Error, MAX_MESSAGE};
 
 use crate::memory::{self, AddressSpace, Permissions, PAGE_SIZE};
@@ -18,7 +18,11 @@ struct Process {
     space: AddressSpace,
     stacks: u64,
     dynamic_pages: usize,
-    driver: bool,
+    ports: u8,
+    irqs: u16,
+    framebuffer: bool,
+    framebuffer_mapped: bool,
+    test_control: bool,
 }
 
 impl Process {
@@ -74,7 +78,7 @@ struct Thread {
     base: u8,
     effective: u8,
     state: State,
-    port: bool,
+    ports: u8,
     expected_fault: Option<&'static str>,
 }
 
@@ -93,7 +97,7 @@ impl Thread {
             base: priority,
             effective: priority,
             state: State::Ready,
-            port: false,
+            ports: 0,
             expected_fault: None,
         })
     }
@@ -112,7 +116,7 @@ struct Channel {
     owner: usize,
     pending: VecDeque<usize>,
     closed: bool,
-    irq_pending: bool,
+    irq_pending: u16,
 }
 
 struct Scheduler {
@@ -121,7 +125,10 @@ struct Scheduler {
     current: Option<usize>,
     last: [usize; 32],
     sequence: u64,
-    irq_channel: Option<usize>,
+    irq_channels: [Option<usize>; 16],
+    irq_seen: [usize; 16],
+    console: bool,
+    console_finished: bool,
     replies: usize,
     cross_process: usize,
     donations: usize,
@@ -208,7 +215,7 @@ impl Scheduler {
         let thread = &self.threads[selected];
         let top = thread.stack.as_ptr() as u64 + core::mem::size_of_val(&*thread.stack) as u64;
         arch::kernel_stack(top);
-        crate::interrupts::select_stack(top, thread.port);
+        crate::interrupts::select_stack(top, thread.ports);
         // SAFETY: all kernel code, stacks and heap are shared; no user reference
         // is live across this switch. Context validation precedes every return.
         unsafe { thread.process.lock().space.activate() };
@@ -293,21 +300,23 @@ impl Scheduler {
             ) {
                 self.cross_process += 1;
             }
-        } else if self.channels[channel].irq_pending {
+        } else if self.channels[channel].irq_pending != 0 {
             if capacity < 8 {
                 self.threads[receiver].result(Err(Error::TooLarge), 0);
                 return;
             }
+            let irq = self.channels[channel].irq_pending.trailing_zeros() as usize;
             let copied = self.threads[receiver]
                 .process
                 .lock()
                 .space
-                .write_user(buffer, &0_u64.to_le_bytes());
+                .write_user(buffer, &(irq as u64).to_le_bytes());
             if copied.is_err() {
                 self.threads[receiver].result(Err(Error::BadAddress), 0);
                 return;
             }
-            self.channels[channel].irq_pending = false;
+            self.channels[channel].irq_pending &= !(1 << irq);
+            self.irq_seen[irq] += 1;
             self.irq_notifications += 1;
             self.threads[receiver].result(Ok(0), 8);
         } else {
@@ -319,9 +328,9 @@ impl Scheduler {
         }
     }
 
-    fn notify_timer(&mut self) {
-        if let Some(channel) = self.irq_channel {
-            self.channels[channel].irq_pending = true;
+    fn notify_irq(&mut self, irq: usize) {
+        if let Some(channel) = self.irq_channels[irq] {
+            self.channels[channel].irq_pending |= 1 << irq;
             let owner = self.channels[channel].owner;
             if let State::Receiving {
                 channel: waiting,
@@ -341,8 +350,11 @@ impl Scheduler {
             if channel.owner == owner {
                 channel.closed = true;
                 channel.pending.clear();
-                if self.irq_channel == Some(index) {
-                    self.irq_channel = None;
+                for (irq, attachment) in self.irq_channels.iter_mut().enumerate() {
+                    if *attachment == Some(index) {
+                        *attachment = None;
+                        crate::interrupts::irq_enable(irq, false);
+                    }
                 }
             }
         }
@@ -369,7 +381,7 @@ impl Scheduler {
                     owner: id,
                     pending: VecDeque::new(),
                     closed: false,
-                    irq_pending: false,
+                    irq_pending: 0,
                 });
                 Ok(Some(self.channels.len()))
             }
@@ -500,22 +512,86 @@ impl Scheduler {
                 if frame.rsi > 15 {
                     return Err(Error::Invalid);
                 }
-                if frame.rsi != 0
-                    || !self.threads[id].process.lock().driver
+                let irq = frame.rsi as usize;
+                if self.threads[id].process.lock().irqs & (1 << irq) == 0
                     || self.channels[channel].owner != id
-                    || self.irq_channel.is_some()
+                    || self.irq_channels[irq].is_some()
                 {
                     return Err(Error::Denied);
                 }
-                self.irq_channel = Some(channel);
+                self.irq_channels[irq] = Some(channel);
+                crate::interrupts::irq_enable(irq, true);
                 Ok(Some(0))
             }
             x if x == Call::IoPortGrant as u64 => {
-                if frame.rdi != 0x80 || frame.rsi != 1 || !self.threads[id].process.lock().driver {
+                let bit = match frame.rdi {
+                    0x80 => 1,
+                    0x60 => 2,
+                    0x64 => 4,
+                    _ => return Err(Error::Denied),
+                };
+                if frame.rsi != 1 || self.threads[id].process.lock().ports & bit == 0 {
                     return Err(Error::Denied);
                 }
-                self.threads[id].port = true;
+                self.threads[id].ports |= bit;
                 Ok(Some(0))
+            }
+            x if x == Call::FramebufferMap as u64 => {
+                let mut process = self.threads[id].process.lock();
+                if !process.framebuffer || process.framebuffer_mapped {
+                    return Err(Error::Denied);
+                }
+                if frame.rsi != 48 {
+                    return Err(Error::Invalid);
+                }
+                process
+                    .space
+                    .check(frame.rdi, 48, true)
+                    .map_err(|_| Error::BadAddress)?;
+                let fb = process.space.map_framebuffer().map_err(|error| {
+                    if error == memory::Error::OutOfFrames {
+                        Error::NoMemory
+                    } else {
+                        Error::Invalid
+                    }
+                })?;
+                process.framebuffer_mapped = true;
+                let mut bytes = [0_u8; 48];
+                for (index, word) in [
+                    fb.address,
+                    fb.width as u64,
+                    fb.height as u64,
+                    fb.pitch as u64,
+                    u32::from_le_bytes([fb.shifts[0], fb.shifts[1], fb.shifts[2], 0]) as u64,
+                    fb.length as u64,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                process
+                    .space
+                    .write_user(frame.rdi, &bytes)
+                    .map_err(|_| Error::BadAddress)?;
+                Ok(Some(0))
+            }
+            x if x == Call::ConsoleTestFinish as u64 => {
+                if !cfg!(feature = "test-console") || !self.threads[id].process.lock().test_control
+                {
+                    return Err(Error::Denied);
+                }
+                assert!(self.irq_seen[1] > 0 && self.irq_seen[12] > 0);
+                self.console_finished = true;
+                for owner in 0..self.threads.len() {
+                    assert!(!matches!(
+                        self.threads[owner].state,
+                        State::Faulted(_) | State::Exited(_)
+                    ));
+                    self.threads[owner].state = State::Exited(0);
+                    self.close_owned(owner);
+                }
+                Ok(None)
             }
             x if x == Call::Exit as u64 => {
                 crate::logln!("USER EXIT: tid={} status={}", id + 1, frame.rdi as i64);
@@ -558,7 +634,7 @@ impl Scheduler {
     }
 }
 
-fn dispatch(frame: &Frame, fx: &FxState, timer: bool) -> *const Context {
+fn dispatch(frame: &Frame, fx: &FxState, kind: u64) -> *const Context {
     let next = {
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut().expect("User trap before scheduler");
@@ -568,8 +644,8 @@ fn dispatch(frame: &Frame, fx: &FxState, timer: bool) -> *const Context {
         scheduler.threads[id].context.frame.flags = (frame.flags & 0x0000_0000_0020_0cd5) | 0x202;
         if !scheduler.validate_return(id) {
             scheduler.fault(id, "INVALID RETURN", frame.rsp);
-        } else if timer {
-            scheduler.notify_timer();
+        } else if kind != 1 {
+            scheduler.notify_irq(if kind == 0 { 0 } else { (kind - 1) as usize });
         } else {
             match scheduler.syscall(id) {
                 Ok(Some(value)) => scheduler.threads[id].result(Ok(value), 0),
@@ -577,7 +653,7 @@ fn dispatch(frame: &Frame, fx: &FxState, timer: bool) -> *const Context {
                 Err(error) => scheduler.threads[id].result(Err(error), 0),
             }
         }
-        scheduler.choose(timer)
+        scheduler.choose(kind == 0)
     };
     match next {
         Some(context) => context,
@@ -589,15 +665,16 @@ fn dispatch(frame: &Frame, fx: &FxState, timer: bool) -> *const Context {
 extern "C" fn zos_trap(frame: &Frame, fx: &FxState, kind: u64) -> *const Context {
     if kind == 0 {
         crate::TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // SAFETY: this is the assembly IRQ0 path and must acknowledge the PIC.
-        unsafe { Port::<u8>::new(0x20).write(0x20) };
     }
-    dispatch(frame, fx, kind == 0)
+    if kind != 1 {
+        crate::interrupts::acknowledge(if kind == 0 { 0 } else { (kind - 1) as usize });
+    }
+    dispatch(frame, fx, kind)
 }
 
-pub fn idle_tick() {
+pub fn idle_irq(irq: usize) {
     if let Some(scheduler) = SCHEDULER.lock().as_mut() {
-        scheduler.notify_timer();
+        scheduler.notify_irq(irq);
     }
 }
 
@@ -655,6 +732,23 @@ extern "C" fn zos_idle() -> ! {
 
 fn complete() -> ! {
     let scheduler = SCHEDULER.lock().take().unwrap();
+    if scheduler.console {
+        assert!(
+            scheduler.console_finished,
+            "Console services stopped unexpectedly"
+        );
+        let baseline = scheduler.baseline;
+        drop(scheduler);
+        let after = memory::stats();
+        assert_eq!(after.free_bytes, baseline.free_bytes, "Console frame leak");
+        assert_eq!(
+            after.heap_used_bytes, baseline.heap_used_bytes,
+            "Console heap leak"
+        );
+        crate::logln!("CONSOLE CLEANUP PASS: borrowed framebuffer and driver resources released");
+        crate::logln!("CONSOLE ACCEPTANCE PASS");
+        crate::finish_test(true);
+    }
     assert!(scheduler.preemptions >= 1, "No user timer preemption");
     assert!(scheduler.donations > 0, "No priority inheritance");
     assert!(scheduler.replies >= 4 && scheduler.cross_process >= 3);
@@ -700,10 +794,7 @@ fn complete() -> ! {
         crate::logln!("IPC ACCEPTANCE PASS");
         crate::finish_test(true);
     }
-    crate::logln!("ZOS ready: IPC checkpoint; no user-space shell yet.");
-    loop {
-        cpu_interrupts::enable_and_hlt();
-    }
+    start_console()
 }
 
 pub fn start() -> ! {
@@ -727,7 +818,10 @@ pub fn start() -> ! {
         current: None,
         last: [usize::MAX; 32],
         sequence: 0,
-        irq_channel: None,
+        irq_channels: [None; 16],
+        irq_seen: [0; 16],
+        console: false,
+        console_finished: false,
         replies: 0,
         cross_process: 0,
         donations: 0,
@@ -749,7 +843,11 @@ pub fn start() -> ! {
             space,
             stacks: 0,
             dynamic_pages: 0,
-            driver,
+            ports: if driver { 1 } else { 0 },
+            irqs: if driver { 1 } else { 0 },
+            framebuffer: false,
+            framebuffer_mapped: false,
+            test_control: false,
         }));
         let mut thread = Thread::new(process, entry, role, priority).unwrap();
         thread.expected_fault = expected_fault;
@@ -762,5 +860,65 @@ pub fn start() -> ! {
     assert!(SCHEDULER.lock().replace(scheduler).is_none());
     // SAFETY: choose configured the first user root and kernel stack. Contexts
     // live in the Vec allocation, which is not moved until a later kernel trap.
+    unsafe { arch::resume(next) }
+}
+
+fn start_console() -> ! {
+    crate::logln!("Starting ring-3 console, PS/2 input and TTY servers");
+    crate::framebuffer::handoff();
+    let mut scheduler = Scheduler {
+        threads: Vec::new(),
+        channels: Vec::new(),
+        current: None,
+        last: [0; 32],
+        sequence: 0,
+        irq_channels: [None; 16],
+        irq_seen: [0; 16],
+        console: true,
+        console_finished: false,
+        replies: 0,
+        cross_process: 0,
+        donations: 0,
+        preemptions: 0,
+        irq_notifications: 0,
+        baseline: memory::stats(),
+    };
+    for (name, priority, ports, irqs, framebuffer) in [
+        ("console-server", 0, 0, 0, true),
+        ("input-server", 1, 6, (1 << 1) | (1 << 12), false),
+        ("tty-server", 2, 0, 0, false),
+    ] {
+        let file = crate::boot::MODULES
+            .response()
+            .unwrap()
+            .modules()
+            .iter()
+            .find(|file| file.cmdline() == name)
+            .expect("Missing console ELF");
+        let (space, entry) = elf::load(file.data()).expect("Console ELF load failed");
+        let process = Arc::new(Mutex::new(Process {
+            space,
+            stacks: 0,
+            dynamic_pages: 0,
+            ports,
+            irqs,
+            framebuffer,
+            framebuffer_mapped: false,
+            test_control: name == "tty-server",
+        }));
+        scheduler.threads.push(
+            Thread::new(
+                process,
+                entry,
+                cfg!(feature = "test-console") as u64,
+                priority,
+            )
+            .unwrap(),
+        );
+    }
+    scheduler.last = [scheduler.threads.len() - 1; 32];
+    let next = scheduler.choose(false).unwrap();
+    assert!(SCHEDULER.lock().replace(scheduler).is_none());
+    // SAFETY: all service contexts and capability sets are installed before entry.
     unsafe { arch::resume(next) }
 }

@@ -84,6 +84,8 @@ static mut ZOS_KERNEL_RSP: u64 = 0;
 
 extern "C" {
     pub fn zos_timer_entry();
+    pub fn zos_keyboard_entry();
+    pub fn zos_mouse_entry();
     fn zos_syscall_entry();
     fn zos_restore(context: *const Context) -> !;
     fn zos_idle_entry() -> !;
@@ -211,6 +213,21 @@ zos_timer_entry:
     push 0
     PUSH_REGS
     xor edx, edx
+    jmp zos_trap_common
+
+    .macro DEVICE_IRQ name, boot, kind
+    .global \name
+\name:
+    test byte ptr [rsp + 8], 3
+    jz \boot
+    push 0
+    PUSH_REGS
+    mov edx, \kind
+    jmp zos_trap_common
+    .endm
+    DEVICE_IRQ zos_keyboard_entry, zos_boot_keyboard, 2
+    DEVICE_IRQ zos_mouse_entry, zos_boot_mouse, 13
+
 zos_trap_common:
     cld
     sub rsp, 520

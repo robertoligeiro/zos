@@ -18,6 +18,7 @@ test-memory-protection = []
 test-memory-unmap = []
 test-memory-execute = []
 test-ipc = []
+test-console = []
 
 [dependencies]
 limine = "=0.6.5"

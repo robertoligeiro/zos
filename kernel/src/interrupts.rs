@@ -148,6 +148,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[TIMER_VECTOR].set_handler_addr(VirtAddr::new(
             crate::process::arch::zos_timer_entry as usize as u64,
         ));
+        idt[33].set_handler_addr(VirtAddr::new(
+            crate::process::arch::zos_keyboard_entry as usize as u64,
+        ));
+        idt[44].set_handler_addr(VirtAddr::new(
+            crate::process::arch::zos_mouse_entry as usize as u64,
+        ));
     }
     idt[39].set_handler_fn(spurious_master);
     idt[47].set_handler_fn(spurious_slave);
@@ -202,10 +208,62 @@ pub extern "x86-interrupt" fn zos_boot_timer(_: InterruptStackFrame) {
     crate::TICKS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: this handler services master-PIC IRQ0 and must acknowledge it.
     unsafe { Port::<u8>::new(0x20).write(0x20) };
-    crate::process::idle_tick();
+    crate::process::idle_irq(0);
 }
 
-pub fn select_stack(top: u64, port: bool) {
+#[no_mangle]
+pub extern "x86-interrupt" fn zos_boot_keyboard(_: InterruptStackFrame) {
+    acknowledge(1);
+    crate::process::idle_irq(1);
+}
+
+#[no_mangle]
+pub extern "x86-interrupt" fn zos_boot_mouse(_: InterruptStackFrame) {
+    acknowledge(12);
+    crate::process::idle_irq(12);
+}
+
+pub fn acknowledge(irq: usize) {
+    // SAFETY: IRQ12 must acknowledge the slave before its master cascade.
+    unsafe {
+        if irq >= 8 {
+            Port::<u8>::new(0xa0).write(0x20);
+        }
+        Port::<u8>::new(0x20).write(0x20);
+    }
+}
+
+pub fn irq_enable(irq: usize, enable: bool) {
+    assert!(!x86_64::instructions::interrupts::are_enabled());
+    assert!(matches!(irq, 0 | 1 | 12));
+    if irq == 0 {
+        return;
+    }
+    // SAFETY: only the serialized scheduler changes PIC masks after boot.
+    unsafe {
+        let mut master = Port::<u8>::new(0x21);
+        let mut slave = Port::<u8>::new(0xa1);
+        let mut mask = if irq < 8 { master.read() } else { slave.read() };
+        if enable {
+            mask &= !(1 << (irq % 8));
+        } else {
+            mask |= 1 << (irq % 8);
+        }
+        if irq < 8 {
+            master.write(mask);
+        } else {
+            slave.write(mask);
+            let current = master.read();
+            master.write(if mask == 0xff {
+                current | 4
+            } else {
+                current & !4
+            });
+        }
+    }
+}
+
+pub fn select_stack(top: u64, ports: u8) {
     assert!(!x86_64::instructions::interrupts::are_enabled());
     // SAFETY: no hardware privilege transition or other TSS mutation can occur
     // until the scheduler returns to user mode. All ungranted ports stay denied.
@@ -215,8 +273,10 @@ pub fn select_stack(top: u64, port: bool) {
             .write_unaligned(VirtAddr::new(top));
         let bitmap = &mut *TSS.bitmap.get();
         bitmap.fill(0xff);
-        if port {
-            bitmap[0x80 / 8] &= !(1 << (0x80 % 8));
+        for (bit, port) in [(1, 0x80), (2, 0x60), (4, 0x64)] {
+            if ports & bit != 0 {
+                bitmap[port / 8] &= !(1 << (port % 8));
+            }
         }
     }
 }

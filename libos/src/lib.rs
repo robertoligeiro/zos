@@ -14,6 +14,8 @@ pub enum Call {
     IoPortGrant = 7,
     Exit = 8,
     DebugWrite = 9,
+    FramebufferMap = 10,
+    ConsoleTestFinish = 11,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +177,38 @@ pub fn debug_write(text: &str) -> Result<(), Error> {
         [text.as_ptr() as u64, text.len() as u64, 0, 0, 0],
     )
     .map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Framebuffer {
+    pub address: u64,
+    pub width: usize,
+    pub height: usize,
+    pub pitch: usize,
+    pub shifts: [u8; 3],
+    pub length: usize,
+}
+
+pub fn framebuffer_map() -> Result<Framebuffer, Error> {
+    let mut bytes = [0_u8; 48];
+    call(
+        Call::FramebufferMap,
+        [bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0],
+    )?;
+    let word = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+    Ok(Framebuffer {
+        address: word(0),
+        width: word(8) as usize,
+        height: word(16) as usize,
+        pitch: word(24) as usize,
+        shifts: [bytes[32], bytes[33], bytes[34]],
+        length: word(40) as usize,
+    })
+}
+
+/// Available only to the initial TTY in dedicated console acceptance images.
+pub fn console_test_finish() -> Result<(), Error> {
+    call(Call::ConsoleTestFinish, [0; 5]).map(|_| ())
 }
 
 pub fn exit(status: i64) -> ! {

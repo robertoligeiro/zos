@@ -1,0 +1,26 @@
+[package]
+name = "zos-console"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "console-server"
+path = "src/console.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "input-server"
+path = "src/input.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "tty-server"
+path = "src/tty.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }
+font8x8 = { version = "=0.3.1", default-features = false, features = ["unicode"] }
