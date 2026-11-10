@@ -5,7 +5,7 @@ use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use arch::{Context, Frame, FxState};
 use spin::Mutex;
 use x86_64::instructions::interrupts as cpu_interrupts;
-use zos_libos::{Call, Error, MAX_MESSAGE};
+use zos_libos::{Call, Error, MAX_MESSAGE, MAX_STORAGE_MESSAGE};
 
 use crate::memory::{self, AddressSpace, Permissions, PAGE_SIZE};
 
@@ -23,6 +23,8 @@ struct Process {
     framebuffer: bool,
     framebuffer_mapped: bool,
     test_control: bool,
+    storage_control: bool,
+    bulk: bool,
 }
 
 impl Process {
@@ -55,7 +57,6 @@ enum State {
     },
     Sending {
         channel: usize,
-        message: [u8; MAX_MESSAGE],
         length: usize,
         reply: u64,
         capacity: usize,
@@ -80,6 +81,7 @@ struct Thread {
     state: State,
     ports: u8,
     expected_fault: Option<&'static str>,
+    pending_message: [u8; MAX_STORAGE_MESSAGE],
 }
 
 impl Thread {
@@ -99,6 +101,7 @@ impl Thread {
             state: State::Ready,
             ports: 0,
             expected_fault: None,
+            pending_message: [0; MAX_STORAGE_MESSAGE],
         })
     }
 
@@ -129,6 +132,7 @@ struct Scheduler {
     irq_seen: [usize; 16],
     console: bool,
     console_finished: bool,
+    storage_finished: bool,
     replies: usize,
     cross_process: usize,
     donations: usize,
@@ -227,11 +231,16 @@ impl Scheduler {
         thread: usize,
         pointer: u64,
         length: u64,
-    ) -> Result<([u8; MAX_MESSAGE], usize), Error> {
-        if length > MAX_MESSAGE as u64 {
+    ) -> Result<([u8; MAX_STORAGE_MESSAGE], usize), Error> {
+        let limit = if self.threads[thread].process.lock().bulk {
+            MAX_STORAGE_MESSAGE
+        } else {
+            MAX_MESSAGE
+        };
+        if length > limit as u64 {
             return Err(Error::TooLarge);
         }
-        let mut bytes = [0; MAX_MESSAGE];
+        let mut bytes = [0; MAX_STORAGE_MESSAGE];
         self.threads[thread]
             .process
             .lock()
@@ -242,7 +251,12 @@ impl Scheduler {
     }
 
     fn check_buffer(&self, thread: usize, pointer: u64, length: u64) -> Result<usize, Error> {
-        if length > MAX_MESSAGE as u64 {
+        let limit = if self.threads[thread].process.lock().bulk {
+            MAX_STORAGE_MESSAGE
+        } else {
+            MAX_MESSAGE
+        };
+        if length > limit as u64 {
             return Err(Error::TooLarge);
         }
         self.threads[thread]
@@ -263,7 +277,6 @@ impl Scheduler {
             .map(|(position, sender)| (position, *sender));
         if let Some((position, sender)) = queued {
             let State::Sending {
-                message,
                 length,
                 reply,
                 capacity: reply_capacity,
@@ -281,7 +294,7 @@ impl Scheduler {
                 .process
                 .lock()
                 .space
-                .write_user(buffer, &message[..length]);
+                .write_user(buffer, &self.threads[sender].pending_message[..length]);
             if copied.is_err() {
                 self.threads[receiver].result(Err(Error::BadAddress), 0);
                 return;
@@ -399,9 +412,9 @@ impl Scheduler {
                     .filter(|&value| value <= u64::MAX >> 16)
                     .ok_or(Error::Limit)?;
                 let token = (self.sequence << 16) | (id + 1) as u64;
+                self.threads[id].pending_message = message;
                 self.threads[id].state = State::Sending {
                     channel,
-                    message,
                     length,
                     reply: frame.r10,
                     capacity,
@@ -524,13 +537,15 @@ impl Scheduler {
                 Ok(Some(0))
             }
             x if x == Call::IoPortGrant as u64 => {
-                let bit = match frame.rdi {
-                    0x80 => 1,
-                    0x60 => 2,
-                    0x64 => 4,
+                let (bit, count) = match frame.rdi {
+                    0x80 => (1, 1),
+                    0x60 => (2, 1),
+                    0x64 => (4, 1),
+                    0x170 => (8, 8),
+                    0x376 => (16, 1),
                     _ => return Err(Error::Denied),
                 };
-                if frame.rsi != 1 || self.threads[id].process.lock().ports & bit == 0 {
+                if frame.rsi != count || self.threads[id].process.lock().ports & bit == 0 {
                     return Err(Error::Denied);
                 }
                 self.threads[id].ports |= bit;
@@ -593,6 +608,27 @@ impl Scheduler {
                 }
                 Ok(None)
             }
+            x if x == Call::StorageTestFinish as u64 => {
+                if !cfg!(any(feature = "test-fs-create", feature = "test-fs-read"))
+                    || !self.threads[id].process.lock().storage_control
+                {
+                    return Err(Error::Denied);
+                }
+                assert!(self.console && self.threads.len() >= 7);
+                self.storage_finished = true;
+                for thread in &mut self.threads {
+                    assert!(match thread.state {
+                        State::Faulted(_) => false,
+                        State::Exited(status) => status == 0,
+                        _ => true,
+                    });
+                    thread.state = State::Exited(0);
+                }
+                for owner in 0..self.threads.len() {
+                    self.close_owned(owner);
+                }
+                Ok(None)
+            }
             x if x == Call::Exit as u64 => {
                 crate::logln!("USER EXIT: tid={} status={}", id + 1, frame.rdi as i64);
                 self.threads[id].state = State::Exited(frame.rdi as i64);
@@ -600,6 +636,9 @@ impl Scheduler {
                 Ok(None)
             }
             x if x == Call::DebugWrite as u64 => {
+                if frame.rsi > MAX_MESSAGE as u64 {
+                    return Err(Error::TooLarge);
+                }
                 let (bytes, length) = self.request(id, frame.rdi, frame.rsi)?;
                 let text = core::str::from_utf8(&bytes[..length]).map_err(|_| Error::Invalid)?;
                 crate::logln!("USER tid={}: {}", id + 1, text);
@@ -732,6 +771,19 @@ extern "C" fn zos_idle() -> ! {
 
 fn complete() -> ! {
     let scheduler = SCHEDULER.lock().take().unwrap();
+    if scheduler.storage_finished {
+        let baseline = scheduler.baseline;
+        drop(scheduler);
+        let after = memory::stats();
+        assert_eq!(after.free_bytes, baseline.free_bytes, "Storage frame leak");
+        assert_eq!(
+            after.heap_used_bytes, baseline.heap_used_bytes,
+            "Storage heap leak"
+        );
+        crate::logln!("STORAGE CLEANUP PASS: all driver, filesystem and VFS resources released");
+        crate::logln!("FILESYSTEM ACCEPTANCE PASS");
+        crate::finish_test(true);
+    }
     if scheduler.console {
         assert!(
             scheduler.console_finished,
@@ -822,6 +874,7 @@ pub fn start() -> ! {
         irq_seen: [0; 16],
         console: false,
         console_finished: false,
+        storage_finished: false,
         replies: 0,
         cross_process: 0,
         donations: 0,
@@ -848,6 +901,8 @@ pub fn start() -> ! {
             framebuffer: false,
             framebuffer_mapped: false,
             test_control: false,
+            storage_control: false,
+            bulk: false,
         }));
         let mut thread = Thread::new(process, entry, role, priority).unwrap();
         thread.expected_fault = expected_fault;
@@ -876,6 +931,7 @@ fn start_console() -> ! {
         irq_seen: [0; 16],
         console: true,
         console_finished: false,
+        storage_finished: false,
         replies: 0,
         cross_process: 0,
         donations: 0,
@@ -905,6 +961,8 @@ fn start_console() -> ! {
             framebuffer,
             framebuffer_mapped: false,
             test_control: name == "tty-server",
+            storage_control: false,
+            bulk: false,
         }));
         scheduler.threads.push(
             Thread::new(
@@ -915,6 +973,45 @@ fn start_console() -> ! {
             )
             .unwrap(),
         );
+    }
+    if !cfg!(feature = "test-console") {
+        for (name, priority, ports) in [
+            ("blkdev-server", 3, 24),
+            ("fs-simple-server", 4, 0),
+            ("vfs-server", 5, 0),
+            ("storage-probe", 6, 0),
+        ] {
+            let file = crate::boot::MODULES
+                .response()
+                .unwrap()
+                .modules()
+                .iter()
+                .find(|file| file.cmdline() == name)
+                .expect("Missing storage ELF");
+            let (space, entry) = elf::load(file.data()).expect("Storage ELF load failed");
+            let process = Arc::new(Mutex::new(Process {
+                space,
+                stacks: 0,
+                dynamic_pages: 0,
+                ports,
+                irqs: 0,
+                framebuffer: false,
+                framebuffer_mapped: false,
+                test_control: false,
+                storage_control: name == "storage-probe",
+                bulk: true,
+            }));
+            let role = if cfg!(feature = "test-fs-create") {
+                1
+            } else if cfg!(feature = "test-fs-read") {
+                2
+            } else {
+                0
+            };
+            scheduler
+                .threads
+                .push(Thread::new(process, entry, role, priority).unwrap());
+        }
     }
     scheduler.last = [scheduler.threads.len() - 1; 32];
     let next = scheduler.choose(false).unwrap();

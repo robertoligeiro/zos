@@ -1,0 +1,32 @@
+[package]
+name = "zos-storage"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "blkdev-server"
+path = "src/blkdev.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "fs-simple-server"
+path = "src/server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vfs-server"
+path = "src/frontend.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "storage-probe"
+path = "src/probe.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }
+zos-console = { path = "../console" }

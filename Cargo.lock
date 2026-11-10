@@ -110,3 +110,11 @@ dependencies = [
 [[package]]
 name = "zos-libos"
 version = "0.1.0"
+
+[[package]]
+name = "zos-storage"
+version = "0.1.0"
+dependencies = [
+ "zos-console",
+ "zos-libos",
+]

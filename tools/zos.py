@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,7 @@ import sys
 import time
 
 from mkimage import BUILD, ROOT, create_image, image_path
+from mkfs import data_path, ensure_disk, format_disk, validate_disk
 
 TOOLS = ROOT / ".tools"
 CASES = {
@@ -26,6 +28,8 @@ CASES = {
     "memory-execute": ("test-memory-execute", "MEMORY EXECUTE ACCEPTANCE PASS"),
     "ipc": ("test-ipc", "IPC ACCEPTANCE PASS"),
     "console": ("test-console", "CONSOLE ACCEPTANCE PASS"),
+    "fs-create": ("test-fs-create", "FS CREATE PASS:"),
+    "fs-read": ("test-fs-read", "FS REBOOT PASS:"),
 }
 COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
                   "GDT/TSS/IDT ready", "PAGING ready:", "HEAP ready:",
@@ -45,12 +49,15 @@ IPC_MARKERS = (
     "PROCESS CLEANUP PASS:",
 )
 USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe",
-                 "console-server", "input-server", "tty-server")
+                 "console-server", "input-server", "tty-server",
+                 "blkdev-server", "fs-simple-server", "vfs-server", "storage-probe")
 READY_MARKER = "ZOS ready: console checkpoint"
 CONSOLE_MARKERS = ("CONSOLE PASS: cursor, colors, backspace, scrolling",
                    "PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12",
                    "CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated", READY_MARKER)
 CONSOLE_LINES = ["zombie", "zombie!", "zombie!", "ZOS", "ab!c", "~finish"]
+STORAGE_READY = "ZOS ready: persistent filesystem and VFS verified"
+STORAGE_MARKERS = ("BLOCK ready: secondary ATA", "FS ready: checkpoint=", "VFS ready: root mount")
 
 
 def environment() -> dict[str, str]:
@@ -85,7 +92,7 @@ def cargo(*args: str, user: bool = False) -> None:
 
 def build(case: str | None = None) -> Path:
     cargo("build", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console", user=True)
+          "--package", "zos-console", "--package", "zos-storage", user=True)
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     if case:
         args += ["--features", CASES[case][0]]
@@ -119,7 +126,7 @@ def image(kernel: Path, case: str | None = None) -> Path:
 
 
 def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
-                 memory_mib: int = 256) -> list[str]:
+                 memory_mib: int = 256, data_disk: Path | None = None) -> list[str]:
     directory = TOOLS / "qemu"
     executable = directory / "qemu-system-x86_64.exe"
     if not executable.is_file():
@@ -130,9 +137,14 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
     command = [
         str(executable), "-L", str(bios.parent), "-accel", "tcg", "-machine", "pc",
         "-cpu", "max", "-smp", "1", "-m", f"{memory_mib}M", "-nic", "none",
-        "-drive", f"file={disk},format=raw,if=ide,snapshot=on",
+        "-drive", f"file={disk},format=raw,if=ide,index=0,snapshot=on",
         "-no-reboot",
     ]
+    if data_disk is not None:
+        if data_disk.resolve() == disk.resolve() or data_disk.resolve() != data_path(data_disk.name):
+            raise ValueError("Data disk must be a separate generated volume inside build")
+        validate_disk(data_disk)
+        command += ["-drive", f"file={data_disk},format=raw,if=ide,index=2,cache=writeback,snapshot=off"]
     if not exit_on_shutdown:
         command.append("-no-shutdown")
     if firmware == "uefi":
@@ -168,15 +180,28 @@ def validate_log(text: str, firmware: str, case: str) -> None:
     if case in ("page-fault", "memory-protection", "memory-unmap", "memory-execute") \
             and "EXCEPTION: PAGE FAULT" not in text:
         raise RuntimeError("Page-fault test did not report the expected CPU exception")
-    if case in ("boot", "memory", "ipc", "console") and "EXCEPTION:" in text:
+    if case in ("boot", "memory", "ipc", "console", "fs-create", "fs-read") and "EXCEPTION:" in text:
         raise RuntimeError("Boot image raised an unexpected exception")
     if case == "ipc":
         validate_ipc(text)
     if case == "console":
         validate_console(text)
+    if case.startswith("fs-"):
+        validate_storage(text)
+        for marker in ("STORAGE CLEANUP PASS:", "FILESYSTEM ACCEPTANCE PASS"):
+            if marker not in text:
+                raise RuntimeError(f"Missing filesystem proof: {marker}")
+        if case == "fs-create":
+            for marker in ("FD OWNER PASS:", "STORAGE CAPABILITIES PASS:", "VFS CRUD PASS:",
+                           "8197 patterned bytes durably committed"):
+                if marker not in text:
+                    raise RuntimeError(f"Missing storage create proof: {marker}")
+        elif "exact data and metadata survived QEMU restart" not in text:
+            raise RuntimeError("Read phase did not verify exact reboot persistence")
 
 
 def validate_ipc(text: str) -> None:
+    text = text.split("Starting ring-3 console", 1)[0]
     for marker in IPC_MARKERS:
         if marker not in text:
             raise RuntimeError(f"Missing IPC proof: {marker}")
@@ -192,6 +217,17 @@ def validate_ipc(text: str) -> None:
     exits = re.findall(r"^USER EXIT: tid=\d+ status=(-?\d+)$", text, re.MULTILINE)
     if len(exits) != 6 or any(status != "0" for status in exits):
         raise RuntimeError("All six non-faulting threads must exit successfully")
+
+
+def validate_storage(text: str) -> None:
+    validate_ipc(text)
+    for marker in (*CONSOLE_MARKERS, *STORAGE_MARKERS):
+        if marker not in text:
+            raise RuntimeError(f"Missing storage startup proof: {marker}")
+    services = text.split("Starting ring-3 console", 1)[-1]
+    if any(marker in services for marker in ("USER FAULT:", "SERVICE FAILURE", "KERNEL PANIC",
+                                            "IO ERROR", "ASSERTION FAILED")):
+        raise RuntimeError("Storage or console service failed")
 
 def validate_console(text: str) -> None:
     validate_ipc(text)
@@ -356,8 +392,19 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     stderr = BUILD / f"{firmware}-{case}.qemu.log"
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
+    data_disk = None
+    before = None
+    if case.startswith("fs-"):
+        name = f"data-test-{firmware}.img"
+        if case == "fs-create":
+            data_disk = format_disk(name, force=True)
+        else:
+            data_disk = data_path(name)
+            validate_disk(data_disk)
+        before = hashlib.sha256(data_disk.read_bytes()).hexdigest()
     command = qemu_command(
         disk, firmware, exit_on_shutdown=True, memory_mib=1024 if case == "memory" else 256,
+        data_disk=data_disk,
     ) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
@@ -376,6 +423,14 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
             f"{firmware}/{case}: expected debug-exit 33, got {code}; inspect {log} and {stderr}"
         )
     validate_log(text, firmware, case)
+    if data_disk is not None:
+        after = hashlib.sha256(data_disk.read_bytes()).hexdigest()
+        if (case == "fs-create" and before == after) or (case == "fs-read" and before != after):
+            raise RuntimeError("Filesystem persistence image did not have the expected write/read behavior")
+        (BUILD / f"{firmware}-{case}.data.json").write_text(json.dumps({
+            "data_image": data_disk.name, "before_sha256": before, "after_sha256": after,
+            "qemu_fully_exited": True,
+        }, indent=2) + "\n", encoding="utf-8")
     print(f"PASS {firmware}/{case}: serial, framebuffer initialized, timer, expected exit", flush=True)
 
 
@@ -386,7 +441,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
     picture.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware) + [
+    command = qemu_command(disk, firmware, data_disk=ensure_disk()) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-qmp", "stdio",
     ]
@@ -399,9 +454,9 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             deadline = time.monotonic() + timeout
             while True:
                 text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-                if READY_MARKER in text:
+                if STORAGE_READY in text:
                     break
-                if "KERNEL PANIC" in text or "EXCEPTION:" in text or process.poll() is not None:
+                if "KERNEL PANIC" in text or "EXCEPTION:" in text or "SERVICE FAILURE" in text or process.poll() is not None:
                     raise RuntimeError(f"{firmware}: normal kernel failed; inspect {log}")
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"{firmware}: framebuffer capture timed out; inspect {log}")
@@ -410,6 +465,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: screenshot boot log missing {marker}")
             validate_ipc(text)
+            validate_storage(text)
             for marker in CONSOLE_MARKERS:
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: normal console missing {marker}")
@@ -439,9 +495,10 @@ def check() -> None:
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
     cargo("test", "--locked", "--package", "zos-console", "--lib",
+          "--package", "zos-storage",
           "--target", "x86_64-pc-windows-gnu")
     cargo("clippy", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console",
+          "--package", "zos-console", "--package", "zos-storage",
           "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
@@ -451,7 +508,7 @@ def check() -> None:
 
 
 def accept(timeout: int) -> None:
-    result = BUILD / "phase-5-acceptance.json"
+    result = BUILD / "phase-6-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
     check()
@@ -463,24 +520,30 @@ def accept(timeout: int) -> None:
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout)
     result.write_text(json.dumps({
-        "phase": 5,
+        "phase": 6,
         "automated_checks": "passed",
         "visual_review": "pending: inspect bios/uefi-screen.ppm and bios/uefi-console.ppm",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED STEP 5 PASS. Inspect normal and console screenshots before Step 6.", flush=True)
+    print("AUTOMATED STEP 6 PASS. Inspect normal and console screenshots.", flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ZOS - Zombie OS development tools")
-    parser.add_argument("command", choices=["fmt", "build", "image", "run", "debug", "check", "test"])
+    parser.add_argument("command", choices=["fmt", "build", "image", "run", "debug", "check", "test", "mkfs"])
     parser.add_argument("--firmware", choices=["bios", "uefi"], default="uefi")
     parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--data-image", default="data.img", help="Dedicated volume name inside build")
+    parser.add_argument("--force", action="store_true", help="Explicitly overwrite the selected data volume (mkfs only)")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    if args.command == "fmt":
+    if args.force and args.command != "mkfs":
+        parser.error("--force is only valid with mkfs")
+    if args.command == "mkfs":
+        print(f"Formatted: {format_disk(args.data_image, force=args.force)}")
+    elif args.command == "fmt":
         cargo("fmt", "--all")
     elif args.command == "check":
         check()
@@ -491,7 +554,7 @@ def main() -> None:
         if args.command != "build":
             disk = image(kernel)
             if args.command in ("run", "debug"):
-                command = qemu_command(disk, args.firmware) + ["-serial", "stdio"]
+                command = qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image)) + ["-serial", "stdio"]
                 if args.command == "debug":
                     command += ["-s", "-S", "-d", "int,cpu_reset",
                                 "-D", str(BUILD / "qemu-debug.log")]

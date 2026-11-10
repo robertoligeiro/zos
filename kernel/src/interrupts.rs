@@ -278,6 +278,14 @@ pub fn select_stack(top: u64, ports: u8) {
                 bitmap[port / 8] &= !(1 << (port % 8));
             }
         }
+        if ports & 8 != 0 {
+            for port in 0x170..0x178 {
+                bitmap[port / 8] &= !(1 << (port % 8));
+            }
+        }
+        if ports & 16 != 0 {
+            bitmap[0x376 / 8] &= !(1 << (0x376 % 8));
+        }
     }
 }
 

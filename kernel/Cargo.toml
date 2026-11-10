@@ -19,6 +19,8 @@ test-memory-unmap = []
 test-memory-execute = []
 test-ipc = []
 test-console = []
+test-fs-create = []
+test-fs-read = []
 
 [dependencies]
 limine = "=0.6.5"

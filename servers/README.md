@@ -35,4 +35,27 @@ pointer coordinates, capture the framebuffer, and verify driver/process cleanup.
 The `~finish` line has special meaning only in the dedicated test image;
 normal boots just echo it like any other input.
 
-`procmgr`, `vfs`, `fs-simple`, `blkdev` and `shell` remain future work.
+`storage` adds four ring-3 ELFs after the console services:
+
+- `blkdev-server`: priority 3/channel 4, exact secondary ATA port grants,
+  bounded polling, one-sector LBA28 read/write RPCs and cache flush.
+- `fs-simple-server`: priority 4/channel 5, checksummed geometry, inodes,
+  bitmap, hierarchy and copy-on-write checkpoints. Accepts only VFS requests.
+- `vfs-server`: priority 5/channel 6, root mount table, normalized absolute
+  paths, owned generation handles, bounded file operations and explicit errors.
+- `storage-probe`: priority 6, exercises persistence through public VFS IPC.
+  Normal boots preserve/read welcome.txt and exit; isolated creation/read tests
+  validate CRUD, ownership, backend/device isolation and exact reboot contents.
+
+The FS server is the block driver's only accepted caller. Those identities come
+from kernel-issued reply tokens; fixed boot channel/thread IDs are an explicit
+checkpoint limitation until the process manager/registry exists. Only storage
+processes have 1024-byte copied IPC, while all prior services remain at 64 bytes.
+The console test still starts only its original three services.
+
+Seven Rust host storage tests cover crash/torn-write recovery, preserved backup
+data, corruption, limits, hierarchy, VFS descriptor ownership and protocol bounds.
+Real BIOS/UEFI tests format disposable volumes, write, stop QEMU completely and
+read from the same image in a new VM. The normal data volume remains persistent.
+
+`procmgr` and `shell` remain Step 7 work; the TTY still only echoes input.

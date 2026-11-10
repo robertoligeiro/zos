@@ -12,7 +12,7 @@ from mkimage import (
 )
 from zos import (
     CASES, COMMON_MARKERS, CONSOLE_LINES, CONSOLE_MARKERS, IPC_MARKERS,
-    MEMORY_MARKERS, READY_MARKER, USER_PROGRAMS,
+    MEMORY_MARKERS, READY_MARKER, STORAGE_MARKERS, STORAGE_READY, USER_PROGRAMS,
     image, qemu_command, screenshot, user_environment, validate_log, wait_serial,
 )
 
@@ -173,7 +173,8 @@ class AcceptanceHarnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=BUILD) as directory:
             output = Path(directory)
             serial_text = "\n".join(
-                (self.valid_log("BIOS", "ipc"), *CONSOLE_MARKERS)
+                (self.valid_log("BIOS", "ipc"), "Starting ring-3 console",
+                 *CONSOLE_MARKERS, *STORAGE_MARKERS, STORAGE_READY, "USER EXIT: tid=7 status=0")
             )
             replies = iter([
                 b'{"QMP": {}}\n',
@@ -208,6 +209,7 @@ class AcceptanceHarnessTests(unittest.TestCase):
                 return process
 
             with patch("zos.BUILD", output), patch("zos.qemu_command", return_value=["qemu"]), \
+                    patch("zos.ensure_disk", return_value=BUILD / "data.img"), \
                     patch("zos.subprocess.Popen", side_effect=launch_process) as launch:
                 screenshot(BUILD / "zos.img", "bios", 5)
             self.assertEqual(commands, ["capabilities", "capture", "quit"])
@@ -233,6 +235,14 @@ class AcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(memory[memory.index("-m") + 1], "1024M")
 
     def valid_log(self, firmware, case):
+        if case.startswith("fs-"):
+            return self.valid_log(firmware, "ipc") + "\nStarting ring-3 console\n" + "\n".join((
+                *CONSOLE_MARKERS, *STORAGE_MARKERS, CASES[case][1],
+                "FD OWNER PASS:", "STORAGE CAPABILITIES PASS:", "VFS CRUD PASS:",
+                "8197 patterned bytes durably committed",
+                "exact data and metadata survived QEMU restart",
+                "STORAGE CLEANUP PASS:", "FILESYSTEM ACCEPTANCE PASS",
+            ))
         if case == "console":
             return self.valid_log(firmware, "ipc") + "\n" + "\n".join((
                 *CONSOLE_MARKERS, *(f"TTY LINE: {line}" for line in CONSOLE_LINES),

@@ -32,7 +32,9 @@ const ACCEPTANCE_FEATURES: u8 = cfg!(feature = "test-boot") as u8
     + cfg!(feature = "test-memory-unmap") as u8
     + cfg!(feature = "test-memory-execute") as u8
     + cfg!(feature = "test-ipc") as u8
-    + cfg!(feature = "test-console") as u8;
+    + cfg!(feature = "test-console") as u8
+    + cfg!(feature = "test-fs-create") as u8
+    + cfg!(feature = "test-fs-read") as u8;
 const _: () = match ACCEPTANCE_FEATURES {
     0 | 1 => (),
     _ => panic!("Select only one QEMU acceptance-test feature at a time"),

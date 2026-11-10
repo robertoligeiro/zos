@@ -1,6 +1,7 @@
 #![no_std]
 
 pub const MAX_MESSAGE: usize = 64;
+pub const MAX_STORAGE_MESSAGE: usize = 1024;
 
 #[repr(u64)]
 pub enum Call {
@@ -16,6 +17,7 @@ pub enum Call {
     DebugWrite = 9,
     FramebufferMap = 10,
     ConsoleTestFinish = 11,
+    StorageTestFinish = 12,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +211,10 @@ pub fn framebuffer_map() -> Result<Framebuffer, Error> {
 /// Available only to the initial TTY in dedicated console acceptance images.
 pub fn console_test_finish() -> Result<(), Error> {
     call(Call::ConsoleTestFinish, [0; 5]).map(|_| ())
+}
+
+pub fn storage_test_finish() -> Result<(), Error> {
+    call(Call::StorageTestFinish, [0; 5]).map(|_| ())
 }
 
 pub fn exit(status: i64) -> ! {

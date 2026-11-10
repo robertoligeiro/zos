@@ -17,8 +17,10 @@ A single-core x86-64 microkernel project following the supplied
   user linker flags, and memory/IPC/console acceptance gates. Rust host tests
   exercise keyboard modifiers/releases, mouse packet decoding, editor/history
   boundaries, scrolling, colors, cursor pixels and pointer restoration.
-  The Step 5 gate contains 17 Python tests, five Rust tests, Rustfmt, Clippy in
-  eleven configurations, and 18 BIOS/UEFI acceptance cases.
+  Storage tests cover formatting/preservation, crash and torn-write recovery,
+  corrupt metadata, file/inode limits, paths, owned descriptors and stale handles.
+  The Step 6 gate contains 22 Python tests, twelve Rust tests, Rustfmt, Clippy in
+  thirteen configurations, and 22 BIOS/UEFI acceptance cases.
 - Step 3: bitmap physical-frame allocation from Limine's usable regions;
   ZOS-owned page tables; 4 KiB map/unmap/protect; per-process lower halves
   sharing supervisor-only kernel mappings; an 8 MiB coalescing kernel heap
@@ -28,13 +30,16 @@ A single-core x86-64 microkernel project following the supplied
   inheritance, checked syscalls, `libos`, and an echo server/client demonstration.
 - Step 5: separate ring-3 framebuffer console, PS/2 keyboard/mouse input and
   line-editing TTY servers. Normal boots present an interactive **input demo**.
-- Steps 6-8: deferred. There is no command shell, filesystem, filesystem
-  persistence, or hardware USB support.
+- Step 6: separate ring-3 ATA block, fs-simple and VFS servers; a dedicated
+  persistent data image, hierarchical files/directories and reboot verification.
+- Steps 7-8: deferred. There is no command shell/process manager or hardware
+  USB support. The TTY remains an input demo, not a shell.
 
 The `phase-2` tag preserves the verified boot checkpoint. The `phase-3` memory
 checkpoint preserves **Step 3 / Phase 2** in the supplied plan. The
 `phase-4` tag corresponds to **Step 4 / Phase 3**; `phase-5` corresponds to
-**Step 5 / Phase 4**. Repository tags follow step numbers. The command shell
+**Step 5 / Phase 4**; `phase-6` corresponds to **Step 6 / Phase 5**.
+Repository tags follow step numbers. The command shell
 is Step 7, after disk/filesystem work in Step 6.
 
 The frame bitmap and copied page tables are reserved from usable RAM. Bootloader
@@ -63,7 +68,9 @@ User faults terminate only the offending thread; other threads continue.
 The syscall ABI uses RAX for the call/result and RDI/RSI/RDX/R10/R8 for arguments;
 Receive also returns message length in RDX. The nine planned syscalls are
 implemented, plus bounded serial `DebugWrite`, capability-checked `FramebufferMap`,
-and a test-only `ConsoleTestFinish`. Small messages and replies are copied, at most **64 bytes**;
+and test-only `ConsoleTestFinish` and `StorageTestFinish`. Normal processes retain
+the **64-byte** copied-message limit. The four storage processes have a narrowly
+granted **1024-byte** copied-message limit for sector transfers and VFS payloads;
 oversized buffers return an error, never truncated data. Large shared-message
 mapping is deferred, as allowed by the plan's start-with-copy decision. Send
 blocks until a server-owned, generation-checked Reply or an explicit channel
@@ -77,7 +84,10 @@ After it finishes and releases its resources, the input server alone can attach
 containing the actual IRQ number through an owned channel, reserving reply token
 0 for notifications. The input driver drains controller data in user space;
 the kernel only forwards IRQs and handles PIC masks/cascade/EOI. IoPortGrant
-enables exact approved ports in the requesting thread's TSS I/O bitmap; IOPL
+enables exact approved ports in the requesting thread's TSS I/O bitmap. The
+block server alone may grant secondary ATA ports **0x170-0x177 and 0x376**;
+primary/boot-disk ports stay denied. ATA interrupts are disabled and the driver
+uses bounded PIO polling, IDENTIFY, LBA28 read/write and FLUSH CACHE. IOPL
 remains zero and all other ports stay denied. MapMemory supplies individual
 zeroed pages in a restricted user range,
 rejects writable-executable mappings and overlaps, and caps dynamic allocations
@@ -85,7 +95,7 @@ at 128 pages per process. This boot demonstration allows 32 thread IDs,
 16 channel IDs and 8 stacks per process; IDs/stacks are not recycled until final
 demo teardown. It is not yet a general-purpose process manager.
 
-Six freestanding user ELFs are packaged as Limine modules. The loader checks
+Ten freestanding user ELFs are packaged as Limine modules. The loader checks
 ELF64/x86-64 headers, file bounds/overflow, page-separated load segments,
 executable entry points, overlap, image limits and W^X. User builds use their
 own lower-half linker script and `target\user` artifacts. Their code model
@@ -105,6 +115,56 @@ entries with draft restoration. Lines are limited to **48 ASCII characters**;
 extra characters report `TTY LIMIT` on serial without corrupting the editor.
 Enter echoes `You typed: ...`; it does not parse or execute commands.
 Click inside QEMU to focus keyboard/mouse input; Ctrl+Alt releases mouse capture.
+
+## Persistent filesystem
+
+Normal `run`/`debug` automatically creates `build\data.img` **only if absent**,
+then mounts it at `/`. The boot disk remains snapshot-protected; this dedicated
+16 MiB data volume is attached as secondary IDE master without snapshots.
+`welcome.txt` is created only when missing, read back and left intact on subsequent
+boots. Invalid existing geometry/checkpoints fail explicitly, never trigger
+automatic formatting. Close QEMU before opening the same data image again.
+
+The custom volume is not FAT/ext and is not directly mountable by Windows. It
+contains a checksummed superblock, 64 inodes (including root), a block bitmap,
+parent/name directory records and two checksummed metadata banks. Names are up
+to 24 printable ASCII bytes, absolute paths up to 192 bytes and files up to
+64 KiB (sixteen direct 4 KiB blocks). There are no indirect blocks, permissions,
+links, registry, multiple mounted filesystems or general-purpose process manager.
+The inode/direct-pointer limits constrain usable file capacity below the 16 MiB
+volume size.
+
+Updates copy file data to unused blocks and preserve every block referenced by
+either valid checkpoint. Commit ordering is data flush, inactive metadata-body
+write/flush, then generation/checksum header write/flush. Mount selects the newest
+valid checkpoint; malformed trees, duplicate blocks and inconsistent bitmaps are
+rejected. Ambiguous write/flush failures take the filesystem offline until remount.
+Data contents themselves are not checksummed. Host tests simulate cache loss and
+torn sectors at every write/flush boundary for writes, create, rename, unlink and
+truncate; reboot must recover an entire old or new checkpoint.
+
+VFS supports open/read/write/close/stat/readdir/mkdir/unlink/rename, append,
+truncate and sync. Paths are lexically normalized (`.`, `..`, repeated `/`);
+escaping above root fails. Its 64 descriptors carry generation handles and are
+owned by the kernel-authenticated calling thread, not an owner field supplied
+by a client. Stale/foreign handles and access-mode violations fail. Unlink of an
+open inode is denied; rename preserves live descriptors and does not overwrite an
+existing destination. Descriptors require explicit close; client-exit cleanup
+awaits the Step 7 process manager. Each read/write RPC transfers at most 1000 bytes
+and returns the actual count; larger files use repeated calls. FS and block
+backend channels accept only their designated VFS/FS caller respectively.
+
+To create a separate volume or explicitly erase a selected existing volume:
+
+```powershell
+python tools\zos.py mkfs --data-image data-scratch.img
+python tools\zos.py run --firmware uefi --data-image data-scratch.img
+python tools\zos.py mkfs --data-image data-scratch.img --force
+```
+
+Only `data.img` or `data-<name>.img` directly inside `build` are accepted. Mkfs
+formats the entire dedicated volume image; it does not modify the boot GPT/ESP
+or any physical disk. Its format matches the user-space filesystem implementation.
 
 ## Windows setup (no WSL or administrator installation)
 
@@ -144,16 +204,17 @@ stage-2 partition and a FAT32 EFI System Partition, then invokes the pinned
 below are the primary interface; the Makefile is optional if Windows Make is
 already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
 
-## Step 5 acceptance gate
+## Step 6 acceptance gate
 
 `python tools\zos.py test` must exit successfully. It performs:
 
 1. Host unit tests, Rustfmt check, and Clippy with warnings denied for normal,
    boot, divide, page-fault, memory, read-only-write, unmap, and NX-execute test
-   configurations plus IPC and console (ten kernel configurations), and both user
-   packages (eleven configurations total). Five Rust host tests cover driver,
-   editor and renderer behavior alongside the 17 Python harness/image tests.
-2. BIOS and UEFI boots for each of nine isolated test images. Each must
+   configurations plus IPC, console, fs-create and fs-read (twelve kernel
+   configurations), and all three user packages (thirteen configurations total).
+   Twelve Rust host tests cover console/storage behavior alongside 22 Python
+   harness/image/formatter tests.
+2. BIOS and UEFI boots for each of eleven isolated test images. Each must
    report the correct firmware, framebuffer initialization, GDT/TSS/IDT, and
    at least 100 timer interrupts; then exit through QEMU's test device with
    host status 33. A panic, unexpected exit, missing marker, or timeout fails.
@@ -183,7 +244,15 @@ already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
    coordinates must match. It captures the edited screen, then terminates all
    three services and verifies exact frame/heap recovery, including borrowed
    framebuffer mappings. Its finish syscall is denied in production images.
-4. Normal BIOS and UEFI boots, each with a framebuffer screenshot. These do
+4. For each firmware, fs-create formats a separate `data-test-<firmware>.img`,
+   exercises VFS CRUD, path normalization, access modes, descriptor ownership,
+   stale handles and quotas, and commits 8197 patterned bytes across sector/block
+   boundaries. QEMU exits completely. Fs-read boots a new VM against that same
+   non-snapshot data image and verifies exact contents, metadata and EOF. The
+   create image must change its hash; the read image must leave it unchanged.
+   Both check exact frame/heap cleanup. Normal `data.img` is never reformatted
+   by these disposable persistence tests.
+5. Normal BIOS and UEFI boots, each with a framebuffer screenshot. These do
    not enable the test exit device. The harness stops each VM through QMP over
    standard input/output, without opening a network listener.
 
@@ -199,14 +268,21 @@ bios-memory-unmap.serial.log     uefi-memory-unmap.serial.log
 bios-memory-execute.serial.log   uefi-memory-execute.serial.log
 bios-ipc.serial.log              uefi-ipc.serial.log
 bios-console.serial.log          uefi-console.serial.log
+bios-fs-create.serial.log        uefi-fs-create.serial.log
+bios-fs-read.serial.log          uefi-fs-read.serial.log
+bios-fs-create.data.json         uefi-fs-create.data.json
+bios-fs-read.data.json           uefi-fs-read.data.json
 bios-screen.ppm                 uefi-screen.ppm
 bios-console.ppm                uefi-console.ppm
-phase-5-acceptance.json          (created only after automated success)
+phase-6-acceptance.json          (created only after automated success)
 zos.img                         (normal image, never a deliberate-fault image)
+data.img                        (persistent normal filesystem)
+data-test-bios.img              data-test-uefi.img (isolated acceptance volumes)
 ```
 
 Inspect all four screenshots to confirm a readable ZOS banner, input-demo
 instructions, prompt/cursor, correctly edited/echoed text and mouse crosshair.
+Normal screenshots additionally show the persistent filesystem status.
 Earlier IPC/isolation diagnostics remain in the serial log.
 The JSON explicitly records visual review as pending. Alternatively,
 verify the screen interactively, closing each QEMU window before the next:
@@ -244,6 +320,10 @@ CONSOLE PASS: cursor, colors, backspace, scrolling
 PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12
 CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated
 ZOS ready: console checkpoint; input demo, not a shell.
+BLOCK ready: secondary ATA, LBA28, flush, 32768 sectors
+FS ready: checkpoint=..., COW metadata/data
+VFS ready: root mount, owned FDs, bounded copied IPC
+ZOS ready: persistent filesystem and VFS verified
 ```
 
 UEFI reports `FIRMWARE: UEFI`; resolution and tick count can differ.
@@ -257,9 +337,10 @@ The hardware-fault cases report `MEMORY PROTECTION ACCEPTANCE PASS`,
 `MEMORY UNMAP ACCEPTANCE PASS` and `MEMORY EXECUTE ACCEPTANCE PASS`, respectively.
 The IPC image additionally reports `IPC ACCEPTANCE PASS`. The console image
 reports `TTY PASS`, `CONSOLE CLEANUP PASS` and `CONSOLE ACCEPTANCE PASS`.
-Normal boots run the IPC regression demo, then keep the console/input/TTY
-services running at an editable input prompt. Review this checkpoint before
-implementing Step 6; the Step 7 command shell is not present yet.
+Normal boots run the IPC regression demo, then keep console/input/TTY and
+block/filesystem/VFS services running at an editable input prompt. The storage
+probe verifies `welcome.txt` and exits. Review this checkpoint before
+implementing Step 7; the command shell is not present yet.
 
 ## Development commands
 
@@ -278,7 +359,8 @@ with `target remote :1234`. Interrupt/reset diagnostics go to
 QEMU runs a single CPU with 256 MiB RAM using software emulation, except for the
 1 GiB physical-memory stress test. UEFI uses the
 QEMU package's EDK2 code and a fresh per-image copy of its variable store.
-Disk access is restricted to generated image files; QEMU uses snapshot mode.
+Disk access is restricted to generated image files. Only the boot image uses
+snapshot mode; the selected dedicated data volume persists writes.
 No tools here enumerate, format, or write a physical drive.
 
 ## Repository and sharing
