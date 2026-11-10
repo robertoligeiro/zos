@@ -18,6 +18,13 @@ pub enum Call {
     FramebufferMap = 10,
     ConsoleTestFinish = 11,
     StorageTestFinish = 12,
+    ProcessSpawn = 13,
+    ProcessInfo = 14,
+    ProcessKill = 15,
+    ProcessReap = 16,
+    MemoryStats = 17,
+    BootProgram = 18,
+    SystemControl = 19,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +222,100 @@ pub fn console_test_finish() -> Result<(), Error> {
 
 pub fn storage_test_finish() -> Result<(), Error> {
     call(Call::StorageTestFinish, [0; 5]).map(|_| ())
+}
+
+pub const PROCESS_NAME: usize = 24;
+pub const PROCESS_SLOTS: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessInfo {
+    pub pid: u64,
+    pub state: u8,
+    pub system: bool,
+    pub memory: u64,
+    pub status: i64,
+    pub name: [u8; PROCESS_NAME],
+}
+impl ProcessInfo {
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != 50
+            || bytes[8] > 4
+            || bytes[9] > 1
+            || bytes[26..]
+                .iter()
+                .any(|b| *b != 0 && !(32..=126).contains(b))
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            pid: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            state: bytes[8],
+            system: bytes[9] != 0,
+            memory: u64::from_le_bytes(bytes[10..18].try_into().unwrap()),
+            status: i64::from_le_bytes(bytes[18..26].try_into().unwrap()),
+            name: bytes[26..50].try_into().unwrap(),
+        })
+    }
+    pub fn name(&self) -> &str {
+        let length = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(PROCESS_NAME);
+        core::str::from_utf8(&self.name[..length]).expect("Validated process name")
+    }
+}
+
+pub fn process_spawn(image: &[u8], name: &[u8]) -> Result<u64, Error> {
+    call(
+        Call::ProcessSpawn,
+        [
+            image.as_ptr() as u64,
+            image.len() as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            0,
+        ],
+    )
+    .map(|r| r.0 as u64)
+}
+pub fn process_info(slot: usize) -> Result<ProcessInfo, Error> {
+    let mut bytes = [0; 50];
+    call(
+        Call::ProcessInfo,
+        [slot as u64, bytes.as_mut_ptr() as u64, 50, 0, 0],
+    )?;
+    ProcessInfo::decode(&bytes)
+}
+pub fn process_kill(pid: u64) -> Result<(), Error> {
+    call(Call::ProcessKill, [pid, 0, 0, 0, 0]).map(|_| ())
+}
+pub fn process_reap(pid: u64) -> Result<(), Error> {
+    call(Call::ProcessReap, [pid, 0, 0, 0, 0]).map(|_| ())
+}
+pub fn memory_stats() -> Result<[u64; 4], Error> {
+    let mut bytes = [0; 32];
+    call(Call::MemoryStats, [bytes.as_mut_ptr() as u64, 32, 0, 0, 0])?;
+    Ok(core::array::from_fn(|i| {
+        u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
+    }))
+}
+pub fn boot_program(bytes: &mut [u8]) -> Result<usize, Error> {
+    call(
+        Call::BootProgram,
+        [bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0],
+    )
+    .map(|r| r.0)
+}
+pub fn system_control(action: u64) -> Result<(), Error> {
+    call(Call::SystemControl, [action, 0, 0, 0, 0]).map(|_| ())
+}
+
+pub fn reply_live(token: usize, bytes: &[u8]) -> Result<(), Error> {
+    match reply(token, bytes) {
+        Err(Error::Invalid) => debug_write("IPC reply abandoned: client exited"),
+        result => result,
+    }
 }
 
 pub fn exit(status: i64) -> ! {

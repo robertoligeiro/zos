@@ -15,11 +15,23 @@ Receive returns a server-owned reply token and message length; token zero is an
 IRQ notification carrying an eight-byte little-endian IRQ number and must not
 be replied to. Multiple IRQs may share a channel, coalesced separately by IRQ.
 The device owner must drain its device after a notification.
-Messages/replies retain the 64-byte default cap. Only initial storage processes
-receive the 1024-byte copied-message capability; existing console/IPC limits and
-tests are unchanged. Errors are explicit, including Closed, TooLarge, Denied and
+Messages/replies retain the 64-byte default cap. Storage, session and console
+processes receive the 1024-byte copied-message capability; the original IPC demo
+remains at 64 bytes. Errors are explicit, including Closed, TooLarge, Denied and
 Deadlock. Secondary ATA port-range/control grants are restricted to the block
 driver; no primary disk ports are granted.
+
+ProcessSpawn/Info/Kill/Reap, MemoryStats, BootProgram and SystemControl are
+restricted to the initial process manager. PIDs encode slot generations;
+reaped process slots and closed channels can be reused without reviving stale
+identifiers. ProcessInfo has a checked 50-byte wire representation and reports
+state, system status, resident bytes and exit status. Spawned programs are
+single-threaded and lack lifecycle/hardware capabilities. SystemControl sync is
+performed by the manager through VFS before invoking reboot/halt.
+
+`reply_live` explicitly logs a canceled outstanding reply when a client exits;
+other IPC errors propagate. The manager closes authenticated client-owned VFS
+descriptors before reaping a process, preserving FD generations on slot reuse.
 
 The `zos-storage` library supplies the VFS protocol/client wrappers on top of
 libos IPC. Read/write RPCs transfer at most 1000 bytes, return actual counts and

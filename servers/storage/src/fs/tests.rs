@@ -282,6 +282,26 @@ fn vfs_normalization_ownership_rights_stale_fds_and_capacity() {
 const DESCRIPTORS_FOR_TEST: usize = 64;
 
 #[test]
+fn exited_owner_cleanup_preserves_other_clients_and_invalidates_old_handles() {
+    let mut vfs = Vfs::new(Filesystem::mount(MemoryDisk::formatted()).unwrap());
+    let first = vfs.open(1, b"/file", READ | WRITE | CREATE).unwrap();
+    vfs.write(1, first, b"data").unwrap();
+    let other = vfs.open(2, b"/file", READ).unwrap();
+    vfs.close_owner(1);
+    assert_eq!(vfs.read(1, first, &mut [0; 4]), Err(Error::BadFd));
+    let replacement = vfs.open(1, b"/file", READ).unwrap();
+    assert_ne!(replacement, first);
+    assert_eq!(vfs.close(1, first), Err(Error::BadFd));
+    let mut bytes = [0; 4];
+    assert_eq!(vfs.read(2, other, &mut bytes), Ok(4));
+    assert_eq!(&bytes, b"data");
+    vfs.close_owner(1);
+    assert_eq!(vfs.remove(b"/file"), Err(Error::Denied));
+    vfs.close(2, other).unwrap();
+    vfs.remove(b"/file").unwrap();
+}
+
+#[test]
 fn malformed_wire_requests_and_trailing_bytes_fail_explicitly() {
     use crate::protocol::{Reader, Request};
     let mut request = Reader::new(&[1, 2]);

@@ -188,7 +188,7 @@ pub extern "C" fn _start(_: usize) -> ! {
                 1
             }
         };
-        os::reply(token, &reply[..length]).unwrap();
+        os::reply_live(token, &reply[..length]).unwrap();
     }
 }
 #[panic_handler]

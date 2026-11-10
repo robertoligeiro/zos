@@ -12,7 +12,7 @@ from mkimage import (
 )
 from zos import (
     CASES, COMMON_MARKERS, CONSOLE_LINES, CONSOLE_MARKERS, IPC_MARKERS,
-    MEMORY_MARKERS, READY_MARKER, STORAGE_MARKERS, STORAGE_READY, USER_PROGRAMS,
+    MEMORY_MARKERS, READY_MARKER, STORAGE_MARKERS, STORAGE_READY, USER_PROGRAMS, SHELL_READY, SHELL_PROOFS,
     image, qemu_command, screenshot, user_environment, validate_log, wait_serial,
 )
 
@@ -174,7 +174,7 @@ class AcceptanceHarnessTests(unittest.TestCase):
             output = Path(directory)
             serial_text = "\n".join(
                 (self.valid_log("BIOS", "ipc"), "Starting ring-3 console",
-                 *CONSOLE_MARKERS, *STORAGE_MARKERS, STORAGE_READY, "USER EXIT: tid=7 status=0")
+                 *CONSOLE_MARKERS, *STORAGE_MARKERS, STORAGE_READY, SHELL_READY, "USER EXIT: tid=7 status=0")
             )
             replies = iter([
                 b'{"QMP": {}}\n',
@@ -235,6 +235,11 @@ class AcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(memory[memory.index("-m") + 1], "1024M")
 
     def valid_log(self, firmware, case):
+        if case == "shell":
+            return self.valid_log(firmware, "ipc") + "\nStarting ring-3 console\n" + "\n".join((
+                *CONSOLE_MARKERS, *STORAGE_MARKERS, SHELL_READY, *SHELL_PROOFS,
+                "USER FAULT: tid=9 kind=INVALID OPCODE address=0x400000", CASES[case][1],
+            ))
         if case.startswith("fs-"):
             return self.valid_log(firmware, "ipc") + "\nStarting ring-3 console\n" + "\n".join((
                 *CONSOLE_MARKERS, *STORAGE_MARKERS, CASES[case][1],

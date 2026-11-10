@@ -1,6 +1,6 @@
 use crate::keyboard::Key;
 
-pub const CAPACITY: usize = 48;
+pub const CAPACITY: usize = 120;
 const HISTORY: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

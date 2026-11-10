@@ -40,14 +40,14 @@ pub extern "C" fn _start(_: usize) -> ! {
     os::debug_write("CONSOLE PASS: cursor, colors, backspace, scrolling").unwrap();
     terminal.colors(0x90ee90, 0x081008);
     terminal.clear();
-    terminal.write(b"ZOS - Zombie OS\nStep 5: ring-3 console and PS/2 input\n\n");
+    terminal.write(b"ZOS - Zombie OS\nRing-3 console and PS/2 input\n\n");
     terminal.colors(0xffcc66, 0x081008);
-    terminal.write(b"Input demo - not a command shell.\n");
+    terminal.write(b"Keyboard and mouse use isolated user-space drivers.\n");
     terminal.colors(0x90ee90, 0x081008);
     terminal.write(b"Edit: arrows, Home/End, Backspace/Delete; Up/Down: history\n");
     terminal.write(b"Ctrl+A/E: start/end; Ctrl+L: clear; mouse: move/click crosshair\n\n");
     terminal.render(pixels, fb);
-    let mut bytes = [0; 64];
+    let mut bytes = [0; 128];
     loop {
         let (token, length) = os::receive(CONSOLE, &mut bytes).unwrap();
         assert!(token != 0 && length > 0);
@@ -78,7 +78,7 @@ pub extern "C" fn _start(_: usize) -> ! {
             _ => panic!("Invalid console protocol"),
         }
         terminal.render(pixels, fb);
-        os::reply(token, &[]).unwrap();
+        os::reply_live(token, &[]).unwrap();
     }
 }
 

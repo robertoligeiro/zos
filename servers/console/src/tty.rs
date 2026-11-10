@@ -9,7 +9,7 @@ use zos_console::{
 use zos_libos as os;
 
 fn redraw(editor: &Editor) {
-    let mut bytes = [0; 64];
+    let mut bytes = [0; 128];
     bytes[0] = LINE;
     bytes[1] = editor.cursor as u8;
     bytes[2..2 + editor.line.length].copy_from_slice(&editor.line.bytes[..editor.line.length]);
@@ -26,6 +26,7 @@ pub extern "C" fn _start(test: usize) -> ! {
     if test == 0 {
         assert_eq!(os::console_test_finish(), Err(os::Error::Denied));
     }
+    output(b"Input demo - not a command shell.\n");
     let mut editor = Editor::default();
     redraw(&editor);
     os::send(INPUT, b"ready", &mut []).unwrap();
@@ -70,7 +71,7 @@ pub extern "C" fn _start(test: usize) -> ! {
                 os::send(CONSOLE, &[CLEAR], &mut []).unwrap();
             }
             Action::Full => {
-                os::debug_write("TTY LIMIT: 48 characters").unwrap();
+                os::debug_write("TTY LIMIT: 120 characters").unwrap();
             }
             Action::Changed => (),
         }

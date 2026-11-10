@@ -21,6 +21,7 @@ test-ipc = []
 test-console = []
 test-fs-create = []
 test-fs-read = []
+test-shell = []
 
 [dependencies]
 limine = "=0.6.5"

@@ -171,6 +171,13 @@ pub struct Vfs<B: Backend> {
     generations: [u64; DESCRIPTORS],
 }
 impl<B: Backend> Vfs<B> {
+    pub fn close_owner(&mut self, owner: usize) {
+        for fd in &mut self.descriptors {
+            if fd.is_some_and(|fd| fd.owner == owner) {
+                *fd = None;
+            }
+        }
+    }
     pub fn new(backend: B) -> Self {
         Self {
             backend,

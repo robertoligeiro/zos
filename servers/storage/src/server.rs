@@ -113,7 +113,7 @@ pub extern "C" fn _start(_: usize) -> ! {
                 1
             }
         };
-        os::reply(token, &reply[..count]).unwrap();
+        os::reply_live(token, &reply[..count]).unwrap();
     }
 }
 #[panic_handler]

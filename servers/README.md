@@ -19,21 +19,21 @@ proof markers are validated under both BIOS and UEFI.
 - `input-server`: bounded PS/2 controller initialization, set-1 keyboard
   decoding and standard three-byte mouse packets; owns ports 0x60/0x64 and
   IRQ1/IRQ12. It forwards decoded keys to TTY and mouse motion to console.
-- `tty-server`: 48-character ASCII insertion/editing, eight-entry history with
+- `tty-server`: 120-character ASCII insertion/editing, eight-entry history with
   draft restoration, and input echo; no command parsing or execution.
 
-Normal boot runs and tears down the regression demo first, then starts these
-three persistent services in priority order (console 0, input 1, TTY 2). Their
+Boot runs and tears down the regression demo first, then starts console/input
+and either the normal shell or regression TTY (priorities 0/1/2). Their
 fixed boot channels 1/2/3 are established by that deterministic order before
 input delivery is enabled by the TTY handshake; there is no registry yet.
 Synchronous IPC and priority inheritance apply to both key and rendering paths.
 Boot kernel framebuffer output is disabled at handoff; COM1 stays enabled.
 
-Pure decoding/editor/rendering logic has five host Rust tests. QMP-driven
+Pure decoding/editor/rendering logic has host Rust tests. QMP-driven
 BIOS/UEFI tests inject actual PS/2 keyboard/mouse events, check edited lines and
 pointer coordinates, capture the framebuffer, and verify driver/process cleanup.
 The `~finish` line has special meaning only in the dedicated test image;
-normal boots just echo it like any other input.
+normal boots do not interpret it as a test control.
 
 `storage` adds four ring-3 ELFs after the console services:
 
@@ -49,13 +49,32 @@ normal boots just echo it like any other input.
 
 The FS server is the block driver's only accepted caller. Those identities come
 from kernel-issued reply tokens; fixed boot channel/thread IDs are an explicit
-checkpoint limitation until the process manager/registry exists. Only storage
-processes have 1024-byte copied IPC, while all prior services remain at 64 bytes.
+checkpoint limitation; a dynamic registry remains deferred. Storage and
+session/console processes have 1024-byte copied IPC; the demo remains at 64 bytes.
 The console test still starts only its original three services.
 
-Seven Rust host storage tests cover crash/torn-write recovery, preserved backup
+Rust host storage tests cover crash/torn-write recovery, preserved backup
 data, corruption, limits, hierarchy, VFS descriptor ownership and protocol bounds.
 Real BIOS/UEFI tests format disposable volumes, write, stop QEMU completely and
 read from the same image in a new VM. The normal data volume remains persistent.
 
-`procmgr` and `shell` remain Step 7 work; the TTY still only echoes input.
+`session` adds `procmgr-server`, `shell-server` and the compact `zos-command`
+ELF. The manager starts at priority 7/TID 8, creates channel 7, seeds missing
+`/bin` files and authenticates shell (TID 3) and child startup requests. Its IRQ0
+notifications drive exit/fault polling, VFS descriptor cleanup and safe reaping.
+The normal shell creates channel 3 before storage startup, then waits for the
+manager handshake before enabling input. Fixed TID/channel distinctions matter:
+VFS owner-cleanup trusts manager **TID 8**, not its channel 7.
+
+The shell has a bounded pure parser for quotes/escapes/`;`/`>`/`>>`/`&`, builtins
+for filesystem/process/memory/control operations, and VFS-path executable loading
+for external commands. Each single-thread child receives a checked invocation
+and opens its own redirection FD. Generational PIDs, reply tokens, channels and
+FDs prevent stale operations after slot reuse. System services cannot be killed.
+At most 24 jobs retain status until wait. Existing `/bin` executables are
+preserved, not automatically replaced by newer boot modules.
+
+BIOS/UEFI shell acceptance checks repeated spawn/wait, fault and kill status,
+blocked IPC/channel reuse, leaked-descriptor cleanup, copied executable launch,
+real keyboard commands, exact contents across full QEMU exit/relaunch, guest
+reboot and CPU halt. `~finish` is privileged only in dedicated test images.

@@ -168,7 +168,7 @@ fn normal() {
     assert!(api::readdir(b"/", 0).unwrap().is_some());
     api::sync().unwrap();
     assert_eq!(os::storage_test_finish(), Err(os::Error::Denied));
-    zos_console::output(b"\nPersistent filesystem mounted at /.\nwelcome.txt is stored on data.img.\nStep 6: storage ready; shell is Step 7.\n");
+    zos_console::output(b"\nPersistent filesystem mounted at /.\nwelcome.txt is stored on the mounted data volume.\nPersistent storage ready.\n");
     os::send(zos_console::CONSOLE, &[zos_console::LINE, 0], &mut []).unwrap();
     os::debug_write("ZOS ready: persistent filesystem and VFS verified").unwrap();
 }

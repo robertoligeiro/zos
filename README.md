@@ -19,8 +19,8 @@ A single-core x86-64 microkernel project following the supplied
   boundaries, scrolling, colors, cursor pixels and pointer restoration.
   Storage tests cover formatting/preservation, crash and torn-write recovery,
   corrupt metadata, file/inode limits, paths, owned descriptors and stale handles.
-  The Step 6 gate contains 22 Python tests, twelve Rust tests, Rustfmt, Clippy in
-  thirteen configurations, and 22 BIOS/UEFI acceptance cases.
+  Session tests additionally cover quotes, sequencing, redirection, checked
+  startup packets and compact executable packaging.
 - Step 3: bitmap physical-frame allocation from Limine's usable regions;
   ZOS-owned page tables; 4 KiB map/unmap/protect; per-process lower halves
   sharing supervisor-only kernel mappings; an 8 MiB coalescing kernel heap
@@ -29,18 +29,19 @@ A single-core x86-64 microkernel project following the supplied
   scheduling with round-robin peers, synchronous IPC with transitive priority
   inheritance, checked syscalls, `libos`, and an echo server/client demonstration.
 - Step 5: separate ring-3 framebuffer console, PS/2 keyboard/mouse input and
-  line-editing TTY servers. Normal boots present an interactive **input demo**.
+  line-editing TTY servers. The dedicated console regression remains an input demo.
 - Step 6: separate ring-3 ATA block, fs-simple and VFS servers; a dedicated
   persistent data image, hierarchical files/directories and reboot verification.
-- Steps 7-8: deferred. There is no command shell/process manager or hardware
-  USB support. The TTY remains an input demo, not a shell.
+- Step 7: a ring-3 process manager and **interactive command shell**, executable
+  loading from VFS paths, reusable generation-checked PIDs/channels, exit/fault
+  status, automatic spawned-process descriptor cleanup, and memory reporting.
+- Step 8: deferred; there is no USB hardware support yet.
 
 The `phase-2` tag preserves the verified boot checkpoint. The `phase-3` memory
 checkpoint preserves **Step 3 / Phase 2** in the supplied plan. The
 `phase-4` tag corresponds to **Step 4 / Phase 3**; `phase-5` corresponds to
-**Step 5 / Phase 4**; `phase-6` corresponds to **Step 6 / Phase 5**.
-Repository tags follow step numbers. The command shell
-is Step 7, after disk/filesystem work in Step 6.
+**Step 5 / Phase 4**; `phase-6` corresponds to **Step 6 / Phase 5**;
+`phase-7` corresponds to **Step 7 / Phase 6**. Repository tags follow step numbers.
 
 The frame bitmap and copied page tables are reserved from usable RAM. Bootloader
 reclaimable memory stays reserved: boot responses and the initial kernel stack
@@ -68,9 +69,11 @@ User faults terminate only the offending thread; other threads continue.
 The syscall ABI uses RAX for the call/result and RDI/RSI/RDX/R10/R8 for arguments;
 Receive also returns message length in RDX. The nine planned syscalls are
 implemented, plus bounded serial `DebugWrite`, capability-checked `FramebufferMap`,
-and test-only `ConsoleTestFinish` and `StorageTestFinish`. Normal processes retain
-the **64-byte** copied-message limit. The four storage processes have a narrowly
-granted **1024-byte** copied-message limit for sector transfers and VFS payloads;
+and test-only `ConsoleTestFinish` and `StorageTestFinish`. Lifecycle calls are
+restricted to the initial process manager; it authenticates shell/child RPCs.
+Ordinary demo processes retain the **64-byte** copied-message limit.
+Storage, console/TTY/shell, manager and spawned command processes receive a
+**1024-byte** copied-message limit for bounded lines, sectors and VFS payloads;
 oversized buffers return an error, never truncated data. Large shared-message
 mapping is deferred, as allowed by the plan's start-with-copy decision. Send
 blocks until a server-owned, generation-checked Reply or an explicit channel
@@ -91,11 +94,12 @@ uses bounded PIO polling, IDENTIFY, LBA28 read/write and FLUSH CACHE. IOPL
 remains zero and all other ports stay denied. MapMemory supplies individual
 zeroed pages in a restricted user range,
 rejects writable-executable mappings and overlaps, and caps dynamic allocations
-at 128 pages per process. This boot demonstration allows 32 thread IDs,
-16 channel IDs and 8 stacks per process; IDs/stacks are not recycled until final
-demo teardown. It is not yet a general-purpose process manager.
+at 128 pages per process. There are 32 thread slots and 16 channel slots.
+The original demo allows eight stacks per address space; Step 7 spawned programs
+are single-threaded and cannot create threads. Reaped process slots and closed
+channels are reusable with generations; stale identifiers cannot target a replacement.
 
-Ten freestanding user ELFs are packaged as Limine modules. The loader checks
+Thirteen freestanding user ELFs are packaged as Limine modules. The loader checks
 ELF64/x86-64 headers, file bounds/overflow, page-separated load segments,
 executable entry points, overlap, image limits and W^X. User builds use their
 own lower-half linker script and `target\user` artifacts. Their code model
@@ -111,10 +115,53 @@ translation disabled and a standard three-byte PS/2 mouse. Initialization and
 controller drains are bounded and fail explicitly. Keyboard support is US ASCII
 with Shift/Caps Lock, extended arrows/Home/End/Delete, and Ctrl+A/E/L.
 The TTY supports insertion, Backspace/Delete, cursor movement, and eight history
-entries with draft restoration. Lines are limited to **48 ASCII characters**;
+entries with draft restoration. Lines are limited to **120 ASCII characters**;
 extra characters report `TTY LIMIT` on serial without corrupting the editor.
-Enter echoes `You typed: ...`; it does not parse or execute commands.
+Long lines scroll horizontally to keep the cursor visible. Normal Enter executes
+commands; the dedicated console regression still echoes `You typed: ...`.
 Click inside QEMU to focus keyboard/mouse input; Ctrl+Alt releases mouse capture.
+
+## Interactive shell and processes
+
+Run `python tools\zos.py run --firmware uefi` (or `bios`), click inside QEMU,
+and wait for `SHELL ready: interactive ZOS shell, persistent root filesystem`.
+At the `> ` prompt, execute the plan's acceptance session:
+
+```text
+mkdir a; cd a; echo hi > f; cat f; ps; free
+echo "a; > b" >> f; cat f
+cp f copy; mv copy renamed; ls
+```
+
+Use a fresh directory name if `a` already exists on your persistent volume.
+Commands: `help clear ls cd pwd mkdir rmdir touch cat echo rm cp mv free ps
+kill wait uname reboot halt`. `ps` reports PID, name, state and resident bytes;
+`free` reports real usable/free/used physical memory and kernel-heap usage.
+`reboot` and `halt` first synchronize the filesystem.
+
+Single/double quotes, backslash escapes, empty quoted arguments, `;`, `>` and
+`>>` are supported. There are no pipes, environment expansion, globbing or
+command substitution. Input is bounded to 120 ASCII characters, eight commands
+and twelve arguments per command. Paths are relative to `pwd` unless absolute.
+`cp`/`mv` require an exact destination path; there is no directory-destination
+expansion. Self-copy and cat redirection to an input inode fail before truncation.
+`rm` rejects directories; `rmdir` rejects nonempty directories.
+
+The manager loads checked ELF files from `/bin/name` or an explicit VFS path,
+not a boot-only executable whitelist. Missing bundled `/bin` programs are seeded
+on boot; existing files are preserved, **not upgraded automatically**. Copying
+`/bin/true` to another path and spawning that path is covered by acceptance.
+The bundled command ELF implements echo/cat/cp and simple true/false/spin/block/
+fault/leak/uname helpers according to its invocation name.
+
+External programs may run in the background with `&`; the shell prints their
+generation-checked PID. `kill PID` terminates a dynamic process and `wait PID`
+reports its exit status, including kill/fault outcomes. System services cannot
+be killed. Up/Down recall history; Ctrl+L clears the screen. Background jobs
+retain their bounded status slot until `wait`; there are at most 24 tracked jobs
+and 32 total process/thread slots. Spawned programs are single-threaded and
+receive no hardware, framebuffer or lifecycle capability. Cleanup releases
+their address space, dynamic pages, kernel stack, channels and owned VFS FDs.
 
 ## Persistent filesystem
 
@@ -130,7 +177,7 @@ contains a checksummed superblock, 64 inodes (including root), a block bitmap,
 parent/name directory records and two checksummed metadata banks. Names are up
 to 24 printable ASCII bytes, absolute paths up to 192 bytes and files up to
 64 KiB (sixteen direct 4 KiB blocks). There are no indirect blocks, permissions,
-links, registry, multiple mounted filesystems or general-purpose process manager.
+links, a dynamic service registry or multiple mounted filesystems.
 The inode/direct-pointer limits constrain usable file capacity below the 16 MiB
 volume size.
 
@@ -149,8 +196,9 @@ escaping above root fails. Its 64 descriptors carry generation handles and are
 owned by the kernel-authenticated calling thread, not an owner field supplied
 by a client. Stale/foreign handles and access-mode violations fail. Unlink of an
 open inode is denied; rename preserves live descriptors and does not overwrite an
-existing destination. Descriptors require explicit close; client-exit cleanup
-awaits the Step 7 process manager. Each read/write RPC transfers at most 1000 bytes
+existing destination. Clients normally close descriptors explicitly. The manager
+closes all descriptors owned by an exited, killed or faulted spawned process
+before reaping/reusing its slot. Each read/write RPC transfers at most 1000 bytes
 and returns the actual count; larger files use repeated calls. FS and block
 backend channels accept only their designated VFS/FS caller respectively.
 
@@ -252,7 +300,14 @@ already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
    create image must change its hash; the read image must leave it unchanged.
    Both check exact frame/heap cleanup. Normal `data.img` is never reformatted
    by these disposable persistence tests.
-5. Normal BIOS and UEFI boots, each with a framebuffer screenshot. These do
+5. Shell BIOS/UEFI cases drive actual PS/2 keys through the plan's session,
+   quotes, append, file commands, self-truncation rejection, editing/history,
+   background/kill/wait and real ps/free. Forty repeated spawns verify slot reuse,
+   stale PIDs, exit/fault status and exact memory recovery. Blocked-process kills
+   check stale channels and automatic descriptor cleanup. A fresh QEMU instance
+   reads exact persisted contents; separate commands reset the guest and halt
+   its CPU in ring 0. Test-only finish verifies complete service/resource teardown.
+6. Normal BIOS and UEFI boots, each with a framebuffer screenshot. These do
    not enable the test exit device. The harness stops each VM through QMP over
    standard input/output, without opening a network listener.
 
@@ -274,15 +329,19 @@ bios-fs-create.data.json         uefi-fs-create.data.json
 bios-fs-read.data.json           uefi-fs-read.data.json
 bios-screen.ppm                 uefi-screen.ppm
 bios-console.ppm                uefi-console.ppm
-phase-6-acceptance.json          (created only after automated success)
+bios-shell-session.ppm          uefi-shell-session.ppm
+bios-shell-reboot.ppm           uefi-shell-reboot.ppm
+bios-shell-power.serial.log     uefi-shell-power.serial.log
+bios-shell.data.json            uefi-shell.data.json
+phase-7-acceptance.json          (created only after automated success)
 zos.img                         (normal image, never a deliberate-fault image)
 data.img                        (persistent normal filesystem)
 data-test-bios.img              data-test-uefi.img (isolated acceptance volumes)
 ```
 
-Inspect all four screenshots to confirm a readable ZOS banner, input-demo
-instructions, prompt/cursor, correctly edited/echoed text and mouse crosshair.
-Normal screenshots additionally show the persistent filesystem status.
+Inspect all eight screenshots: two normal shell prompts, two console-regression
+screens and four shell-session/reboot screens. Confirm readable text,
+prompt/cursor, command/file/process/memory output and the mouse crosshair.
 Earlier IPC/isolation diagnostics remain in the serial log.
 The JSON explicitly records visual review as pending. Alternatively,
 verify the screen interactively, closing each QEMU window before the next:
@@ -319,11 +378,12 @@ PROCESS CLEANUP PASS: all address spaces, threads, channels released
 CONSOLE PASS: cursor, colors, backspace, scrolling
 PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12
 CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated
-ZOS ready: console checkpoint; input demo, not a shell.
 BLOCK ready: secondary ATA, LBA28, flush, 32768 sectors
 FS ready: checkpoint=..., COW metadata/data
 VFS ready: root mount, owned FDs, bounded copied IPC
 ZOS ready: persistent filesystem and VFS verified
+PROCMGR ready: path spawn, kill, wait, stats, reusable PIDs
+SHELL ready: interactive ZOS shell, persistent root filesystem
 ```
 
 UEFI reports `FIRMWARE: UEFI`; resolution and tick count can differ.
@@ -337,10 +397,9 @@ The hardware-fault cases report `MEMORY PROTECTION ACCEPTANCE PASS`,
 `MEMORY UNMAP ACCEPTANCE PASS` and `MEMORY EXECUTE ACCEPTANCE PASS`, respectively.
 The IPC image additionally reports `IPC ACCEPTANCE PASS`. The console image
 reports `TTY PASS`, `CONSOLE CLEANUP PASS` and `CONSOLE ACCEPTANCE PASS`.
-Normal boots run the IPC regression demo, then keep console/input/TTY and
-block/filesystem/VFS services running at an editable input prompt. The storage
-probe verifies `welcome.txt` and exits. Review this checkpoint before
-implementing Step 7; the command shell is not present yet.
+Normal boots run the IPC regression demo, then keep console/input/shell,
+block/filesystem/VFS and the process manager running at a command prompt.
+The storage probe verifies `welcome.txt` and exits. Hardware Step 8 remains deferred.
 
 ## Development commands
 

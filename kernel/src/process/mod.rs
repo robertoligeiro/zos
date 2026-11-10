@@ -1,5 +1,6 @@
 pub mod arch;
 mod elf;
+mod management;
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use arch::{Context, Frame, FxState};
@@ -25,6 +26,7 @@ struct Process {
     test_control: bool,
     storage_control: bool,
     bulk: bool,
+    manager: bool,
 }
 
 impl Process {
@@ -70,6 +72,7 @@ enum State {
     },
     Exited(i64),
     Faulted(&'static str),
+    Reaped,
 }
 
 struct Thread {
@@ -82,6 +85,9 @@ struct Thread {
     ports: u8,
     expected_fault: Option<&'static str>,
     pending_message: [u8; MAX_STORAGE_MESSAGE],
+    name: [u8; zos_libos::PROCESS_NAME],
+    generation: u64,
+    system: bool,
 }
 
 impl Thread {
@@ -102,6 +108,9 @@ impl Thread {
             ports: 0,
             expected_fault: None,
             pending_message: [0; MAX_STORAGE_MESSAGE],
+            name: [0; zos_libos::PROCESS_NAME],
+            generation: 0,
+            system: true,
         })
     }
 
@@ -120,6 +129,7 @@ struct Channel {
     pending: VecDeque<usize>,
     closed: bool,
     irq_pending: u16,
+    generation: u64,
 }
 
 struct Scheduler {
@@ -133,6 +143,7 @@ struct Scheduler {
     console: bool,
     console_finished: bool,
     storage_finished: bool,
+    shell_finished: bool,
     replies: usize,
     cross_process: usize,
     donations: usize,
@@ -143,9 +154,9 @@ struct Scheduler {
 
 impl Scheduler {
     fn channel(&self, handle: u64) -> Result<usize, Error> {
-        let index = handle.checked_sub(1).ok_or(Error::Invalid)? as usize;
+        let index = (handle & 255).checked_sub(1).ok_or(Error::Invalid)? as usize;
         let channel = self.channels.get(index).ok_or(Error::Invalid)?;
-        if channel.closed {
+        if channel.closed || channel.generation != handle >> 8 {
             return Err(Error::Closed);
         }
         Ok(index)
@@ -360,6 +371,7 @@ impl Scheduler {
 
     fn close_owned(&mut self, owner: usize) {
         for (index, channel) in self.channels.iter_mut().enumerate() {
+            channel.pending.retain(|&sender| sender != owner);
             if channel.owner == owner {
                 channel.closed = true;
                 channel.pending.clear();
@@ -387,16 +399,36 @@ impl Scheduler {
         let frame = self.threads[id].context.frame;
         match frame.rax {
             x if x == Call::ChannelCreate as u64 => {
-                if self.channels.len() == MAX_CHANNELS {
+                let slot = self
+                    .channels
+                    .iter()
+                    .position(|channel| channel.closed)
+                    .unwrap_or(self.channels.len());
+                if slot == MAX_CHANNELS {
                     return Err(Error::Limit);
                 }
-                self.channels.push(Channel {
+                let generation = if slot == self.channels.len() {
+                    0
+                } else {
+                    self.channels[slot]
+                        .generation
+                        .checked_add(1)
+                        .filter(|&g| g <= u64::MAX >> 8)
+                        .ok_or(Error::Limit)?
+                };
+                let channel = Channel {
                     owner: id,
                     pending: VecDeque::new(),
                     closed: false,
                     irq_pending: 0,
-                });
-                Ok(Some(self.channels.len()))
+                    generation,
+                };
+                if slot == self.channels.len() {
+                    self.channels.push(channel);
+                } else {
+                    self.channels[slot] = channel;
+                }
+                Ok(Some(((generation << 8) | (slot + 1) as u64) as usize))
             }
             x if x == Call::Send as u64 => {
                 let (message, length) = self.request(id, frame.rsi, frame.rdx)?;
@@ -475,6 +507,9 @@ impl Scheduler {
                 Ok(Some(0))
             }
             x if x == Call::ThreadCreate as u64 => {
+                if !self.threads[id].system {
+                    return Err(Error::Denied);
+                }
                 if self.threads.len() == MAX_THREADS {
                     return Err(Error::Limit);
                 }
@@ -644,6 +679,9 @@ impl Scheduler {
                 crate::logln!("USER tid={}: {}", id + 1, text);
                 Ok(Some(0))
             }
+            x if (Call::ProcessSpawn as u64..=Call::SystemControl as u64).contains(&x) => {
+                self.management(id, frame)
+            }
             _ => Err(Error::Invalid),
         }
     }
@@ -744,10 +782,12 @@ extern "C" fn zos_idle() -> ! {
         let (finished, next) = {
             let mut guard = SCHEDULER.lock();
             let scheduler = guard.as_mut().unwrap();
-            let finished = scheduler
-                .threads
-                .iter()
-                .all(|thread| matches!(thread.state, State::Exited(_) | State::Faulted(_)));
+            let finished = scheduler.threads.iter().all(|thread| {
+                matches!(
+                    thread.state,
+                    State::Exited(_) | State::Faulted(_) | State::Reaped
+                )
+            });
             (
                 finished,
                 if finished {
@@ -771,6 +811,19 @@ extern "C" fn zos_idle() -> ! {
 
 fn complete() -> ! {
     let scheduler = SCHEDULER.lock().take().unwrap();
+    if scheduler.shell_finished {
+        let baseline = scheduler.baseline;
+        drop(scheduler);
+        let after = memory::stats();
+        assert_eq!(after.free_bytes, baseline.free_bytes, "Shell frame leak");
+        assert_eq!(
+            after.heap_used_bytes, baseline.heap_used_bytes,
+            "Shell heap leak"
+        );
+        crate::logln!("SHELL CLEANUP PASS: all processes, descriptors and services released");
+        crate::logln!("SHELL ACCEPTANCE PASS");
+        crate::finish_test(true);
+    }
     if scheduler.storage_finished {
         let baseline = scheduler.baseline;
         drop(scheduler);
@@ -875,6 +928,7 @@ pub fn start() -> ! {
         console: false,
         console_finished: false,
         storage_finished: false,
+        shell_finished: false,
         replies: 0,
         cross_process: 0,
         donations: 0,
@@ -903,8 +957,10 @@ pub fn start() -> ! {
             test_control: false,
             storage_control: false,
             bulk: false,
+            manager: false,
         }));
         let mut thread = Thread::new(process, entry, role, priority).unwrap();
+        thread.name[..name.len()].copy_from_slice(name.as_bytes());
         thread.expected_fault = expected_fault;
         scheduler.threads.push(thread);
         crate::logln!("ELF LOAD: {} role={} entry={:#x}", name, role, entry);
@@ -932,6 +988,7 @@ fn start_console() -> ! {
         console: true,
         console_finished: false,
         storage_finished: false,
+        shell_finished: false,
         replies: 0,
         cross_process: 0,
         donations: 0,
@@ -942,7 +999,17 @@ fn start_console() -> ! {
     for (name, priority, ports, irqs, framebuffer) in [
         ("console-server", 0, 0, 0, true),
         ("input-server", 1, 6, (1 << 1) | (1 << 12), false),
-        ("tty-server", 2, 0, 0, false),
+        (
+            if shell_enabled() {
+                "shell-server"
+            } else {
+                "tty-server"
+            },
+            2,
+            0,
+            0,
+            false,
+        ),
     ] {
         let file = crate::boot::MODULES
             .response()
@@ -962,17 +1029,18 @@ fn start_console() -> ! {
             framebuffer_mapped: false,
             test_control: name == "tty-server",
             storage_control: false,
-            bulk: false,
+            bulk: framebuffer || matches!(name, "shell-server" | "tty-server"),
+            manager: false,
         }));
-        scheduler.threads.push(
-            Thread::new(
-                process,
-                entry,
-                cfg!(feature = "test-console") as u64,
-                priority,
-            )
-            .unwrap(),
-        );
+        let mut thread = Thread::new(
+            process,
+            entry,
+            (cfg!(feature = "test-console") || cfg!(feature = "test-shell")) as u64,
+            priority,
+        )
+        .unwrap();
+        thread.name[..name.len()].copy_from_slice(name.as_bytes());
+        scheduler.threads.push(thread);
     }
     if !cfg!(feature = "test-console") {
         for (name, priority, ports) in [
@@ -1000,6 +1068,7 @@ fn start_console() -> ! {
                 test_control: false,
                 storage_control: name == "storage-probe",
                 bulk: true,
+                manager: false,
             }));
             let role = if cfg!(feature = "test-fs-create") {
                 1
@@ -1008,14 +1077,48 @@ fn start_console() -> ! {
             } else {
                 0
             };
-            scheduler
-                .threads
-                .push(Thread::new(process, entry, role, priority).unwrap());
+            let mut thread = Thread::new(process, entry, role, priority).unwrap();
+            thread.name[..name.len()].copy_from_slice(name.as_bytes());
+            scheduler.threads.push(thread);
         }
+    }
+    if shell_enabled() {
+        let file = crate::boot::MODULES
+            .response()
+            .unwrap()
+            .modules()
+            .iter()
+            .find(|file| file.cmdline() == "procmgr-server")
+            .expect("Missing procmgr ELF");
+        let (space, entry) = elf::load(file.data()).expect("Process manager ELF load failed");
+        let process = Arc::new(Mutex::new(Process {
+            space,
+            stacks: 0,
+            dynamic_pages: 0,
+            ports: 0,
+            irqs: 1,
+            framebuffer: false,
+            framebuffer_mapped: false,
+            test_control: false,
+            storage_control: false,
+            bulk: true,
+            manager: true,
+        }));
+        let mut thread = Thread::new(process, entry, 0, 7).unwrap();
+        thread.name[..14].copy_from_slice(b"procmgr-server");
+        scheduler.threads.push(thread);
     }
     scheduler.last = [scheduler.threads.len() - 1; 32];
     let next = scheduler.choose(false).unwrap();
     assert!(SCHEDULER.lock().replace(scheduler).is_none());
     // SAFETY: all service contexts and capability sets are installed before entry.
     unsafe { arch::resume(next) }
+}
+
+fn shell_enabled() -> bool {
+    !cfg!(any(
+        feature = "test-console",
+        feature = "test-fs-create",
+        feature = "test-fs-read"
+    ))
 }

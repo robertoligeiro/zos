@@ -129,8 +129,10 @@ impl Terminal {
         self.cells[self.y * COLUMNS..(self.y + 1) * COLUMNS].fill(blank);
         self.x = 0;
         self.write(b"> ");
-        self.write(bytes);
-        self.x = cursor + 2;
+        let start = cursor.saturating_sub(self.columns - 3);
+        let end = (start + self.columns - 2).min(bytes.len());
+        self.write(&bytes[start..end]);
+        self.x = cursor - start + 2;
         self.dirty[self.y] = true;
     }
     pub fn pointer(&mut self, dx: i16, dy: i16, buttons: u8) {
@@ -203,6 +205,19 @@ impl Terminal {
 mod tests {
     extern crate std;
     use super::*;
+    #[test]
+    fn long_edit_lines_scroll_horizontally_without_advancing_rows() {
+        let mut terminal = Terminal::new();
+        terminal.configure(512, 32);
+        let mut line = [b'a'; crate::editor::CAPACITY];
+        line[line.len() - 1] = b'z';
+        terminal.line(&line, line.len());
+        assert_eq!((terminal.x, terminal.y, terminal.scrolls), (63, 0, 0));
+        assert_eq!(terminal.cells[62].byte, b'z');
+        terminal.line(&line, 0);
+        assert_eq!((terminal.x, terminal.y, terminal.scrolls), (2, 0, 0));
+        assert_eq!(terminal.cells[2].byte, b'a');
+    }
     #[test]
     fn scroll_backspace_colors_cursor_and_pointer_restore() {
         let mut terminal = Terminal::new();

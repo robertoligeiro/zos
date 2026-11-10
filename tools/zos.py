@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import struct
 import sys
 import time
 
@@ -30,6 +31,7 @@ CASES = {
     "console": ("test-console", "CONSOLE ACCEPTANCE PASS"),
     "fs-create": ("test-fs-create", "FS CREATE PASS:"),
     "fs-read": ("test-fs-read", "FS REBOOT PASS:"),
+    "shell": ("test-shell", "SHELL ACCEPTANCE PASS"),
 }
 COMMON_MARKERS = ("ZOS - Zombie OS", "ZOS booting", "FRAMEBUFFER ready:",
                   "GDT/TSS/IDT ready", "PAGING ready:", "HEAP ready:",
@@ -50,7 +52,8 @@ IPC_MARKERS = (
 )
 USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe",
                  "console-server", "input-server", "tty-server",
-                 "blkdev-server", "fs-simple-server", "vfs-server", "storage-probe")
+                 "blkdev-server", "fs-simple-server", "vfs-server", "storage-probe",
+                 "procmgr-server", "shell-server", "zos-command")
 READY_MARKER = "ZOS ready: console checkpoint"
 CONSOLE_MARKERS = ("CONSOLE PASS: cursor, colors, backspace, scrolling",
                    "PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12",
@@ -58,6 +61,12 @@ CONSOLE_MARKERS = ("CONSOLE PASS: cursor, colors, backspace, scrolling",
 CONSOLE_LINES = ["zombie", "zombie!", "zombie!", "ZOS", "ab!c", "~finish"]
 STORAGE_READY = "ZOS ready: persistent filesystem and VFS verified"
 STORAGE_MARKERS = ("BLOCK ready: secondary ATA", "FS ready: checkpoint=", "VFS ready: root mount")
+SHELL_READY = "SHELL ready: interactive ZOS shell"
+SHELL_PROOFS = (
+    "PROCESS CAPABILITIES PASS:", "PROCESS REUSE PASS:", "PROCESS STATUS PASS:",
+    "PROCESS CLEANUP PASS: kill blocked IPC", "PATH SPAWN PASS:",
+    "SHELL SESSION PASS:", "SHELL CLEANUP PASS:",
+)
 
 
 def environment() -> dict[str, str]:
@@ -92,7 +101,10 @@ def cargo(*args: str, user: bool = False) -> None:
 
 def build(case: str | None = None) -> Path:
     cargo("build", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console", "--package", "zos-storage", user=True)
+          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", user=True)
+    BUILD.mkdir(exist_ok=True)
+    program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / "zos-command"
+    (BUILD / "zos-command.elf").write_bytes(compact_elf(program.read_bytes()))
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     if case:
         args += ["--features", CASES[case][0]]
@@ -101,6 +113,28 @@ def build(case: str | None = None) -> Path:
     destination = BUILD / f"zos-{case or 'normal'}.elf"
     shutil.copyfile(ROOT / "target" / "x86_64-unknown-none" / "release" / "zos-kernel", destination)
     return destination
+
+
+def compact_elf(data: bytes) -> bytes:
+    if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+        raise ValueError("Invalid bundled program ELF")
+    offset = struct.unpack_from("<Q", data, 32)[0]
+    count = struct.unpack_from("<H", data, 56)[0]
+    end = offset + count * 56
+    if count == 0 or end > len(data):
+        raise ValueError("Invalid program header table")
+    for i in range(count):
+        location = offset + i * 56
+        if struct.unpack_from("<I", data, location)[0] == 1:
+            file_offset = struct.unpack_from("<Q", data, location + 8)[0]
+            size = struct.unpack_from("<Q", data, location + 32)[0]
+            end = max(end, file_offset + size)
+    if end > len(data) or end > 65536:
+        raise ValueError("Bundled executable exceeds the filesystem's 64 KiB file limit")
+    result = bytearray(data[:end])
+    result[40:48] = bytes(8)
+    result[58:64] = bytes(6)
+    return bytes(result)
 
 
 def image(kernel: Path, case: str | None = None) -> Path:
@@ -113,9 +147,10 @@ def image(kernel: Path, case: str | None = None) -> Path:
         "boot/zos.elf": kernel.read_bytes(),
     }
     for program in USER_PROGRAMS:
-        payloads[f"boot/{program}.elf"] = (
+        source = BUILD / "zos-command.elf" if program == "zos-command" else (
             ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / program
-        ).read_bytes()
+        )
+        payloads[f"boot/{program}.elf"] = source.read_bytes()
     create_image(destination, payloads)
     subprocess.run(
         [str(limine / "limine.exe"), "bios-install", str(destination), "1"],
@@ -138,8 +173,9 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
         str(executable), "-L", str(bios.parent), "-accel", "tcg", "-machine", "pc",
         "-cpu", "max", "-smp", "1", "-m", f"{memory_mib}M", "-nic", "none",
         "-drive", f"file={disk},format=raw,if=ide,index=0,snapshot=on",
-        "-no-reboot",
     ]
+    if exit_on_shutdown:
+        command.append("-no-reboot")
     if data_disk is not None:
         if data_disk.resolve() == disk.resolve() or data_disk.resolve() != data_path(data_disk.name):
             raise ValueError("Data disk must be a separate generated volume inside build")
@@ -186,6 +222,8 @@ def validate_log(text: str, firmware: str, case: str) -> None:
         validate_ipc(text)
     if case == "console":
         validate_console(text)
+    if case == "shell":
+        validate_shell(text)
     if case.startswith("fs-"):
         validate_storage(text)
         for marker in ("STORAGE CLEANUP PASS:", "FILESYSTEM ACCEPTANCE PASS"):
@@ -229,6 +267,23 @@ def validate_storage(text: str) -> None:
                                             "IO ERROR", "ASSERTION FAILED")):
         raise RuntimeError("Storage or console service failed")
 
+
+def validate_shell(text: str) -> None:
+    validate_ipc(text)
+    for marker in (*CONSOLE_MARKERS, *STORAGE_MARKERS, SHELL_READY, *SHELL_PROOFS):
+        if marker not in text:
+            raise RuntimeError(f"Missing shell proof: {marker}")
+    services = text.split("Starting ring-3 console", 1)[-1]
+    faults = re.findall(r"^USER FAULT: tid=(\d+) kind=(.*?) address=", services, re.MULTILINE)
+    if faults != [("9", "INVALID OPCODE")]:
+        raise RuntimeError("Shell test requires exactly its contained command fault")
+    if any(marker in services for marker in ("SERVICE FAILURE", "KERNEL PANIC", "EXCEPTION:",
+                                             "IO ERROR", "ASSERTION FAILED")):
+        raise RuntimeError("Shell or supporting service failed")
+    for tid, status in re.findall(r"^USER EXIT: tid=(\d+) status=(-?\d+)$", services, re.MULTILINE):
+        if int(tid) <= 8 and status != "0":
+            raise RuntimeError("A system service exited unsuccessfully")
+
 def validate_console(text: str) -> None:
     validate_ipc(text)
     for marker in (*CONSOLE_MARKERS, "TTY PASS: real keys, editing, modifiers and history",
@@ -269,7 +324,7 @@ class Qmp:
         self.execute("qmp_capabilities", identity="capabilities")
 
     def execute(self, command: str, arguments: dict | None = None,
-                *, identity: str | None = None) -> None:
+                *, identity: str | None = None):
         self.sequence += 1
         request = {"execute": command, "id": identity or str(self.sequence)}
         if arguments is not None:
@@ -282,7 +337,7 @@ class Qmp:
             if "error" in response:
                 raise RuntimeError(f"QMP {command} failed: {response['error']}")
             if response.get("id") == request["id"] and "return" in response:
-                return
+                return response["return"]
         raise RuntimeError(f"QMP {command} timed out")
 
     def close(self) -> None:
@@ -291,13 +346,14 @@ class Qmp:
         self.log.close()
 
 
-def wait_serial(process, log: Path, marker: str, timeout: int) -> str:
+def wait_serial(process, log: Path, marker: str, timeout: int, *, start: int = 0) -> str:
     deadline = time.monotonic() + timeout
     while True:
         text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-        if any(failure in text for failure in ("KERNEL PANIC", "EXCEPTION:", "CONSOLE SERVICE FAILURE")):
+        current = text[start:]
+        if any(failure in current for failure in ("KERNEL PANIC", "EXCEPTION:", "SERVICE FAILURE")):
             raise RuntimeError(f"Guest failed; inspect {log}")
-        if marker in text:
+        if marker in current:
             return text
         if process.poll() is not None or time.monotonic() >= deadline:
             raise RuntimeError(f"Waiting for {marker!r} failed; inspect {log}")
@@ -384,7 +440,170 @@ def console_case(disk: Path, firmware: str, timeout: int) -> None:
     print(f"PASS {firmware}/console: real keyboard/mouse, editing/history, rendering, cleanup", flush=True)
 
 
+class ShellKeys:
+    def __init__(self, process, qmp: Qmp, log: Path, timeout: int):
+        self.process, self.qmp, self.log, self.timeout = process, qmp, log, timeout
+        self.keys = self.lines = self.start = 0
+
+    def key(self, code: str, *, shift: bool = False, ctrl: bool = False, wait: bool = True) -> None:
+        codes = (["shift"] if shift else []) + (["ctrl"] if ctrl else []) + [code]
+        self.qmp.execute("send-key", {"keys": [{"type": "qcode", "data": c} for c in codes], "hold-time": 5})
+        time.sleep(0.015)
+        self.keys += 1
+        if wait:
+            wait_serial(self.process, self.log, f"SHELL KEY: {self.keys}\n", self.timeout, start=self.start)
+
+    def type(self, text: str) -> None:
+        plain = {" ": "spc", "/": "slash", ".": "dot", ";": "semicolon", "'": "apostrophe",
+                 "-": "minus", "\\": "backslash", "=": "equal"}
+        shifted = {'"': "apostrophe", ">": "dot", "&": "7", "~": "grave_accent",
+                   "_": "minus", "!": "1", ":": "semicolon"}
+        for char in text:
+            if char in shifted:
+                self.key(shifted[char], shift=True)
+            elif char.isupper():
+                self.key(char.lower(), shift=True)
+            elif char in plain:
+                self.key(plain[char])
+            elif char.isascii() and char.isalnum():
+                self.key(char)
+            else:
+                raise ValueError(f"Missing PS/2 test mapping for {char!r}")
+
+    def enter(self, statuses: list[int]) -> None:
+        before = re.findall(r"SHELL STATUS: (-?\d+)", self.log.read_text(encoding="utf-8"))
+        self.key("ret")
+        self.lines += 1
+        text = wait_serial(self.process, self.log, f"SHELL LINE DONE: {self.lines}\n", self.timeout, start=self.start)
+        after = re.findall(r"SHELL STATUS: (-?\d+)", text)
+        actual = [int(n) for n in after[len(before):]]
+        if actual != statuses:
+            raise RuntimeError(f"Shell statuses {actual} != {statuses}; inspect {self.log}")
+
+    def line(self, text: str, statuses: list[int]) -> None:
+        self.type(text)
+        self.enter(statuses)
+
+
+def shell_case(disk: Path, firmware: str, timeout: int) -> None:
+    data = format_disk(f"data-shell-test-{firmware}.img", force=True)
+    hashes = []
+    for stage in ("session", "reboot"):
+        log = BUILD / f"{firmware}-shell-{stage}.serial.log"
+        log.unlink(missing_ok=True)
+        command = qemu_command(disk, firmware, exit_on_shutdown=True, data_disk=data) + [
+            "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-qmp", "stdio",
+        ]
+        with (BUILD / f"{firmware}-shell-{stage}.qemu.log").open("wb") as errors:
+            process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+            qmp = Qmp(process, BUILD / f"{firmware}-shell-{stage}.qmp.log", timeout)
+            try:
+                qmp.negotiate()
+                wait_serial(process, log, SHELL_READY, timeout)
+                keys = ShellKeys(process, qmp, log, timeout)
+                if stage == "session":
+                    keys.line("mkdir a; cd a; echo hi > f; cat f; ps; free", [0] * 6)
+                    keys.line("pwd", [0])
+                    keys.line('echo "a; > b" >> f; cat f', [0, 0])
+                    keys.line("cp f g; mv g renamed; cat renamed", [0, 0, 0])
+                    keys.line("touch empty; rm empty; mkdir sub; rmdir sub", [0] * 4)
+                    keys.line("ls > listing; cat listing", [0, 0])
+                    keys.line("cp f f; /bin/cat f > f; cat f", [1, 1, 0])
+                    keys.line('echo "with spaces" > "two words"; cat "two words"', [0, 0])
+                    keys.line('echo "unterminated', [])
+                    keys.line("uname; help", [0, 0])
+                    keys.line("kill 3", [1])
+                    keys.line("spin &", [0])
+                    pid = re.findall(r"SHELL BACKGROUND: (\d+)", log.read_text(encoding="utf-8"))[-1]
+                    keys.line("ps", [0])
+                    if "SHELL OUT: spin" not in log.read_text(encoding="utf-8"):
+                        raise RuntimeError("Background process was missing from ps")
+                    keys.line(f"kill {pid}; wait {pid}", [0, 0])
+                    keys.type("echx")
+                    keys.key("backspace")
+                    keys.type("o edited")
+                    keys.enter([0])
+                    keys.key("up")
+                    keys.enter([0])
+                    keys.key("l", ctrl=True)
+                    keys.line("cd /; cat /a/f; ps; free", [0] * 4)
+                else:
+                    keys.line('cat /a/f; cat /a/renamed; cat "/a/two words"; ps; free', [0] * 5)
+                    text = log.read_text(encoding="utf-8")
+                    if text.count("SHELL OUT: hi\na; > b\n") != 2 or "SHELL OUT: with spaces\n" not in text:
+                        raise RuntimeError("Shell file contents did not survive full QEMU exit/relaunch")
+                picture = BUILD / f"{firmware}-shell-{stage}.ppm"
+                qmp.execute("screendump", {"filename": str(picture)})
+                keys.type("~finish")
+                keys.key("ret", wait=False)
+                if process.wait(timeout=timeout) != 33:
+                    raise RuntimeError(f"Shell acceptance exit failed; inspect {log}")
+                validate_log(log.read_text(encoding="utf-8"), firmware, "shell")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                qmp.close()
+                process.stdin.close()
+                process.stdout.close()
+        hashes.append(hashlib.sha256(data.read_bytes()).hexdigest())
+        print(f"PASS {firmware}/shell-{stage}: real keys, commands, process lifecycle and clean exit", flush=True)
+    shell_power_case(disk, firmware, data, timeout)
+    (BUILD / f"{firmware}-shell.data.json").write_text(json.dumps({
+        "data_image": data.name, "session_sha256": hashes[0], "reboot_sha256": hashes[1],
+        "full_qemu_exit_between_sessions": True,
+        "exact_reboot_contents_verified": ["/a/f", "/a/renamed", "/a/two words"],
+        "reboot_and_halt_verified": True,
+    }, indent=2) + "\n", encoding="utf-8")
+
+
+def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int) -> None:
+    log = BUILD / f"{firmware}-shell-power.serial.log"
+    log.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, data_disk=data) + [
+        "-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio",
+    ]
+    with (BUILD / f"{firmware}-shell-power.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-shell-power.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            wait_serial(process, log, SHELL_READY, timeout)
+            keys = ShellKeys(process, qmp, log, timeout)
+            keys.type("reboot")
+            start = len(log.read_text(encoding="utf-8"))
+            keys.key("ret", wait=False)
+            wait_serial(process, log, SHELL_READY, timeout, start=start)
+            text = log.read_text(encoding="utf-8")
+            if text.count("ZOS REBOOT: filesystem synced") != 1 or text.count(SHELL_READY) != 2:
+                raise RuntimeError("Reboot command did not restart the guest")
+            keys = ShellKeys(process, qmp, log, timeout)
+            keys.start = len(text)
+            keys.type("halt")
+            keys.key("ret", wait=False)
+            wait_serial(process, log, "ZOS HALTED: filesystem synced", timeout, start=keys.start)
+            time.sleep(0.05)
+            registers = qmp.execute("human-monitor-command", {"command-line": "info registers"})
+            if not isinstance(registers, str) or "HLT=1" not in registers or "CPL=0" not in registers:
+                raise RuntimeError("Halt command did not halt the CPU in ring 0")
+            qmp.execute("quit")
+            if process.wait(timeout=timeout) != 0:
+                raise RuntimeError("Power-control QEMU did not exit cleanly")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    print(f"PASS {firmware}/shell-power: real reboot and ring-0 halted CPU, storage synchronized", flush=True)
+
+
 def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
+    if case == "shell":
+        shell_case(disk, firmware, timeout)
+        return
     if case == "console":
         console_case(disk, firmware, timeout)
         return
@@ -434,14 +653,14 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     print(f"PASS {firmware}/{case}: serial, framebuffer initialized, timer, expected exit", flush=True)
 
 
-def screenshot(disk: Path, firmware: str, timeout: int) -> None:
+def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | None = None) -> None:
     log = BUILD / f"{firmware}-screen.serial.log"
     stderr = BUILD / f"{firmware}-screen.qemu.log"
     picture = BUILD / f"{firmware}-screen.ppm"
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
     picture.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware, data_disk=ensure_disk()) + [
+    command = qemu_command(disk, firmware, data_disk=data_disk or ensure_disk()) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-qmp", "stdio",
     ]
@@ -454,7 +673,7 @@ def screenshot(disk: Path, firmware: str, timeout: int) -> None:
             deadline = time.monotonic() + timeout
             while True:
                 text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
-                if STORAGE_READY in text:
+                if SHELL_READY in text:
                     break
                 if "KERNEL PANIC" in text or "EXCEPTION:" in text or "SERVICE FAILURE" in text or process.poll() is not None:
                     raise RuntimeError(f"{firmware}: normal kernel failed; inspect {log}")
@@ -495,10 +714,10 @@ def check() -> None:
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
     cargo("test", "--locked", "--package", "zos-console", "--lib",
-          "--package", "zos-storage",
+          "--package", "zos-storage", "--package", "zos-session",
           "--target", "x86_64-pc-windows-gnu")
     cargo("clippy", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console", "--package", "zos-storage",
+          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session",
           "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
@@ -507,26 +726,38 @@ def check() -> None:
         cargo(*args, "--", "-D", "warnings")
 
 
+def source_hashes() -> dict[str, str]:
+    files = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT, text=True,
+    ).splitlines()
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files}
+
+
 def accept(timeout: int) -> None:
-    result = BUILD / "phase-6-acceptance.json"
+    result = BUILD / "phase-7-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
+    tested_sources = source_hashes()
     check()
     for case in CASES:
         disk = image(build(case), case)
         for firmware in ("bios", "uefi"):
             accept_case(disk, firmware, case, timeout)
     normal = image(build())
+    data = format_disk("data-normal-acceptance.img", force=True)
     for firmware in ("bios", "uefi"):
-        screenshot(normal, firmware, timeout)
+        screenshot(normal, firmware, timeout, data_disk=data)
+    if source_hashes() != tested_sources:
+        raise RuntimeError("Source files changed during acceptance; rerun against the final revision")
     result.write_text(json.dumps({
-        "phase": 6,
+        "phase": 7,
         "automated_checks": "passed",
-        "visual_review": "pending: inspect bios/uefi-screen.ppm and bios/uefi-console.ppm",
+        "visual_review": "pending: inspect normal, console and shell captures in BIOS and UEFI",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "source_sha256": tested_sources,
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED STEP 6 PASS. Inspect normal and console screenshots.", flush=True)
+    print("AUTOMATED STEP 7 PASS. Inspect normal, console and shell screenshots.", flush=True)
 
 
 def main() -> None:

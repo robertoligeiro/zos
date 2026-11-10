@@ -81,6 +81,18 @@ fn handle(
             vfs.sync()?;
             Ok(0)
         }
+        10 => {
+            if owner != 8 {
+                return Err(Error::Denied);
+            }
+            let target = reader.byte()? as usize;
+            reader.end()?;
+            if !(1..=os::PROCESS_SLOTS).contains(&target) {
+                return Err(Error::Invalid);
+            }
+            vfs.close_owner(target);
+            Ok(0)
+        }
         _ => Err(Error::Invalid),
     }
 }
@@ -109,7 +121,7 @@ pub extern "C" fn _start(_: usize) -> ! {
                 1
             }
         };
-        os::reply(token, &reply[..count]).unwrap();
+        os::reply_live(token, &reply[..count]).unwrap();
     }
 }
 #[panic_handler]

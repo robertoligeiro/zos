@@ -1,0 +1,27 @@
+[package]
+name = "zos-session"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "procmgr-server"
+path = "src/procmgr.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "shell-server"
+path = "src/shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "zos-command"
+path = "src/command.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }
+zos-console = { path = "../console" }
+zos-storage = { path = "../storage" }

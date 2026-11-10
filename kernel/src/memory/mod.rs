@@ -75,6 +75,23 @@ fn with<T>(f: impl FnOnce(&mut Memory) -> T) -> T {
 }
 
 impl Memory {
+    fn resident_pages(&self, frame: u64, level: usize) -> u64 {
+        let mut pages = 1;
+        let count = if level == 4 { 256 } else { 512 };
+        for index in 0..count {
+            // SAFETY: the memory lock protects this live private lower-half tree.
+            let entry = unsafe { &(&*self.table(frame))[index] };
+            if !entry.flags().contains(Flags::PRESENT) {
+                continue;
+            }
+            if level > 1 {
+                pages += self.resident_pages(entry.addr().as_u64(), level - 1);
+            } else if !entry.flags().contains(Flags::BIT_9) {
+                pages += 1;
+            }
+        }
+        pages
+    }
     fn table(&self, frame: u64) -> *mut PageTable {
         (self.hhdm + frame) as *mut PageTable
     }
@@ -286,6 +303,9 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
+    pub fn resident_bytes(&self) -> u64 {
+        with(|memory| memory.resident_pages(self.root, 4) * PAGE_SIZE)
+    }
     pub fn new() -> Result<Self, Error> {
         with(|memory| {
             let root = memory.allocate_zeroed()?;
