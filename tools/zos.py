@@ -67,6 +67,15 @@ SHELL_PROOFS = (
     "PROCESS CLEANUP PASS: kill blocked IPC", "PATH SPAWN PASS:",
     "SHELL SESSION PASS:", "SHELL CLEANUP PASS:",
 )
+USB_MARKERS = (
+    "PCI XHCI PASS:", "XHCI ready:", "USB ENUM PASS: slot=1 port=3 Storage",
+    "USB ENUM PASS: slot=2 port=5 Keyboard", "USB ENUM PASS: slot=3 port=6 Mouse",
+    "USB SCSI PASS:", "USB ready:", "USB CAPABILITIES PASS:",
+    "CAPABILITIES PASS: framebuffer, USB MMIO/DMA and IRQs isolated",
+    "BLOCK ready: USB bulk-only SCSI", "FS ready: checkpoint=", "VFS ready: root mount",
+    "CONSOLE PASS: cursor, colors, backspace, scrolling", READY_MARKER,
+    "USB STORAGE CAPABILITY PASS: shell cannot issue raw blocks",
+)
 
 
 def environment() -> dict[str, str]:
@@ -99,18 +108,19 @@ def cargo(*args: str, user: bool = False) -> None:
                    env=user_environment() if user else environment(), check=True)
 
 
-def build(case: str | None = None) -> Path:
+def build(case: str | None = None, *, usb: bool = False) -> Path:
     cargo("build", "--locked", "--release", "--package", "zos-demo",
           "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", user=True)
     BUILD.mkdir(exist_ok=True)
     program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / "zos-command"
     (BUILD / "zos-command.elf").write_bytes(compact_elf(program.read_bytes()))
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
-    if case:
-        args += ["--features", CASES[case][0]]
+    features = ([CASES[case][0]] if case else []) + (["usb"] if usb else [])
+    if features:
+        args += ["--features", ",".join(features)]
     cargo(*args)
     BUILD.mkdir(exist_ok=True)
-    destination = BUILD / f"zos-{case or 'normal'}.elf"
+    destination = BUILD / f"zos-{'usb-' if usb else ''}{case or 'normal'}.elf"
     shutil.copyfile(ROOT / "target" / "x86_64-unknown-none" / "release" / "zos-kernel", destination)
     return destination
 
@@ -161,7 +171,8 @@ def image(kernel: Path, case: str | None = None) -> Path:
 
 
 def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
-                 memory_mib: int = 256, data_disk: Path | None = None) -> list[str]:
+                 memory_mib: int = 256, data_disk: Path | None = None,
+                 usb: bool = False) -> list[str]:
     directory = TOOLS / "qemu"
     executable = directory / "qemu-system-x86_64.exe"
     if not executable.is_file():
@@ -176,11 +187,19 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
     ]
     if exit_on_shutdown:
         command.append("-no-reboot")
+    if usb:
+        command += ["-device", "qemu-xhci,id=xhci",
+                    "-device", "usb-kbd,id=zos-usb-kbd,bus=xhci.0,port=1",
+                    "-device", "usb-mouse,id=zos-usb-mouse,bus=xhci.0,port=2"]
     if data_disk is not None:
         if data_disk.resolve() == disk.resolve() or data_disk.resolve() != data_path(data_disk.name):
             raise ValueError("Data disk must be a separate generated volume inside build")
         validate_disk(data_disk)
-        command += ["-drive", f"file={data_disk},format=raw,if=ide,index=2,cache=writeback,snapshot=off"]
+        if usb:
+            command += ["-drive", f"file={data_disk},format=raw,if=none,id=usb-data,cache=writeback,snapshot=off",
+                        "-device", "usb-storage,id=zos-usb-disk,bus=xhci.0,port=3,drive=usb-data"]
+        else:
+            command += ["-drive", f"file={data_disk},format=raw,if=ide,index=2,cache=writeback,snapshot=off"]
     if not exit_on_shutdown:
         command.append("-no-shutdown")
     if firmware == "uefi":
@@ -197,7 +216,7 @@ def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
     return command
 
 
-def validate_log(text: str, firmware: str, case: str) -> None:
+def validate_log(text: str, firmware: str, case: str, *, usb: bool = False) -> None:
     expected = (*COMMON_MARKERS, f"FIRMWARE: {firmware.upper()}", CASES[case][1])
     if case == "memory":
         expected += MEMORY_MARKERS
@@ -223,7 +242,7 @@ def validate_log(text: str, firmware: str, case: str) -> None:
     if case == "console":
         validate_console(text)
     if case == "shell":
-        validate_shell(text)
+        validate_shell(text, usb=usb)
     if case.startswith("fs-"):
         validate_storage(text)
         for marker in ("STORAGE CLEANUP PASS:", "FILESYSTEM ACCEPTANCE PASS"):
@@ -268,9 +287,23 @@ def validate_storage(text: str) -> None:
         raise RuntimeError("Storage or console service failed")
 
 
-def validate_shell(text: str) -> None:
+def validate_usb(text: str) -> None:
+    for marker in USB_MARKERS:
+        if marker not in text:
+            raise RuntimeError(f"Missing USB proof: {marker}")
+    services = text.split("Starting ring-3 console", 1)[-1]
+    if any(marker in services for marker in (
+            "PS2 ready:", "BLOCK ready: secondary ATA", "USB DISK ERROR",
+            "USB DMA ERROR", "USB INITIALIZATION FAILURE", "USB RUNTIME FAILURE", "XHCI HOST ERROR")):
+        raise RuntimeError("USB service failed or fell back to legacy hardware")
+
+
+def validate_shell(text: str, *, usb: bool = False) -> None:
     validate_ipc(text)
-    for marker in (*CONSOLE_MARKERS, *STORAGE_MARKERS, SHELL_READY, *SHELL_PROOFS):
+    hardware = USB_MARKERS if usb else (*CONSOLE_MARKERS, *STORAGE_MARKERS)
+    if usb:
+        validate_usb(text)
+    for marker in (*hardware, SHELL_READY, *SHELL_PROOFS):
         if marker not in text:
             raise RuntimeError(f"Missing shell proof: {marker}")
     services = text.split("Starting ring-3 console", 1)[-1]
@@ -448,7 +481,8 @@ class ShellKeys:
     def key(self, code: str, *, shift: bool = False, ctrl: bool = False, wait: bool = True) -> None:
         codes = (["shift"] if shift else []) + (["ctrl"] if ctrl else []) + [code]
         self.qmp.execute("send-key", {"keys": [{"type": "qcode", "data": c} for c in codes], "hold-time": 5})
-        time.sleep(0.015)
+        if wait:
+            time.sleep(0.015)
         self.keys += 1
         if wait:
             wait_serial(self.process, self.log, f"SHELL KEY: {self.keys}\n", self.timeout, start=self.start)
@@ -468,7 +502,7 @@ class ShellKeys:
             elif char.isascii() and char.isalnum():
                 self.key(char)
             else:
-                raise ValueError(f"Missing PS/2 test mapping for {char!r}")
+                raise ValueError(f"Missing keyboard test mapping for {char!r}")
 
     def enter(self, statuses: list[int]) -> None:
         before = re.findall(r"SHELL STATUS: (-?\d+)", self.log.read_text(encoding="utf-8"))
@@ -485,19 +519,20 @@ class ShellKeys:
         self.enter(statuses)
 
 
-def shell_case(disk: Path, firmware: str, timeout: int) -> None:
-    data = format_disk(f"data-shell-test-{firmware}.img", force=True)
+def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) -> None:
+    flavor = "usb-shell" if usb else "shell"
+    data = format_disk(f"data-{flavor}-test-{firmware}.img", force=True)
     hashes = []
     for stage in ("session", "reboot"):
-        log = BUILD / f"{firmware}-shell-{stage}.serial.log"
+        log = BUILD / f"{firmware}-{flavor}-{stage}.serial.log"
         log.unlink(missing_ok=True)
-        command = qemu_command(disk, firmware, exit_on_shutdown=True, data_disk=data) + [
+        command = qemu_command(disk, firmware, exit_on_shutdown=True, data_disk=data, usb=usb) + [
             "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-qmp", "stdio",
         ]
-        with (BUILD / f"{firmware}-shell-{stage}.qemu.log").open("wb") as errors:
+        with (BUILD / f"{firmware}-{flavor}-{stage}.qemu.log").open("wb") as errors:
             process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
-            qmp = Qmp(process, BUILD / f"{firmware}-shell-{stage}.qmp.log", timeout)
+            qmp = Qmp(process, BUILD / f"{firmware}-{flavor}-{stage}.qmp.log", timeout)
             try:
                 qmp.negotiate()
                 wait_serial(process, log, SHELL_READY, timeout)
@@ -533,13 +568,73 @@ def shell_case(disk: Path, firmware: str, timeout: int) -> None:
                     text = log.read_text(encoding="utf-8")
                     if text.count("SHELL OUT: hi\na; > b\n") != 2 or "SHELL OUT: with spaces\n" not in text:
                         raise RuntimeError("Shell file contents did not survive full QEMU exit/relaunch")
-                picture = BUILD / f"{firmware}-shell-{stage}.ppm"
+                if usb:
+                    if stage == "session":
+                        keys.type("echo abxc")
+                        keys.key("home")
+                        keys.key("end")
+                        keys.key("left")
+                        keys.key("left")
+                        keys.key("delete")
+                        keys.key("a", ctrl=True)
+                        keys.key("e", ctrl=True)
+                        keys.enter([0])
+                        keys.type("echo ")
+                        qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "caps_lock"}], "hold-time": 5})
+                        time.sleep(0.05)
+                        keys.type("caps")
+                        qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "caps_lock"}], "hold-time": 5})
+                        time.sleep(0.05)
+                        keys.enter([0])
+                        if "SHELL OUT: abc\n" not in log.read_text(encoding="utf-8") or "SHELL OUT: CAPS\n" not in log.read_text(encoding="utf-8"):
+                            raise RuntimeError("USB navigation/modifier decoding failed")
+                        keys.type("cp /a/f /a/inputcopy")
+                        before = len(re.findall(r"SHELL STATUS:", log.read_text(encoding="utf-8")))
+                        keys.key("ret", wait=False)
+                        keys.lines += 1
+                        keys.key("e", wait=False)
+                        text = wait_serial(process, log, f"SHELL LINE DONE: {keys.lines}\n", timeout)
+                        actual = re.findall(r"SHELL STATUS: (-?\d+)", text)[before:]
+                        if actual != ["0"]:
+                            raise RuntimeError(f"USB concurrent copy failed: {actual}")
+                        wait_serial(process, log, f"SHELL KEY: {keys.keys}\n", timeout)
+                        keys.type("cho queued > /a/inputproof")
+                        keys.enter([0])
+                        keys.line("cat /a/inputproof; cat /a/inputcopy", [0, 0])
+                        text = log.read_text(encoding="utf-8")
+                        if "SHELL OUT: queued\n" not in text:
+                            raise RuntimeError("USB queued input was lost during storage activity")
+                        wait_serial(process, log, "USB INPUT BACKPRESSURE PASS:", timeout)
+                    else:
+                        keys.line("cat /a/inputproof; cat /a/inputcopy", [0, 0])
+                        if "SHELL OUT: queued\n" not in log.read_text(encoding="utf-8"):
+                            raise RuntimeError("USB concurrent-input file did not survive restart")
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "rel", "data": {"axis": "x", "value": 80}},
+                        {"type": "rel", "data": {"axis": "y", "value": -30}},
+                        {"type": "btn", "data": {"button": "left", "down": True}},
+                    ]})
+                    wait_serial(process, log, "MOUSE: x=592 y=354 buttons=1", timeout)
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "btn", "data": {"button": "left", "down": False}},
+                    ]})
+                    wait_serial(process, log, "MOUSE: x=592 y=354 buttons=0", timeout)
+                    text = log.read_text(encoding="utf-8")
+                    proofs = ("USB COMMAND RING WRAP PASS:", "USB DMA CAPABILITY PASS:",
+                              "USB BULK RING WRAP PASS:", "USB EVENT RING WRAP PASS",
+                              "USB HID MOUSE PASS:")
+                    if stage == "session":
+                        proofs += ("USB HID RING WRAP PASS: Keyboard",)
+                    for proof in proofs:
+                        if proof not in text:
+                            raise RuntimeError(f"Missing USB acceptance proof: {proof}")
+                picture = BUILD / f"{firmware}-{flavor}-{stage}.ppm"
                 qmp.execute("screendump", {"filename": str(picture)})
                 keys.type("~finish")
                 keys.key("ret", wait=False)
                 if process.wait(timeout=timeout) != 33:
                     raise RuntimeError(f"Shell acceptance exit failed; inspect {log}")
-                validate_log(log.read_text(encoding="utf-8"), firmware, "shell")
+                validate_log(log.read_text(encoding="utf-8"), firmware, "shell", usb=usb)
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -548,9 +643,9 @@ def shell_case(disk: Path, firmware: str, timeout: int) -> None:
                 process.stdin.close()
                 process.stdout.close()
         hashes.append(hashlib.sha256(data.read_bytes()).hexdigest())
-        print(f"PASS {firmware}/shell-{stage}: real keys, commands, process lifecycle and clean exit", flush=True)
-    shell_power_case(disk, firmware, data, timeout)
-    (BUILD / f"{firmware}-shell.data.json").write_text(json.dumps({
+        print(f"PASS {firmware}/{flavor}-{stage}: real keys, commands, process lifecycle and clean exit", flush=True)
+    shell_power_case(disk, firmware, data, timeout, usb=usb)
+    (BUILD / f"{firmware}-{flavor}.data.json").write_text(json.dumps({
         "data_image": data.name, "session_sha256": hashes[0], "reboot_sha256": hashes[1],
         "full_qemu_exit_between_sessions": True,
         "exact_reboot_contents_verified": ["/a/f", "/a/renamed", "/a/two words"],
@@ -558,15 +653,16 @@ def shell_case(disk: Path, firmware: str, timeout: int) -> None:
     }, indent=2) + "\n", encoding="utf-8")
 
 
-def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int) -> None:
-    log = BUILD / f"{firmware}-shell-power.serial.log"
+def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int, *, usb: bool = False) -> None:
+    flavor = "usb-shell" if usb else "shell"
+    log = BUILD / f"{firmware}-{flavor}-power.serial.log"
     log.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware, data_disk=data) + [
+    command = qemu_command(disk, firmware, data_disk=data, usb=usb) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio",
     ]
-    with (BUILD / f"{firmware}-shell-power.qemu.log").open("wb") as errors:
+    with (BUILD / f"{firmware}-{flavor}-power.qemu.log").open("wb") as errors:
         process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
-        qmp = Qmp(process, BUILD / f"{firmware}-shell-power.qmp.log", timeout)
+        qmp = Qmp(process, BUILD / f"{firmware}-{flavor}-power.qmp.log", timeout)
         try:
             qmp.negotiate()
             wait_serial(process, log, SHELL_READY, timeout)
@@ -597,7 +693,59 @@ def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int) -> Non
             qmp.close()
             process.stdin.close()
             process.stdout.close()
-    print(f"PASS {firmware}/shell-power: real reboot and ring-0 halted CPU, storage synchronized", flush=True)
+    print(f"PASS {firmware}/{flavor}-power: real reboot and ring-0 halted CPU, storage synchronized", flush=True)
+
+
+def usb_failure_case(disk: Path, firmware: str, timeout: int, case: str) -> None:
+    data = format_disk(f"data-usb-{case}-{firmware}.img", force=True)
+    log = BUILD / f"{firmware}-usb-{case}.serial.log"
+    log.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, data_disk=data, usb=case != "no-controller")
+    if case == "missing-disk":
+        index = next(i for i, part in enumerate(command) if part.startswith("usb-storage,"))
+        del command[index - 1:index + 1]
+    elif case == "unsupported-hid":
+        index = next(i for i, part in enumerate(command) if part.startswith("usb-mouse,"))
+        command[index] = "usb-tablet,id=zos-usb-mouse,bus=xhci.0,port=2"
+    elif case not in ("no-controller", "unplug-disk"):
+        raise ValueError(f"Unknown USB failure case: {case}")
+    command += ["-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio"]
+    before = hashlib.sha256(data.read_bytes()).hexdigest()
+    with (BUILD / f"{firmware}-usb-{case}.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-usb-{case}.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            if case == "unplug-disk":
+                wait_serial(process, log, SHELL_READY, timeout)
+                before = hashlib.sha256(data.read_bytes()).hexdigest()
+                qmp.execute("device_del", {"id": "zos-usb-disk"})
+                expected = "USB RUNTIME FAILURE: Io"
+            else:
+                expected = "USB INITIALIZATION FAILURE: " + ("Io" if case == "no-controller" else "Unsupported")
+            deadline = time.monotonic() + timeout
+            while True:
+                text = log.read_text(encoding="utf-8") if log.exists() else ""
+                if expected in text and "USER EXIT: tid=2 status=" in text:
+                    break
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError(f"Missing expected USB failure {expected!r}; inspect {log}")
+                time.sleep(0.01)
+            if case != "unplug-disk" and SHELL_READY in text:
+                raise RuntimeError("Unsupported USB configuration incorrectly reached the shell")
+            if "USER FAULT: tid=2" in text:
+                raise RuntimeError("USB error handling faulted instead of exiting explicitly")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    after = hashlib.sha256(data.read_bytes()).hexdigest()
+    if before != after:
+        raise RuntimeError(f"USB failure case changed its data volume: {case}")
+    print(f"PASS {firmware}/usb-{case}: explicit failure, no fallback or disk writes", flush=True)
 
 
 def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
@@ -653,14 +801,15 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     print(f"PASS {firmware}/{case}: serial, framebuffer initialized, timer, expected exit", flush=True)
 
 
-def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | None = None) -> None:
-    log = BUILD / f"{firmware}-screen.serial.log"
-    stderr = BUILD / f"{firmware}-screen.qemu.log"
-    picture = BUILD / f"{firmware}-screen.ppm"
+def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | None = None, usb: bool = False) -> None:
+    flavor = "usb-screen" if usb else "screen"
+    log = BUILD / f"{firmware}-{flavor}.serial.log"
+    stderr = BUILD / f"{firmware}-{flavor}.qemu.log"
+    picture = BUILD / f"{firmware}-{flavor}.ppm"
     log.unlink(missing_ok=True)
     stderr.unlink(missing_ok=True)
     picture.unlink(missing_ok=True)
-    command = qemu_command(disk, firmware, data_disk=data_disk or ensure_disk()) + [
+    command = qemu_command(disk, firmware, data_disk=data_disk or ensure_disk("data-usb.img" if usb else "data.img"), usb=usb) + [
         "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
         "-qmp", "stdio",
     ]
@@ -668,7 +817,7 @@ def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | Non
         process = subprocess.Popen(
             command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
         )
-        qmp = Qmp(process, BUILD / f"{firmware}-screen.qmp.log", timeout)
+        qmp = Qmp(process, BUILD / f"{firmware}-{flavor}.qmp.log", timeout)
         try:
             deadline = time.monotonic() + timeout
             while True:
@@ -684,10 +833,13 @@ def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | Non
                 if marker not in text:
                     raise RuntimeError(f"{firmware}: screenshot boot log missing {marker}")
             validate_ipc(text)
-            validate_storage(text)
-            for marker in CONSOLE_MARKERS:
-                if marker not in text:
-                    raise RuntimeError(f"{firmware}: normal console missing {marker}")
+            if usb:
+                validate_usb(text)
+            else:
+                validate_storage(text)
+                for marker in CONSOLE_MARKERS:
+                    if marker not in text:
+                        raise RuntimeError(f"{firmware}: normal console missing {marker}")
             qmp.negotiate()
             qmp.execute("screendump", {"filename": str(picture)}, identity="capture")
             qmp.execute("quit", identity="quit")
@@ -724,6 +876,9 @@ def check() -> None:
         if case:
             args += ["--features", CASES[case][0]]
         cargo(*args, "--", "-D", "warnings")
+    for features in ("usb", "usb,test-shell"):
+        cargo("clippy", "--locked", "--release", "--package", "zos-kernel",
+              "--no-default-features", "--features", features, "--", "-D", "warnings")
 
 
 def source_hashes() -> dict[str, str]:
@@ -733,11 +888,14 @@ def source_hashes() -> dict[str, str]:
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files}
 
 
-def accept(timeout: int) -> None:
-    result = BUILD / "phase-7-acceptance.json"
+def accept(timeout: int, *, usb: bool = False) -> None:
+    phase = 8 if usb else 7
+    result = BUILD / f"phase-{phase}-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
     tested_sources = source_hashes()
+    user_volumes = {name: hashlib.sha256((BUILD / name).read_bytes()).hexdigest()
+                    for name in ("data.img", "data-usb.img") if (BUILD / name).exists()}
     check()
     for case in CASES:
         disk = image(build(case), case)
@@ -747,17 +905,35 @@ def accept(timeout: int) -> None:
     data = format_disk("data-normal-acceptance.img", force=True)
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout, data_disk=data)
+    usb_cases = []
+    if usb:
+        disk = image(build("shell", usb=True), "usb-shell")
+        for firmware in ("bios", "uefi"):
+            shell_case(disk, firmware, timeout, usb=True)
+            usb_cases.extend(f"{firmware}/usb-shell-{stage}" for stage in ("session", "reboot", "power"))
+            for case in ("no-controller", "missing-disk", "unsupported-hid", "unplug-disk"):
+                usb_failure_case(disk, firmware, timeout, case)
+                usb_cases.append(f"{firmware}/usb-{case}")
+        normal_usb = image(build(usb=True), "usb")
+        data_usb = format_disk("data-usb-normal-acceptance.img", force=True)
+        for firmware in ("bios", "uefi"):
+            screenshot(normal_usb, firmware, timeout, data_disk=data_usb, usb=True)
+            usb_cases.append(f"{firmware}/usb-normal")
+    if any(hashlib.sha256((BUILD / name).read_bytes()).hexdigest() != digest
+           for name, digest in user_volumes.items()):
+        raise RuntimeError("Acceptance modified an existing user data volume")
     if source_hashes() != tested_sources:
         raise RuntimeError("Source files changed during acceptance; rerun against the final revision")
     result.write_text(json.dumps({
-        "phase": 7,
+        "phase": phase,
         "automated_checks": "passed",
         "visual_review": "pending: inspect normal, console and shell captures in BIOS and UEFI",
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "source_sha256": tested_sources,
-        "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")],
+        "preserved_user_volume_sha256": user_volumes,
+        "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")] + usb_cases,
     }, indent=2) + "\n", encoding="utf-8")
-    print("AUTOMATED STEP 7 PASS. Inspect normal, console and shell screenshots.", flush=True)
+    print(f"AUTOMATED STEP {phase} PASS. Inspect normal, console and shell screenshots.", flush=True)
 
 
 def main() -> None:
@@ -765,9 +941,11 @@ def main() -> None:
     parser.add_argument("command", choices=["fmt", "build", "image", "run", "debug", "check", "test", "mkfs"])
     parser.add_argument("--firmware", choices=["bios", "uefi"], default="uefi")
     parser.add_argument("--timeout", type=int, default=90)
-    parser.add_argument("--data-image", default="data.img", help="Dedicated volume name inside build")
+    parser.add_argument("--data-image", help="Dedicated volume name inside build (default: data.img or data-usb.img)")
+    parser.add_argument("--usb", action="store_true", help="QEMU xHCI USB keyboard/mouse and data disk")
     parser.add_argument("--force", action="store_true", help="Explicitly overwrite the selected data volume (mkfs only)")
     args = parser.parse_args()
+    args.data_image = args.data_image or ("data-usb.img" if args.usb else "data.img")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.force and args.command != "mkfs":
@@ -779,13 +957,13 @@ def main() -> None:
     elif args.command == "check":
         check()
     elif args.command == "test":
-        accept(args.timeout)
+        accept(args.timeout, usb=args.usb)
     else:
-        kernel = build()
+        kernel = build(usb=args.usb)
         if args.command != "build":
-            disk = image(kernel)
+            disk = image(kernel, "usb" if args.usb else None)
             if args.command in ("run", "debug"):
-                command = qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image)) + ["-serial", "stdio"]
+                command = qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image), usb=args.usb) + ["-serial", "stdio"]
                 if args.command == "debug":
                     command += ["-s", "-S", "-d", "int,cpu_reset",
                                 "-D", str(BUILD / "qemu-debug.log")]

@@ -366,11 +366,28 @@ fn self_test() {
 
 #[no_mangle]
 pub extern "C" fn _start(test: usize) -> ! {
+    let usb = test & 8 != 0;
+    let test = test & 1;
     assert_eq!(os::channel_create(), Ok(TTY));
     assert_eq!(os::framebuffer_map().unwrap_err(), os::Error::Denied);
     assert_eq!(os::io_port_grant(0x60, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(TTY, 12), Err(os::Error::Denied));
-    os::debug_write("CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated").unwrap();
+    assert_eq!(os::usb_controller().unwrap_err(), os::Error::Denied);
+    assert_eq!(os::usb_dma_page().unwrap_err(), os::Error::Denied);
+    assert_eq!(os::usb_enable_dma(), Err(os::Error::Denied));
+    assert_eq!(os::send_ready(TTY, &[], &mut []), Err(os::Error::Denied));
+    if usb {
+        let mut reply = [0];
+        assert_eq!(os::send(2, &[0x13], &mut reply), Ok(1));
+        assert_eq!(reply, [7]);
+        os::debug_write("USB STORAGE CAPABILITY PASS: shell cannot issue raw blocks").unwrap();
+    }
+    os::debug_write(if usb {
+        "CAPABILITIES PASS: framebuffer, USB MMIO/DMA and IRQs isolated"
+    } else {
+        "CAPABILITIES PASS: framebuffer, PS/2 ports and IRQs isolated"
+    })
+    .unwrap();
     let mut bytes = [0; 64];
     let (token, length) = os::receive(TTY, &mut bytes).unwrap();
     assert_eq!(token & 0xffff, MANAGER_TID);

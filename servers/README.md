@@ -78,3 +78,19 @@ BIOS/UEFI shell acceptance checks repeated spawn/wait, fault and kill status,
 blocked IPC/channel reuse, leaked-descriptor cleanup, copied executable launch,
 real keyboard commands, exact contents across full QEMU exit/relaunch, guest
 reboot and CPU halt. `~finish` is privileged only in dedicated test images.
+
+With the kernel's `usb` feature, the same input process (TID/channel 2) owns
+QEMU xHCI MMIO and bounded DMA pages, enumerates direct-root HID boot devices
+and a bulk-only/SCSI disk, and polls event rings on IRQ0. Its block RPCs accept
+only block-service TID 4. The existing block service proxies USB sector/flush
+requests instead of using ATA; FS/VFS and all fixed service identities remain
+unchanged. No extra ELF or driver thread is introduced.
+
+Input uses `SendReady` and a bounded event queue to avoid waiting on a busy
+shell while that shell's filesystem call needs the same USB transport.
+The timer may notify both input and manager. USB images grant no PS/2 or ATA
+ports; normal images retain the legacy drivers. QEMU USB acceptance covers
+real keys/mouse, concurrent copying/input, ring wraps, full-restart persistence,
+power controls, explicit unsupported/disconnect errors and complete teardown.
+Physical hardware, hotplug recovery, hubs and UAS remain unvalidated/unsupported;
+the driver is trusted for DMA because there is no IOMMU.

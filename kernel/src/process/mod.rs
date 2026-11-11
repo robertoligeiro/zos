@@ -1,5 +1,6 @@
 pub mod arch;
 mod elf;
+mod hardware;
 mod management;
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
@@ -27,6 +28,14 @@ struct Process {
     storage_control: bool,
     bulk: bool,
     manager: bool,
+    usb: hardware::Grant,
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Disable device DMA before AddressSpace returns any owned frames.
+        self.usb.stop();
+    }
 }
 
 impl Process {
@@ -138,7 +147,7 @@ struct Scheduler {
     current: Option<usize>,
     last: [usize; 32],
     sequence: u64,
-    irq_channels: [Option<usize>; 16],
+    irq_channels: [u16; 16],
     irq_seen: [usize; 16],
     console: bool,
     console_finished: bool,
@@ -353,7 +362,10 @@ impl Scheduler {
     }
 
     fn notify_irq(&mut self, irq: usize) {
-        if let Some(channel) = self.irq_channels[irq] {
+        for channel in 0..self.channels.len() {
+            if self.irq_channels[irq] & (1 << channel) == 0 {
+                continue;
+            }
             self.channels[channel].irq_pending |= 1 << irq;
             let owner = self.channels[channel].owner;
             if let State::Receiving {
@@ -376,9 +388,11 @@ impl Scheduler {
                 channel.closed = true;
                 channel.pending.clear();
                 for (irq, attachment) in self.irq_channels.iter_mut().enumerate() {
-                    if *attachment == Some(index) {
-                        *attachment = None;
-                        crate::interrupts::irq_enable(irq, false);
+                    if *attachment & (1 << index) != 0 {
+                        *attachment &= !(1 << index);
+                        if *attachment == 0 {
+                            crate::interrupts::irq_enable(irq, false);
+                        }
                     }
                 }
             }
@@ -430,11 +444,21 @@ impl Scheduler {
                 }
                 Ok(Some(((generation << 8) | (slot + 1) as u64) as usize))
             }
-            x if x == Call::Send as u64 => {
+            x if x == Call::Send as u64 || x == Call::SendReady as u64 => {
+                let ready = x == Call::SendReady as u64;
+                if ready && !self.threads[id].process.lock().usb.allowed {
+                    return Err(Error::Denied);
+                }
                 let (message, length) = self.request(id, frame.rsi, frame.rdx)?;
                 let capacity = self.check_buffer(id, frame.r10, frame.r8)?;
                 let channel = self.channel(frame.rdi)?;
                 let owner = self.channels[channel].owner;
+                if ready
+                    && !matches!(self.threads[owner].state,
+                    State::Receiving { channel: waiting, .. } if waiting == channel)
+                {
+                    return Err(Error::Busy);
+                }
                 if self.would_deadlock(id, owner) {
                     return Err(Error::Deadlock);
                 }
@@ -563,11 +587,12 @@ impl Scheduler {
                 let irq = frame.rsi as usize;
                 if self.threads[id].process.lock().irqs & (1 << irq) == 0
                     || self.channels[channel].owner != id
-                    || self.irq_channels[irq].is_some()
+                    || self.irq_channels[irq] & (1 << channel) != 0
+                    || (irq != 0 && self.irq_channels[irq] != 0)
                 {
                     return Err(Error::Denied);
                 }
-                self.irq_channels[irq] = Some(channel);
+                self.irq_channels[irq] |= 1 << channel;
                 crate::interrupts::irq_enable(irq, true);
                 Ok(Some(0))
             }
@@ -681,6 +706,9 @@ impl Scheduler {
             }
             x if (Call::ProcessSpawn as u64..=Call::SystemControl as u64).contains(&x) => {
                 self.management(id, frame)
+            }
+            x if (Call::UsbController as u64..=Call::UsbEnableDma as u64).contains(&x) => {
+                self.hardware(id, frame)
             }
             _ => Err(Error::Invalid),
         }
@@ -923,7 +951,7 @@ pub fn start() -> ! {
         current: None,
         last: [usize::MAX; 32],
         sequence: 0,
-        irq_channels: [None; 16],
+        irq_channels: [0; 16],
         irq_seen: [0; 16],
         console: false,
         console_finished: false,
@@ -958,6 +986,7 @@ pub fn start() -> ! {
             storage_control: false,
             bulk: false,
             manager: false,
+            usb: hardware::Grant::new(false),
         }));
         let mut thread = Thread::new(process, entry, role, priority).unwrap();
         thread.name[..name.len()].copy_from_slice(name.as_bytes());
@@ -975,7 +1004,7 @@ pub fn start() -> ! {
 }
 
 fn start_console() -> ! {
-    crate::logln!("Starting ring-3 console, PS/2 input and TTY servers");
+    crate::logln!("Starting ring-3 console, input and TTY servers");
     crate::framebuffer::handoff();
     let mut scheduler = Scheduler {
         threads: Vec::new(),
@@ -983,7 +1012,7 @@ fn start_console() -> ! {
         current: None,
         last: [0; 32],
         sequence: 0,
-        irq_channels: [None; 16],
+        irq_channels: [0; 16],
         irq_seen: [0; 16],
         console: true,
         console_finished: false,
@@ -998,7 +1027,17 @@ fn start_console() -> ! {
     };
     for (name, priority, ports, irqs, framebuffer) in [
         ("console-server", 0, 0, 0, true),
-        ("input-server", 1, 6, (1 << 1) | (1 << 12), false),
+        (
+            "input-server",
+            1,
+            if cfg!(feature = "usb") { 0 } else { 6 },
+            if cfg!(feature = "usb") {
+                1
+            } else {
+                (1 << 1) | (1 << 12)
+            },
+            false,
+        ),
         (
             if shell_enabled() {
                 "shell-server"
@@ -1029,13 +1068,21 @@ fn start_console() -> ! {
             framebuffer_mapped: false,
             test_control: name == "tty-server",
             storage_control: false,
-            bulk: framebuffer || matches!(name, "shell-server" | "tty-server"),
+            bulk: framebuffer
+                || matches!(name, "shell-server" | "tty-server")
+                || (name == "input-server" && cfg!(feature = "usb")),
             manager: false,
+            usb: hardware::Grant::new(name == "input-server" && cfg!(feature = "usb")),
         }));
         let mut thread = Thread::new(
             process,
             entry,
-            (cfg!(feature = "test-console") || cfg!(feature = "test-shell")) as u64,
+            (cfg!(feature = "test-console") || cfg!(feature = "test-shell")) as u64
+                | if cfg!(feature = "usb") && matches!(name, "input-server" | "shell-server") {
+                    8
+                } else {
+                    0
+                },
             priority,
         )
         .unwrap();
@@ -1061,7 +1108,7 @@ fn start_console() -> ! {
                 space,
                 stacks: 0,
                 dynamic_pages: 0,
-                ports,
+                ports: if cfg!(feature = "usb") { 0 } else { ports },
                 irqs: 0,
                 framebuffer: false,
                 framebuffer_mapped: false,
@@ -1069,8 +1116,11 @@ fn start_console() -> ! {
                 storage_control: name == "storage-probe",
                 bulk: true,
                 manager: false,
+                usb: hardware::Grant::new(false),
             }));
-            let role = if cfg!(feature = "test-fs-create") {
+            let role = if name == "blkdev-server" && cfg!(feature = "usb") {
+                8
+            } else if cfg!(feature = "test-fs-create") {
                 1
             } else if cfg!(feature = "test-fs-read") {
                 2
@@ -1103,6 +1153,7 @@ fn start_console() -> ! {
             storage_control: false,
             bulk: true,
             manager: true,
+            usb: hardware::Grant::new(false),
         }));
         let mut thread = Thread::new(process, entry, 0, 7).unwrap();
         thread.name[..14].copy_from_slice(b"procmgr-server");

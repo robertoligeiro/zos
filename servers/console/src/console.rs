@@ -40,7 +40,7 @@ pub extern "C" fn _start(_: usize) -> ! {
     os::debug_write("CONSOLE PASS: cursor, colors, backspace, scrolling").unwrap();
     terminal.colors(0x90ee90, 0x081008);
     terminal.clear();
-    terminal.write(b"ZOS - Zombie OS\nRing-3 console and PS/2 input\n\n");
+    terminal.write(b"ZOS - Zombie OS\nRing-3 console and input\n\n");
     terminal.colors(0xffcc66, 0x081008);
     terminal.write(b"Keyboard and mouse use isolated user-space drivers.\n");
     terminal.colors(0x90ee90, 0x081008);

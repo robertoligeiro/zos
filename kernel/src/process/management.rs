@@ -80,6 +80,7 @@ impl Scheduler {
                     storage_control: false,
                     bulk: true,
                     manager: false,
+                    usb: hardware::Grant::new(false),
                 }));
                 let pid = (generation << 8) | (slot + 1) as u64;
                 let mut thread = Thread::new(process, entry, pid, 9)?;

@@ -134,7 +134,53 @@ impl Disk for Ata {
     }
 }
 
-fn handle(ata: &mut Ata, request: &[u8], reply: &mut [u8]) -> Result<usize> {
+struct UsbDisk;
+impl Disk for UsbDisk {
+    fn read(&mut self, sector: u32, bytes: &mut [u8; SECTOR]) -> Result<()> {
+        let mut request = [0x10; 5];
+        request[1..].copy_from_slice(&sector.to_le_bytes());
+        let mut reply = [0; 513];
+        if zos_storage::protocol::rpc(2, &request, &mut reply)? != SECTOR {
+            return Err(Error::Corrupt);
+        }
+        bytes.copy_from_slice(&reply[1..]);
+        Ok(())
+    }
+    fn write(&mut self, sector: u32, bytes: &[u8; SECTOR]) -> Result<()> {
+        let mut request = [0x11; 517];
+        request[1..5].copy_from_slice(&sector.to_le_bytes());
+        request[5..].copy_from_slice(bytes);
+        zos_storage::protocol::rpc(2, &request, &mut [0]).map(|_| ())
+    }
+    fn flush(&mut self) -> Result<()> {
+        zos_storage::protocol::rpc(2, &[0x12], &mut [0]).map(|_| ())
+    }
+}
+enum Backend {
+    Ata(Ata),
+    Usb(UsbDisk),
+}
+impl Disk for Backend {
+    fn read(&mut self, sector: u32, bytes: &mut [u8; SECTOR]) -> Result<()> {
+        match self {
+            Self::Ata(disk) => disk.read(sector, bytes),
+            Self::Usb(disk) => disk.read(sector, bytes),
+        }
+    }
+    fn write(&mut self, sector: u32, bytes: &[u8; SECTOR]) -> Result<()> {
+        match self {
+            Self::Ata(disk) => disk.write(sector, bytes),
+            Self::Usb(disk) => disk.write(sector, bytes),
+        }
+    }
+    fn flush(&mut self) -> Result<()> {
+        match self {
+            Self::Ata(disk) => disk.flush(),
+            Self::Usb(disk) => disk.flush(),
+        }
+    }
+}
+fn handle(ata: &mut Backend, request: &[u8], reply: &mut [u8]) -> Result<usize> {
     let mut reader = Reader::new(request);
     match reader.byte()? {
         0 => {
@@ -159,13 +205,29 @@ fn handle(ata: &mut Ata, request: &[u8], reply: &mut [u8]) -> Result<usize> {
     }
 }
 #[no_mangle]
-pub extern "C" fn _start(_: usize) -> ! {
+pub extern "C" fn _start(role: usize) -> ! {
     assert_eq!(os::channel_create(), Ok(BLKDEV));
-    os::io_port_grant(DATA, 8).unwrap();
-    os::io_port_grant(CONTROL, 1).unwrap();
     assert_eq!(os::io_port_grant(0x1f0, 8), Err(os::Error::Denied));
-    let mut ata = Ata::identify().expect("Secondary ATA data disk unavailable");
-    os::debug_write("BLOCK ready: secondary ATA, LBA28, flush, 32768 sectors").unwrap();
+    assert_eq!(os::usb_controller().unwrap_err(), os::Error::Denied);
+    assert_eq!(os::usb_dma_page().unwrap_err(), os::Error::Denied);
+    let mut ata = if role & 8 != 0 {
+        assert_eq!(os::io_port_grant(DATA, 8), Err(os::Error::Denied));
+        assert_eq!(os::io_port_grant(CONTROL, 1), Err(os::Error::Denied));
+        let mut capacity = [0; 5];
+        assert_eq!(zos_storage::protocol::rpc(2, &[0x13], &mut capacity), Ok(4));
+        assert_eq!(
+            u32::from_le_bytes(capacity[1..].try_into().unwrap()),
+            SECTORS
+        );
+        os::debug_write("BLOCK ready: USB bulk-only SCSI, flush, 32768 sectors").unwrap();
+        Backend::Usb(UsbDisk)
+    } else {
+        os::io_port_grant(DATA, 8).unwrap();
+        os::io_port_grant(CONTROL, 1).unwrap();
+        let disk = Ata::identify().expect("Secondary ATA data disk unavailable");
+        os::debug_write("BLOCK ready: secondary ATA, LBA28, flush, 32768 sectors").unwrap();
+        Backend::Ata(disk)
+    };
     let mut request = [0; os::MAX_STORAGE_MESSAGE];
     let mut reply = [0; SECTOR + 1];
     loop {

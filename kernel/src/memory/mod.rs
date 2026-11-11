@@ -334,6 +334,48 @@ impl AddressSpace {
         with(|memory| memory.map(self.root, address, permissions))
     }
 
+    pub fn map_dma_page(&mut self, address: u64) -> Result<u64, Error> {
+        Self::user_address(address)?;
+        with(|memory| {
+            memory.map(self.root, address, Permissions::DATA)?;
+            Ok(memory.mapping(self.root, address)?.0)
+        })
+    }
+
+    pub fn map_device(&mut self, physical: u64, length: u64) -> Result<u64, Error> {
+        let base = 0x2800_0000;
+        if physical % PAGE_SIZE != 0 || length == 0 || length > 65536 || length % PAGE_SIZE != 0 {
+            return Err(Error::InvalidAddress);
+        }
+        with(|memory| {
+            for offset in (0..length).step_by(PAGE_SIZE as usize) {
+                let result = (|| {
+                    let leaf = memory.leaf(self.root, base + offset, true)?;
+                    // SAFETY: caller validated the exclusive PCI BAR; device
+                    // pages are borrowed, uncached and never executable.
+                    unsafe {
+                        if !(*leaf).is_unused() {
+                            return Err(Error::AlreadyMapped);
+                        }
+                        (*leaf).set_addr(
+                            PhysAddr::new(physical + offset),
+                            Permissions::DATA.flags(true) | Flags::BIT_9 | Flags::NO_CACHE,
+                        );
+                    }
+                    tlb::flush(VirtAddr::new(base + offset));
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    for mapped in (0..offset).step_by(PAGE_SIZE as usize) {
+                        memory.unmap(self.root, base + mapped).unwrap();
+                    }
+                    return Err(error);
+                }
+            }
+            Ok(base)
+        })
+    }
+
     /// Map only the boot framebuffer; BIT_9 distinguishes borrowed device memory
     /// from allocator-owned frames during unmap and address-space destruction.
     pub fn map_framebuffer(&mut self) -> Result<zos_libos::Framebuffer, Error> {

@@ -35,13 +35,17 @@ A single-core x86-64 microkernel project following the supplied
 - Step 7: a ring-3 process manager and **interactive command shell**, executable
   loading from VFS paths, reusable generation-checked PIDs/channels, exit/fault
   status, automatic spawned-process descriptor cleanup, and memory reporting.
-- Step 8: deferred; there is no USB hardware support yet.
+- Step 8: **QEMU xHCI USB keyboard/mouse and persistent USB storage**.
+  PCI discovery and hardware-capability mappings remain in the kernel; controller,
+  HID and bulk-only SCSI drivers run in ring 3. Physical-PC validation is deferred.
 
 The `phase-2` tag preserves the verified boot checkpoint. The `phase-3` memory
 checkpoint preserves **Step 3 / Phase 2** in the supplied plan. The
 `phase-4` tag corresponds to **Step 4 / Phase 3**; `phase-5` corresponds to
 **Step 5 / Phase 4**; `phase-6` corresponds to **Step 6 / Phase 5**;
-`phase-7` corresponds to **Step 7 / Phase 6**. Repository tags follow step numbers.
+`phase-7` corresponds to **Step 7 / Phase 6**; `phase-8` records the QEMU USB
+preparation for **Step 8 / Phase 7**, not physical-hardware acceptance.
+Repository tags follow step numbers.
 
 The frame bitmap and copied page tables are reserved from usable RAM. Bootloader
 reclaimable memory stays reserved: boot responses and the initial kernel stack
@@ -120,6 +124,45 @@ extra characters report `TTY LIMIT` on serial without corrupting the editor.
 Long lines scroll horizontally to keep the cursor visible. Normal Enter executes
 commands; the dedicated console regression still echoes `You typed: ...`.
 Click inside QEMU to focus keyboard/mouse input; Ctrl+Alt releases mouse capture.
+
+## QEMU USB checkpoint
+
+```powershell
+python tools\zos.py run --usb --firmware uefi
+python tools\zos.py run --usb --firmware bios
+```
+
+These commands attach QEMU's xHCI controller, a boot-protocol USB keyboard and
+mouse, and a separate 16 MiB USB mass-storage volume at `/`. The default USB data
+file is **`build\data-usb.img`**, created only if absent; the ordinary PS/2/ATA
+configuration and `build\data.img` remain unchanged. Use `--data-image
+data-usb-scratch.img` for another dedicated volume. Close its VM before reopening
+the same volume. The boot image is still Limine-loaded from snapshot-protected
+IDE; this does not test firmware booting ZOS from a physical USB stick.
+
+Serial must report `PCI XHCI PASS`, three `USB ENUM PASS` devices, `USB SCSI PASS`,
+`USB CAPABILITIES PASS`, `BLOCK ready: USB bulk-only SCSI` and `SHELL ready`.
+The input process exclusively owns the controller and proxies block requests
+from the authenticated block service. Its send-on-ready IPC queues HID events
+when the shell is executing, avoiding a circular dependency with USB-backed
+filesystem operations. IRQ0 can notify both input and process manager.
+
+The kernel grants only the selected QEMU `1b36:000d` controller, a checked
+4-64 KiB uncached/NX PCI BAR, and at most 64 owned DMA pages. Bus mastering starts
+after controller reset; it is disabled before DMA frames are released. Other
+processes cannot map controller registers, obtain physical DMA addresses, access
+ATA/PS2 ports in USB mode, or issue raw USB block RPCs. **There is no IOMMU**:
+the USB driver is trusted, and these grants do not isolate malicious DMA.
+
+This checkpoint supports exactly three direct-root devices: one HID boot
+keyboard, one three-byte boot mouse, and one 512-byte-sector, 16 MiB bulk-only
+SCSI disk with LUN 0. It polls xHCI events using the 100 Hz timer, supports
+32/64-byte contexts and ring cycle/link handling, and uses bounded waits/queues.
+Hubs, composite devices, scratchpad-requiring controllers, UAS, keyboard repeat,
+hotplug/recovery and arbitrary physical controllers are not supported.
+Missing/unsupported devices fail explicitly without a PS/2/ATA fallback.
+Disconnecting an enumerated device takes the driver offline; transport failures
+poison the disk until restart. No physical disk or USB stick has been written.
 
 ## Interactive shell and processes
 
@@ -252,17 +295,18 @@ stage-2 partition and a FAT32 EFI System Partition, then invokes the pinned
 below are the primary interface; the Makefile is optional if Windows Make is
 already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
 
-## Step 6 acceptance gate
+## Acceptance gates
 
-`python tools\zos.py test` must exit successfully. It performs:
+`python tools\zos.py test` runs the legacy Step 7 regressions.
+**`python tools\zos.py test --usb`** additionally runs Step 8 USB acceptance.
+Both must exit successfully. The shared checks perform:
 
-1. Host unit tests, Rustfmt check, and Clippy with warnings denied for normal,
-   boot, divide, page-fault, memory, read-only-write, unmap, and NX-execute test
-   configurations plus IPC, console, fs-create and fs-read (twelve kernel
-   configurations), and all three user packages (thirteen configurations total).
-   Twelve Rust host tests cover console/storage behavior alongside 22 Python
-   harness/image/formatter tests.
-2. BIOS and UEFI boots for each of eleven isolated test images. Each must
+1. Python and Rust host unit tests, Rustfmt check, and Clippy with warnings
+   denied for normal and all twelve test kernels, USB and USB-shell kernels,
+   and all four user packages (sixteen configurations total). USB tests cover
+   malformed descriptors, endpoint companions, HID rollover/modifiers,
+   stale/malformed bulk status and strict no-fallback harness validation.
+2. BIOS and UEFI boots for each of twelve isolated test images. Each must
    report the correct firmware, framebuffer initialization, GDT/TSS/IDT, and
    at least 100 timer interrupts; then exit through QEMU's test device with
    host status 33. A panic, unexpected exit, missing marker, or timeout fails.
@@ -311,6 +355,17 @@ already available. `tools/mkimage.sh` is a convenience wrapper for Git Bash.
    not enable the test exit device. The harness stops each VM through QMP over
    standard input/output, without opening a network listener.
 
+USB acceptance additionally repeats the full keyboard-driven shell session in
+both firmwares, checks exact mouse movement/button coordinates and saved screen
+captures, copies files while another key is queued, then verifies exact contents
+after a complete VM restart. It exercises real reboot/halt, DMA-pointer rejection,
+quota exhaustion, NX MMIO, non-owner capability denial, authenticated raw-block
+denial, command/event/bulk/HID ring wraps and complete frame/heap recovery.
+Missing controller/disk, unsupported HID and disk-disconnect cases must fail
+explicitly without unintended driver faults, fallback or further data writes.
+All volumes are dedicated generated image files; neither normal user volume is
+reformatted by acceptance.
+
 Outputs are ignored under `build`:
 
 ```text
@@ -334,6 +389,11 @@ bios-shell-reboot.ppm           uefi-shell-reboot.ppm
 bios-shell-power.serial.log     uefi-shell-power.serial.log
 bios-shell.data.json            uefi-shell.data.json
 phase-7-acceptance.json          (created only after automated success)
+phase-8-acceptance.json          (test --usb, includes all legacy regressions)
+zos-usb.img                     (normal USB configuration)
+data-usb.img                    (persistent USB filesystem)
+<firmware>-usb-shell-*.serial.log (USB shell, restart and power evidence)
+<firmware>-usb-shell-*.ppm       (USB session/restart framebuffer captures)
 zos.img                         (normal image, never a deliberate-fault image)
 data.img                        (persistent normal filesystem)
 data-test-bios.img              data-test-uefi.img (isolated acceptance volumes)
@@ -342,6 +402,8 @@ data-test-bios.img              data-test-uefi.img (isolated acceptance volumes)
 Inspect all eight screenshots: two normal shell prompts, two console-regression
 screens and four shell-session/reboot screens. Confirm readable text,
 prompt/cursor, command/file/process/memory output and the mouse crosshair.
+With `--usb`, also inspect two USB normal prompts and four USB session/restart
+captures (fourteen screenshots total).
 Earlier IPC/isolation diagnostics remain in the serial log.
 The JSON explicitly records visual review as pending. Alternatively,
 verify the screen interactively, closing each QEMU window before the next:

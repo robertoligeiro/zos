@@ -85,13 +85,16 @@ fn initialize() {
 }
 
 #[no_mangle]
-pub extern "C" fn _start(_: usize) -> ! {
+pub extern "C" fn _start(role: usize) -> ! {
     assert_eq!(os::channel_create(), Ok(INPUT));
     assert_eq!(os::framebuffer_map().unwrap_err(), os::Error::Denied);
     assert_eq!(os::io_port_grant(0x80, 1), Err(os::Error::Denied));
     assert_eq!(os::io_port_grant(0x60, 2), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(CONSOLE, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(INPUT, 2), Err(os::Error::Denied));
+    if role & 8 != 0 {
+        usb_input(role & 1 != 0);
+    }
     os::io_port_grant(0x60, 1).unwrap();
     os::io_port_grant(0x64, 1).unwrap();
     os::irq_attach(INPUT, 1).unwrap();
@@ -110,6 +113,7 @@ pub extern "C" fn _start(_: usize) -> ! {
             os::reply(token, &[]).unwrap();
             continue;
         }
+
         assert_eq!(length, 8);
         assert!(matches!(
             u64::from_le_bytes(bytes[..8].try_into().unwrap()),
@@ -147,7 +151,120 @@ pub extern "C" fn _start(_: usize) -> ! {
     }
 }
 
+fn usb_input(test: bool) -> ! {
+    use zos_console::usb::{Controller, Error, Event};
+    assert_eq!(os::io_port_grant(0x60, 1), Err(os::Error::Denied));
+    assert_eq!(os::io_port_grant(0x64, 1), Err(os::Error::Denied));
+    assert_eq!(os::io_port_grant(0x170, 8), Err(os::Error::Denied));
+    assert_eq!(os::irq_attach(INPUT, 1), Err(os::Error::Denied));
+    assert_eq!(os::irq_attach(INPUT, 12), Err(os::Error::Denied));
+    let mut controller = Controller::new().unwrap_or_else(|error| {
+        log(format_args!("USB INITIALIZATION FAILURE: {error:?}"));
+        panic!("USB initialization failed");
+    });
+    assert_eq!(os::usb_controller().unwrap_err(), os::Error::Denied);
+    if test {
+        let (bad_address, _) = unsafe {
+            // SAFETY: intentionally invalid output must be rejected before allocation.
+            os::raw(os::Call::UsbDmaPage as u64, [u64::MAX, 16, 0, 0, 0])
+        };
+        assert_eq!(bad_address, -(os::Error::BadAddress as i64));
+        for _ in 0..64 {
+            match os::usb_dma_page() {
+                Ok(_) => (),
+                Err(error) => {
+                    assert_eq!(error, os::Error::Limit);
+                    break;
+                }
+            }
+        }
+        assert_eq!(os::usb_dma_page().unwrap_err(), os::Error::Limit);
+        assert_eq!(os::usb_enable_dma(), Err(os::Error::Denied));
+        assert_eq!(
+            os::map_memory(0x2800_0000, true, false),
+            Err(os::Error::Invalid)
+        );
+        let (nx, _) = unsafe {
+            // SAFETY: an NX device address is a deliberately invalid thread entry.
+            os::raw(os::Call::ThreadCreate as u64, [0x2800_0000, 0, 1, 0, 0])
+        };
+        assert_eq!(nx, -(os::Error::BadAddress as i64));
+        controller.test_rings().unwrap();
+        os::debug_write("USB DMA CAPABILITY PASS: bad pointer, quota, NX MMIO").unwrap();
+    }
+    os::irq_attach(INPUT, 0).unwrap();
+    os::debug_write("USB CAPABILITIES PASS: controller/DMA only; no PS2/ATA ports").unwrap();
+    let mut ready = false;
+    let mut backpressure = false;
+    let mut request = [0; os::MAX_STORAGE_MESSAGE];
+    let mut reply = [0; 513];
+    loop {
+        let (token, length) = os::receive(INPUT, &mut request).unwrap();
+        if token == 0 {
+            assert_eq!(length, 8);
+            assert_eq!(u64::from_le_bytes(request[..8].try_into().unwrap()), 0);
+        } else if token & 0xffff == TTY && &request[..length] == b"ready" && !ready {
+            ready = true;
+            os::reply(token, &[]).unwrap();
+        } else {
+            let result = if token & 0xffff == 4 {
+                controller.disk_request(&request[..length], (&mut reply[1..]).try_into().unwrap())
+            } else {
+                reply[0] = 7;
+                os::reply_live(token, &reply[..1]).unwrap();
+                continue;
+            };
+            let count = match result {
+                Ok(count) => {
+                    reply[0] = 0;
+                    count + 1
+                }
+                Err(error) => {
+                    reply[0] = if error == Error::Invalid { 1 } else { 10 };
+                    1
+                }
+            };
+            os::reply_live(token, &reply[..count]).unwrap();
+        }
+        controller.poll().unwrap_or_else(|error| {
+            log(format_args!("USB RUNTIME FAILURE: {error:?}"));
+            panic!("USB controller failed");
+        });
+        while let Some(event) = controller.event() {
+            if !ready {
+                controller.consume_event();
+                continue;
+            }
+            let sent = match event {
+                Event::Key(key) => os::send_ready(TTY, &key.encode(), &mut []),
+                Event::Pointer { dx, dy, buttons } => {
+                    let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
+                    os::send_ready(
+                        CONSOLE,
+                        &[POINTER, x[0], x[1], y[0], y[1], buttons],
+                        &mut [],
+                    )
+                }
+            };
+            match sent {
+                Ok(_) => controller.consume_event(),
+                Err(os::Error::Busy) => {
+                    if test && !backpressure && matches!(event, Event::Key(_)) {
+                        os::debug_write("USB INPUT BACKPRESSURE PASS: queued HID, live storage")
+                            .unwrap();
+                        backpressure = true;
+                    }
+                    break;
+                }
+                Err(error) => panic!("USB input forwarding failed: {error:?}"),
+            }
+        }
+    }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    let line = info.location().map_or(0, |location| location.line());
+    log(format_args!("INPUT SERVICE FAILURE: line={line}"));
     fail(info)
 }

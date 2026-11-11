@@ -39,3 +39,16 @@ use generation-checked, calling-thread-owned descriptors. See the root README
 for filesystem format, persistence, path semantics and bounded resources.
 
 See the root README for ABI registers, resource policy and checkpoint limits.
+
+USB calls 20-23 are restricted to the initial USB input process:
+`UsbController` returns its checked writable/NX MMIO mapping; `UsbDmaPage` returns
+one zeroed owned virtual/physical DMA page (maximum 64); `UsbTicks` supplies
+bounded driver deadlines; `UsbEnableDma` enables bus mastering once, after reset
+and allocation. Shutdown disables controller bus mastering before frame release.
+No IOMMU is present; the hardware-capability owner remains a trusted DMA driver.
+
+Call 24, `SendReady`, is also USB-driver-only. It returns `Busy` if the channel
+owner is not currently receiving on that channel. Once accepted, ordinary
+authenticated request/reply semantics apply. Input retains queued HID events
+and retries on later ticks instead of blocking while the shell needs USB storage.
+IRQ0 permits multiple authorized channel owners; other IRQs remain exclusive.

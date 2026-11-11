@@ -4,6 +4,7 @@ pub mod editor;
 pub mod keyboard;
 pub mod mouse;
 pub mod terminal;
+pub mod usb;
 
 pub const CONSOLE: usize = 1;
 pub const INPUT: usize = 2;

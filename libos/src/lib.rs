@@ -25,6 +25,11 @@ pub enum Call {
     MemoryStats = 17,
     BootProgram = 18,
     SystemControl = 19,
+    UsbController = 20,
+    UsbDmaPage = 21,
+    UsbTicks = 22,
+    UsbEnableDma = 23,
+    SendReady = 24,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +43,7 @@ pub enum Error {
     Deadlock = 6,
     TooLarge = 7,
     Limit = 8,
+    Busy = 9,
 }
 
 impl Error {
@@ -50,6 +56,7 @@ impl Error {
             6 => Self::Deadlock,
             7 => Self::TooLarge,
             8 => Self::Limit,
+            9 => Self::Busy,
             _ => Self::Invalid,
         }
     }
@@ -102,6 +109,22 @@ pub fn channel_create() -> Result<usize, Error> {
 pub fn send(channel: usize, message: &[u8], reply: &mut [u8]) -> Result<usize, Error> {
     call(
         Call::Send,
+        [
+            channel as u64,
+            message.as_ptr() as u64,
+            message.len() as u64,
+            reply.as_mut_ptr() as u64,
+            reply.len() as u64,
+        ],
+    )
+    .map(|result| result.0)
+}
+
+/// USB-driver-only send: return Busy unless the recipient is already receiving
+/// on this channel. Once accepted, wait for its ordinary authenticated reply.
+pub fn send_ready(channel: usize, message: &[u8], reply: &mut [u8]) -> Result<usize, Error> {
+    call(
+        Call::SendReady,
         [
             channel as u64,
             message.as_ptr() as u64,
@@ -186,6 +209,49 @@ pub fn debug_write(text: &str) -> Result<(), Error> {
         [text.as_ptr() as u64, text.len() as u64, 0, 0, 0],
     )
     .map(|_| ())
+}
+
+#[derive(Debug)]
+pub struct UsbController {
+    pub address: u64,
+    pub length: usize,
+}
+
+#[derive(Debug)]
+pub struct DmaPage {
+    pub address: u64,
+    pub physical: u64,
+}
+
+/// Available only to the boot input service in USB images.
+pub fn usb_controller() -> Result<UsbController, Error> {
+    let mut bytes = [0; 16];
+    call(
+        Call::UsbController,
+        [bytes.as_mut_ptr() as u64, 16, 0, 0, 0],
+    )?;
+    Ok(UsbController {
+        address: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        length: u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize,
+    })
+}
+
+/// One zeroed, physically contiguous 4 KiB page; capped at 64 pages per driver.
+pub fn usb_dma_page() -> Result<DmaPage, Error> {
+    let mut bytes = [0; 16];
+    call(Call::UsbDmaPage, [bytes.as_mut_ptr() as u64, 16, 0, 0, 0])?;
+    Ok(DmaPage {
+        address: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        physical: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+    })
+}
+
+pub fn usb_ticks() -> Result<u64, Error> {
+    call(Call::UsbTicks, [0; 5]).map(|value| value.0 as u64)
+}
+
+pub fn usb_enable_dma() -> Result<(), Error> {
+    call(Call::UsbEnableDma, [0; 5]).map(|_| ())
 }
 
 #[derive(Clone, Copy, Debug)]
