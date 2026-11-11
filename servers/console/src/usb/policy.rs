@@ -1,5 +1,12 @@
 use super::{Error, Result};
 
+pub fn dma_page(physical: u64) -> Result<()> {
+    if physical > u32::MAX as u64 - 4095 {
+        return Err(Error::DmaAddress(physical));
+    }
+    Ok(())
+}
+
 pub fn scratchpads(structural: u32) -> Result<usize> {
     let count = (((structural >> 21) & 31) << 5 | (structural >> 27) & 31) as usize;
     if count > 32 {
@@ -66,6 +73,14 @@ pub fn capacity(bytes: [u8; 8], read_only: bool) -> Result<(u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dma_pages_must_fit_entirely_in_the_32_bit_range() {
+        assert_eq!(dma_page(0xffff_f000), Ok(()));
+        for address in [0xffff_f001, 0x1_0000_0000, u64::MAX] {
+            assert_eq!(dma_page(address), Err(Error::DmaAddress(address)));
+        }
+    }
 
     #[test]
     fn scratchpad_high_low_fields_and_quota() {

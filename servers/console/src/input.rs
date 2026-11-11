@@ -156,12 +156,17 @@ pub extern "C" fn _start(role: usize) -> ! {
 
 fn diagnostic_input() -> ! {
     use zos_console::keyboard::Key;
-    use zos_console::usb::{Controller, Event};
+    use zos_console::usb::{Controller, Error, Event};
     diagnostic(format_args!("ZOS USB DIAGNOSTIC: storage writes disabled"));
     let result = Controller::diagnostic();
     let mut controller = match result {
         Ok(controller) => controller,
         Err(error) => {
+            if let Error::DmaAddress(physical) = error {
+                diagnostic(format_args!(
+                    "XHCI REJECT: DMA page {physical:#x} exceeds 32-bit range"
+                ));
+            }
             diagnostic(format_args!(
                 "DIAGNOSTIC FAILED: {error:?}; photograph this screen"
             ));

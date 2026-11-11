@@ -10,6 +10,7 @@ pub use xhci::Controller;
 pub enum Error {
     Invalid,
     Unsupported,
+    DmaAddress(u64),
     ReadOnly,
     Timeout,
     Completion(u8),

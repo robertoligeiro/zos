@@ -452,9 +452,13 @@ def diagnostic_case(disk: Path, firmware: str, timeout: int, case: str = "normal
             expected = "DIAGNOSTIC FAILED: " if case == "no-controller" else "DIAGNOSTIC READY:"
             text = wait_serial(process, log, expected, timeout)
             if case != "no-controller":
-                for marker in ("DIAGNOSTIC READ ONLY PASS:", "XHCI running:"):
+                for marker in ("XHCI CAP: version=", "XHCI RAW: hcs1=",
+                               "XHCI DMA: allocating controller rings",
+                               "DIAGNOSTIC READ ONLY PASS:", "XHCI running:"):
                     if marker not in text:
                         raise RuntimeError(f"Missing diagnostic proof {marker}; inspect {log}")
+                if text.index("XHCI RAW: hcs1=") > text.index("XHCI DMA: allocating"):
+                    raise RuntimeError("Controller capabilities were not reported before DMA allocation")
                 if case != "empty":
                     qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "a"}], "hold-time": 20})
                     wait_serial(process, log, "DIAGNOSTIC KEY: Character(97)", timeout)

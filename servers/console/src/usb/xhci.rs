@@ -48,9 +48,7 @@ impl Page {
             crate::log(format_args!("USB DMA ERROR: {error:?}"));
             Error::Io
         })?;
-        if page.0.physical > u32::MAX as u64 - 4095 {
-            return Err(Error::Unsupported);
-        }
+        policy::dma_page(page.0.physical)?;
         Ok(page)
     }
     fn clear(&self) {
@@ -219,10 +217,13 @@ pub struct Controller {
 }
 
 impl Controller {
-    fn read(&self, offset: usize) -> u32 {
-        assert!(offset % 4 == 0 && offset + 4 <= self.registers.length);
+    fn read_register(registers: &os::UsbController, offset: usize) -> u32 {
+        assert!(offset % 4 == 0 && offset + 4 <= registers.length);
         // SAFETY: the kernel mapped only the exclusive controller BAR, uncached/NX.
-        unsafe { core::ptr::read_volatile((self.registers.address + offset as u64) as *const u32) }
+        unsafe { core::ptr::read_volatile((registers.address + offset as u64) as *const u32) }
+    }
+    fn read(&self, offset: usize) -> u32 {
+        Self::read_register(&self.registers, offset)
     }
     fn write(&self, offset: usize, value: u32) {
         assert!(offset % 4 == 0 && offset + 4 <= self.registers.length);
@@ -278,6 +279,30 @@ impl Controller {
     }
     fn initialize(read_only: bool) -> Result<Self> {
         let registers = os::usb_controller().map_err(|_| Error::Io)?;
+        let version = Self::read_register(&registers, 0);
+        let structural = Self::read_register(&registers, 4);
+        let secondary = Self::read_register(&registers, 8);
+        let ports = (structural >> 24) as usize;
+        if read_only {
+            crate::diagnostic(format_args!(
+                "XHCI CAP: version={:#x} ports={ports}",
+                version >> 16
+            ));
+            crate::diagnostic(format_args!(
+                "XHCI RAW: hcs1={structural:#010x} hcs2={secondary:#010x}"
+            ));
+        }
+        let scratchpads = policy::scratchpads(secondary).inspect_err(|_| {
+            if read_only {
+                crate::diagnostic(format_args!("XHCI REJECT: scratchpad count exceeds 32"));
+            }
+        })?;
+        if read_only {
+            crate::diagnostic(format_args!(
+                "XHCI CAP: scratchpads={scratchpads} DMA=32-bit"
+            ));
+            crate::diagnostic(format_args!("XHCI DMA: allocating controller rings"));
+        }
         let mut controller = Self {
             read_only,
             registers,
@@ -306,20 +331,9 @@ impl Controller {
             poisoned: false,
             transfers: 0,
         };
-        let version = controller.read(0);
         controller.operational = (version & 255) as usize;
         controller.runtime = (controller.read(24) & !31) as usize;
         controller.doorbells = (controller.read(20) & !3) as usize;
-        let structural = controller.read(4);
-        let ports = (structural >> 24) as usize;
-        let scratchpads = policy::scratchpads(controller.read(8))?;
-        controller.report(format_args!(
-            "XHCI CAP: version={:#x} ports={ports}",
-            version >> 16
-        ));
-        controller.report(format_args!(
-            "XHCI CAP: scratchpads={scratchpads} DMA=32-bit"
-        ));
         if controller.operational < 32
             || structural & 255 < 3
             || !(1..=32).contains(&ports)
