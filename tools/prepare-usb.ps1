@@ -68,7 +68,7 @@ function Invoke-ZosUsbPreparation {
     $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
     Assert-ZosUsbDisk $disk $DiskNumber
     $partitions = @()
-    if ($disk.PartitionStyle -ne 'RAW') {
+    if ($disk.PartitionStyle -ne 'RAW' -and $disk.NumberOfPartitions -gt 0) {
         $partitions = @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop)
     }
     foreach ($partition in $partitions) {
@@ -98,10 +98,24 @@ function Invoke-ZosUsbPreparation {
         throw 'Disk identity changed; no disk changes.'
     }
     $null = @(Get-ZosPackageFiles)
-    if ($current.PartitionStyle -ne 'RAW') {
+    if ($current.PartitionStyle -ne 'RAW' -and $current.NumberOfPartitions -gt 0) {
         Clear-Disk -Number $DiskNumber -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
     }
-    $null = Initialize-Disk -Number $DiskNumber -PartitionStyle MBR -ErrorAction Stop
+    Update-Disk -Number $DiskNumber -ErrorAction Stop
+    $prepared = Get-Disk -Number $DiskNumber -ErrorAction Stop
+    Assert-ZosUsbDisk $prepared $DiskNumber
+    if ($prepared.UniqueId -cne $current.UniqueId -or $prepared.Size -ne $current.Size) {
+        throw 'Disk identity changed after refresh; stopping preparation.'
+    }
+    if ($prepared.NumberOfPartitions -ne 0) {
+        throw 'Partitions remain after clearing; stopping preparation.'
+    }
+    switch ($prepared.PartitionStyle) {
+        'RAW' { $null = Initialize-Disk -Number $DiskNumber -PartitionStyle MBR -ErrorAction Stop }
+        'MBR' { }
+        'GPT' { Set-Disk -Number $DiskNumber -PartitionStyle MBR -ErrorAction Stop }
+        default { throw "Unsupported partition style after refresh: $($prepared.PartitionStyle)" }
+    }
     $partition = New-Partition -DiskNumber $DiskNumber -Size 512MB -MbrType FAT32 -AssignDriveLetter -ErrorAction Stop
     if ($partition.DiskNumber -ne $DiskNumber) { throw 'Storage API returned a different target disk.' }
     $null = $partition | Format-Volume -FileSystem FAT32 -AllocationUnitSize 4096 -NewFileSystemLabel ZOSDIAG -Confirm:$false -ErrorAction Stop

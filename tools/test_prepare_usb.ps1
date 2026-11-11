@@ -17,13 +17,14 @@ foreach ($name in $names) {
 $script:Disk = [pscustomobject]@{
     Number = 77; BusType = 'USB'; IsBoot = $false; IsSystem = $false
     IsOffline = $false; IsReadOnly = $false; Size = 8GB; LogicalSectorSize = 512
-    UniqueId = 'MOCK-USB'; FriendlyName = 'File-backed test only'; PartitionStyle = 'MBR'
+    UniqueId = 'MOCK-USB'; FriendlyName = 'File-backed test only'; PartitionStyle = 'MBR'; NumberOfPartitions = 1
 }
 $script:Calls = @()
 $script:Partition = [pscustomobject]@{ DiskNumber = 77; DriveLetter = 'Z'; IsBoot = $false; IsSystem = $false }
 $script:Swap = $false
 $script:Reads = 0
 $script:Answer = 'ERASE USB DISK 77'
+$script:ClearedStyle = 'RAW'
 function Get-Disk {
     param($Number, $ErrorAction)
     $script:Reads++
@@ -34,10 +35,41 @@ function Get-Disk {
     }
     return $script:Disk
 }
-function Get-Partition { param($DiskNumber, $ErrorAction) return $script:Partition }
-function Clear-Disk { param($Number, [switch]$RemoveData, [switch]$RemoveOEM, $Confirm, $ErrorAction) $script:Calls += 'clear' }
-function Initialize-Disk { param($Number, $PartitionStyle, $ErrorAction) $script:Calls += 'initialize' }
-function New-Partition { param($DiskNumber, $Size, $MbrType, [switch]$AssignDriveLetter, $ErrorAction) $script:Calls += 'partition'; return $script:Partition }
+function Get-Partition {
+    param($DiskNumber, $ErrorAction)
+    if ($script:Disk.NumberOfPartitions -eq 0) { throw 'No partitions exist on the mock disk.' }
+    return $script:Partition
+}
+function Clear-Disk {
+    param($Number, [switch]$RemoveData, [switch]$RemoveOEM, $Confirm, $ErrorAction)
+    $script:Calls += 'clear'
+    $script:Disk.PartitionStyle = $script:ClearedStyle
+    $script:Disk.NumberOfPartitions = 0
+}
+function Update-Disk { param($Number, $ErrorAction) $script:Calls += 'refresh' }
+function Initialize-Disk {
+    param($Number, $PartitionStyle, $ErrorAction)
+    if ($script:Disk.PartitionStyle -ne 'RAW') { throw 'The disk has already been initialized.' }
+    $script:Calls += 'initialize'
+    $script:Disk.PartitionStyle = $PartitionStyle
+}
+function Set-Disk {
+    param($Number, $PartitionStyle, $ErrorAction)
+    if ($script:Disk.PartitionStyle -ne 'GPT' -or $script:Disk.NumberOfPartitions -ne 0) {
+        throw 'Only an empty GPT disk should need conversion.'
+    }
+    $script:Calls += 'convert'
+    $script:Disk.PartitionStyle = $PartitionStyle
+}
+function New-Partition {
+    param($DiskNumber, $Size, $MbrType, [switch]$AssignDriveLetter, $ErrorAction)
+    if ($script:Disk.PartitionStyle -ne 'MBR' -or $script:Disk.NumberOfPartitions -ne 0) {
+        throw 'The mock disk must be empty and MBR before partitioning.'
+    }
+    $script:Calls += 'partition'
+    $script:Disk.NumberOfPartitions = 1
+    return $script:Partition
+}
 function Format-Volume {
     param([Parameter(ValueFromPipeline = $true)]$InputObject, $FileSystem, $AllocationUnitSize, $NewFileSystemLabel, $Confirm)
     process { $script:Calls += 'format' }
@@ -86,14 +118,29 @@ try {
     Expect-Rejection { Invoke-ZosUsbPreparation -DiskNumber 77 -Write } 'Corrupt package'
     [IO.File]::WriteAllBytes($file, $original)
     Invoke-ZosUsbPreparation -DiskNumber 77 -Write
-    Assert-True (($script:Calls -join ',') -eq 'clear,initialize,partition,format') 'Unexpected storage commands'
+    Assert-True (($script:Calls -join ',') -eq 'clear,refresh,initialize,partition,format') 'Unexpected storage commands'
     foreach ($name in $names) {
         Assert-True ((Get-FileHash -LiteralPath (Join-Path $script:Destination $name)).Hash -eq $hashes[$name]) "Readback failed: $name"
     }
     $script:Disk.PartitionStyle = 'RAW'
+    $script:Disk.NumberOfPartitions = 0
     $script:Calls = @()
     Invoke-ZosUsbPreparation -DiskNumber 77 -Write
-    Assert-True (($script:Calls -join ',') -eq 'initialize,partition,format') 'Blank USB disk was not initialized directly'
+    Assert-True (($script:Calls -join ',') -eq 'refresh,initialize,partition,format') 'Blank USB disk was not initialized directly'
+    $script:ClearedStyle = 'MBR'
+    $script:Calls = @()
+    Invoke-ZosUsbPreparation -DiskNumber 77 -Write
+    Assert-True (($script:Calls -join ',') -eq 'clear,refresh,partition,format') 'Already initialized MBR disk was reinitialized'
+    $script:Disk.PartitionStyle = 'GPT'
+    $script:ClearedStyle = 'GPT'
+    $script:Calls = @()
+    Invoke-ZosUsbPreparation -DiskNumber 77 -Write
+    Assert-True (($script:Calls -join ',') -eq 'clear,refresh,convert,partition,format') 'Empty GPT disk was not converted to MBR'
+    $script:Disk.PartitionStyle = 'MBR'
+    $script:Disk.NumberOfPartitions = 0
+    $script:Calls = @()
+    Invoke-ZosUsbPreparation -DiskNumber 77 -Write
+    Assert-True (($script:Calls -join ',') -eq 'refresh,partition,format') 'Retry on an already empty MBR disk failed'
     Write-Output 'USB SCRIPT PASS: mocked targets, refusal/preview/identity/hash checks, verified file copy'
 } finally {
     $resolved = (Get-Item -LiteralPath $root).FullName
