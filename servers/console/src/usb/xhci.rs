@@ -196,7 +196,7 @@ pub struct Controller {
     context_size: usize,
     dcbaa: Page,
     scratch_array: Option<Page>,
-    scratch: [Option<Page>; 32],
+    scratch: [Option<Page>; policy::MAX_SCRATCHPADS],
     _erst: Page,
     events: Page,
     event_index: usize,
@@ -294,7 +294,10 @@ impl Controller {
         }
         let scratchpads = policy::scratchpads(secondary).inspect_err(|_| {
             if read_only {
-                crate::diagnostic(format_args!("XHCI REJECT: scratchpad count exceeds 32"));
+                crate::diagnostic(format_args!(
+                    "XHCI REJECT: scratchpad count exceeds {}",
+                    policy::MAX_SCRATCHPADS
+                ));
             }
         })?;
         if read_only {

@@ -1,5 +1,7 @@
 use super::{Error, Result};
 
+pub const MAX_SCRATCHPADS: usize = 34;
+
 pub fn dma_page(physical: u64) -> Result<()> {
     if physical > u32::MAX as u64 - 4095 {
         return Err(Error::DmaAddress(physical));
@@ -9,7 +11,7 @@ pub fn dma_page(physical: u64) -> Result<()> {
 
 pub fn scratchpads(structural: u32) -> Result<usize> {
     let count = (((structural >> 21) & 31) << 5 | (structural >> 27) & 31) as usize;
-    if count > 32 {
+    if count > MAX_SCRATCHPADS {
         return Err(Error::Unsupported);
     }
     Ok(count)
@@ -88,7 +90,9 @@ mod tests {
         assert_eq!(scratchpads(1 << 27), Ok(1));
         assert_eq!(scratchpads(31 << 27), Ok(31));
         assert_eq!(scratchpads(1 << 21), Ok(32));
-        assert_eq!(scratchpads((1 << 21) | (1 << 27)), Err(Error::Unsupported));
+        assert_eq!(scratchpads((1 << 21) | (1 << 27)), Ok(33));
+        assert_eq!(scratchpads(0x1420_0054), Ok(34));
+        assert_eq!(scratchpads((1 << 21) | (3 << 27)), Err(Error::Unsupported));
         assert_eq!(scratchpads(0xfbe0_0000), Err(Error::Unsupported));
     }
 

@@ -180,8 +180,10 @@ start: **no filesystem, block server, process manager, or shell**. Regular
 `run --usb` remains the QEMU-only persistent shell configuration.
 
 The diagnostic kernel allows QEMU `1b36:000d` or Intel Jasper Lake `8086:4ded`,
-one eligible controller, a 4-64 KiB BAR, up to 32 scratchpad buffers, and 64
-DMA pages below 4 GiB. It requests firmware ownership, validates standard
+one eligible controller, a 4-64 KiB BAR, up to 34 scratchpad buffers, and 64
+DMA pages below 4 GiB. With 34 scratchpads, controller structures and three
+fully allocated device slots use at most 63 of those DMA pages.
+It requests firmware ownership, validates standard
 USB2/USB3 speed-ID tables, resets the controller and reports capabilities,
 connected root ports, supported device IDs, capacity, and a first-sector read.
 Enumeration can succeed with zero devices; unsupported protocols/devices and
