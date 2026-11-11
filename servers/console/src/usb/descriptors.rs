@@ -32,11 +32,14 @@ pub struct Configuration {
 pub fn parse(bytes: &[u8]) -> Result<Configuration> {
     if bytes.len() < 9
         || bytes[0..2] != [9, 2]
-        || bytes[4] != 1
+        || bytes[4] == 0
         || u16::from_le_bytes([bytes[2], bytes[3]]) as usize != bytes.len()
         || bytes[5] == 0
     {
         return Err(Error::Invalid);
+    }
+    if bytes[4] != 1 {
+        return Err(Error::Unsupported);
     }
     let mut kind = None;
     let mut interface = 0;
@@ -159,6 +162,9 @@ mod tests {
             broken[index] = value;
             assert!(parse(&broken).is_err(), "offset {index}");
         }
+        let mut composite = valid;
+        composite[4] = 2;
+        assert_eq!(parse(&composite).unwrap_err(), Error::Unsupported);
     }
     #[test]
     fn bulk_pair_and_super_speed_companion() {

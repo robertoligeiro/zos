@@ -92,6 +92,9 @@ pub extern "C" fn _start(role: usize) -> ! {
     assert_eq!(os::io_port_grant(0x60, 2), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(CONSOLE, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(INPUT, 2), Err(os::Error::Denied));
+    if role & 16 != 0 {
+        diagnostic_input();
+    }
     if role & 8 != 0 {
         usb_input(role & 1 != 0);
     }
@@ -148,6 +151,64 @@ pub extern "C" fn _start(role: usize) -> ! {
             }
         }
         assert!(drained, "PS/2 runtime drain limit");
+    }
+}
+
+fn diagnostic_input() -> ! {
+    use zos_console::keyboard::Key;
+    use zos_console::usb::{Controller, Event};
+    diagnostic(format_args!("ZOS USB DIAGNOSTIC: storage writes disabled"));
+    let result = Controller::diagnostic();
+    let mut controller = match result {
+        Ok(controller) => controller,
+        Err(error) => {
+            diagnostic(format_args!(
+                "DIAGNOSTIC FAILED: {error:?}; photograph this screen"
+            ));
+            os::exit(1)
+        }
+    };
+    os::irq_attach(INPUT, 0).unwrap();
+    diagnostic(format_args!(
+        "DIAGNOSTIC READY: type keys / move mouse; no shell"
+    ));
+    let mut bytes = [0; 64];
+    loop {
+        let (token, length) = os::receive(INPUT, &mut bytes).unwrap();
+        if token != 0 {
+            os::reply_live(token, &[4]).unwrap();
+            continue;
+        }
+        assert_eq!(length, 8);
+        if let Err(error) = controller.poll() {
+            diagnostic(format_args!(
+                "DIAGNOSTIC OFFLINE: {error:?}; restart required"
+            ));
+            os::exit(2)
+        }
+        while let Some(event) = controller.event() {
+            match event {
+                Event::Key(key) => {
+                    match key {
+                        Key::Character(byte) => output(&[byte]),
+                        Key::Enter => output(b"\n"),
+                        Key::Clear => os::send(CONSOLE, &[CLEAR], &mut []).map(|_| ()).unwrap(),
+                        _ => (),
+                    }
+                    log(format_args!("DIAGNOSTIC KEY: {key:?}"));
+                }
+                Event::Pointer { dx, dy, buttons } => {
+                    let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
+                    os::send(
+                        CONSOLE,
+                        &[POINTER, x[0], x[1], y[0], y[1], buttons],
+                        &mut [],
+                    )
+                    .unwrap();
+                }
+            }
+            controller.consume_event();
+        }
     }
 }
 

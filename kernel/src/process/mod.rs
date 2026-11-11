@@ -933,6 +933,9 @@ fn complete() -> ! {
 pub fn start() -> ! {
     cpu_interrupts::disable();
     arch::init();
+    if cfg!(feature = "usb-diagnostic") {
+        start_console();
+    }
     let modules = crate::boot::MODULES
         .response()
         .expect("Missing Limine modules")
@@ -1004,7 +1007,11 @@ pub fn start() -> ! {
 }
 
 fn start_console() -> ! {
-    crate::logln!("Starting ring-3 console, input and TTY servers");
+    if cfg!(feature = "usb-diagnostic") {
+        crate::logln!("Starting read-only USB diagnostic services");
+    } else {
+        crate::logln!("Starting ring-3 console, input and TTY servers");
+    }
     crate::framebuffer::handoff();
     let mut scheduler = Scheduler {
         threads: Vec::new(),
@@ -1050,6 +1057,9 @@ fn start_console() -> ! {
             false,
         ),
     ] {
+        if cfg!(feature = "usb-diagnostic") && priority == 2 {
+            continue;
+        }
         let file = crate::boot::MODULES
             .response()
             .unwrap()
@@ -1078,6 +1088,11 @@ fn start_console() -> ! {
             process,
             entry,
             (cfg!(feature = "test-console") || cfg!(feature = "test-shell")) as u64
+                | if cfg!(feature = "usb-diagnostic") {
+                    16
+                } else {
+                    0
+                }
                 | if cfg!(feature = "usb") && matches!(name, "input-server" | "shell-server") {
                     8
                 } else {
@@ -1089,7 +1104,7 @@ fn start_console() -> ! {
         thread.name[..name.len()].copy_from_slice(name.as_bytes());
         scheduler.threads.push(thread);
     }
-    if !cfg!(feature = "test-console") {
+    if !cfg!(any(feature = "test-console", feature = "usb-diagnostic")) {
         for (name, priority, ports) in [
             ("blkdev-server", 3, 24),
             ("fs-simple-server", 4, 0),
@@ -1168,6 +1183,7 @@ fn start_console() -> ! {
 
 fn shell_enabled() -> bool {
     !cfg!(any(
+        feature = "usb-diagnostic",
         feature = "test-console",
         feature = "test-fs-create",
         feature = "test-fs-read"

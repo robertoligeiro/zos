@@ -108,19 +108,22 @@ def cargo(*args: str, user: bool = False) -> None:
                    env=user_environment() if user else environment(), check=True)
 
 
-def build(case: str | None = None, *, usb: bool = False) -> Path:
+def build(case: str | None = None, *, usb: bool = False, diagnostic: bool = False) -> Path:
+    if diagnostic and case:
+        raise ValueError("Diagnostics cannot be combined with another boot test")
     cargo("build", "--locked", "--release", "--package", "zos-demo",
           "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", user=True)
     BUILD.mkdir(exist_ok=True)
     program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / "zos-command"
     (BUILD / "zos-command.elf").write_bytes(compact_elf(program.read_bytes()))
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
-    features = ([CASES[case][0]] if case else []) + (["usb"] if usb else [])
+    features = ([CASES[case][0]] if case else []) + (
+        ["usb-diagnostic"] if diagnostic else ["usb"] if usb else [])
     if features:
         args += ["--features", ",".join(features)]
     cargo(*args)
     BUILD.mkdir(exist_ok=True)
-    destination = BUILD / f"zos-{'usb-' if usb else ''}{case or 'normal'}.elf"
+    destination = BUILD / ("zos-diagnostic.elf" if diagnostic else f"zos-{'usb-' if usb else ''}{case or 'normal'}.elf")
     shutil.copyfile(ROOT / "target" / "x86_64-unknown-none" / "release" / "zos-kernel", destination)
     return destination
 
@@ -151,12 +154,12 @@ def image(kernel: Path, case: str | None = None) -> Path:
     limine = TOOLS / "limine"
     destination = image_path(f"zos-{case}.img" if case else "zos.img")
     payloads = {
-        "limine.conf": (ROOT / "boot" / "limine.conf").read_bytes(),
+        "limine.conf": (ROOT / "boot" / ("limine-diagnostic.conf" if case == "diagnostic" else "limine.conf")).read_bytes(),
         "limine-bios.sys": (limine / "limine-bios.sys").read_bytes(),
         "EFI/BOOT/BOOTX64.EFI": (limine / "BOOTX64.EFI").read_bytes(),
         "boot/zos.elf": kernel.read_bytes(),
     }
-    for program in USER_PROGRAMS:
+    for program in (("console-server", "input-server") if case == "diagnostic" else USER_PROGRAMS):
         source = BUILD / "zos-command.elf" if program == "zos-command" else (
             ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / program
         )
@@ -167,6 +170,20 @@ def image(kernel: Path, case: str | None = None) -> Path:
         cwd=ROOT, check=True,
     )
     print(f"Image: {destination}", flush=True)
+    if case == "diagnostic":
+        package = BUILD / "usb-diagnostic-files"
+        hashes = {}
+        for name, data in payloads.items():
+            if name == "limine-bios.sys":
+                continue
+            target = package / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            hashes[name.replace("/", "\\")] = hashlib.sha256(data).hexdigest()
+        (package / "manifest.json").write_text(json.dumps({
+            "kind": "zos-usb-diagnostic", "storage_read_only": True, "files": hashes,
+        }, indent=2) + "\n", encoding="utf-8")
+        print(f"UEFI USB package: {package}", flush=True)
     return destination
 
 
@@ -384,13 +401,104 @@ def wait_serial(process, log: Path, marker: str, timeout: int, *, start: int = 0
     while True:
         text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
         current = text[start:]
-        if any(failure in current for failure in ("KERNEL PANIC", "EXCEPTION:", "SERVICE FAILURE")):
+        if any(failure in current for failure in ("KERNEL PANIC", "EXCEPTION:", "SERVICE FAILURE", "X64 Exception Type")):
             raise RuntimeError(f"Guest failed; inspect {log}")
         if marker in current:
             return text
         if process.poll() is not None or time.monotonic() >= deadline:
             raise RuntimeError(f"Waiting for {marker!r} failed; inspect {log}")
         time.sleep(0.01)
+
+def diagnostic_command(disk: Path, firmware: str, case: str = "normal") -> list[str]:
+    command = qemu_command(disk, firmware, usb=case != "no-controller")
+    if case in ("normal", "read-only-media"):
+        if case == "normal":
+            index = command.index("-drive")
+            del command[index:index + 2]
+        # Bundled EDK2's USB mass-storage driver faults on a write-protected medium.
+        protection = "snapshot=on" if case == "normal" and firmware == "uefi" else "readonly=on"
+        command += ["-drive", f"file={disk},format=raw,if=none,id=diagnostic-boot,{protection}"]
+        if case == "normal":
+            command += ["-device", "usb-storage,id=zos-usb-disk,bus=xhci.0,port=3,drive=diagnostic-boot,bootindex=1"]
+    if case == "empty":
+        for prefix in ("usb-kbd,", "usb-mouse,"):
+            index = next(i for i, value in enumerate(command) if value.startswith(prefix))
+            del command[index - 1:index + 1]
+    if case == "unsupported":
+        command += ["-device", "usb-tablet,id=unsupported,bus=xhci.0,port=4"]
+    return command
+
+
+def diagnostic_case(disk: Path, firmware: str, timeout: int, case: str = "normal") -> None:
+    stem = f"{firmware}-diagnostic-{case}"
+    log, picture = BUILD / f"{stem}.serial.log", BUILD / f"{stem}.ppm"
+    log.unlink(missing_ok=True)
+    picture.unlink(missing_ok=True)
+    before = hashlib.sha256(disk.read_bytes()).hexdigest()
+    command = diagnostic_command(disk, firmware, case) + [
+        "-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio"]
+    with (BUILD / f"{stem}.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{stem}.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            if case == "read-only-media":
+                # Insert after ExitBootServices, before the one-second PIT test ends.
+                wait_serial(process, log, "PIT ready: 100 Hz", timeout)
+                qmp.execute("stop")
+                qmp.execute("device_add", {"driver": "usb-storage", "id": "zos-usb-disk",
+                            "bus": "xhci.0", "port": "3", "drive": "diagnostic-boot"})
+                qmp.execute("cont")
+            expected = "DIAGNOSTIC FAILED: " if case == "no-controller" else "DIAGNOSTIC READY:"
+            text = wait_serial(process, log, expected, timeout)
+            if case != "no-controller":
+                for marker in ("DIAGNOSTIC READ ONLY PASS:", "XHCI running:"):
+                    if marker not in text:
+                        raise RuntimeError(f"Missing diagnostic proof {marker}; inspect {log}")
+                if case != "empty":
+                    qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "a"}], "hold-time": 20})
+                    wait_serial(process, log, "DIAGNOSTIC KEY: Character(97)", timeout)
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "rel", "data": {"axis": "x", "value": 20}},
+                        {"type": "rel", "data": {"axis": "y", "value": -10}}]})
+                    wait_serial(process, log, "MOUSE: x=532 y=374", timeout)
+                if case in ("normal", "read-only-media"):
+                    text = wait_serial(process, log, "USB READ PASS:", timeout)
+                    if "USB DISK: sectors=262144 block=512" not in text:
+                        raise RuntimeError("Diagnostics did not read the non-16MiB USB boot disk")
+                    if case == "normal":
+                        qmp.execute("device_del", {"id": "zos-usb-disk"})
+                        wait_serial(process, log, "DIAGNOSTIC OFFLINE: Io", timeout)
+                if case == "unsupported":
+                    wait_serial(process, log, "unsupported device", timeout)
+            text = log.read_text(encoding="utf-8")
+            for marker in ("SHELL ready:", "FS ready:", "BLOCK ready:", "USER FAULT:", "KERNEL PANIC"):
+                if marker in text:
+                    raise RuntimeError(f"Unexpected diagnostic activity {marker}; inspect {log}")
+            qmp.execute("screendump", {"filename": str(picture)})
+            qmp.execute("quit")
+            if process.wait(timeout=timeout) != 0 or not picture.read_bytes().startswith(b"P6\n"):
+                raise RuntimeError(f"Diagnostic capture/shutdown failed; inspect {log}")
+        except RuntimeError:
+            if process.poll() is None:
+                qmp.execute("screendump", {"filename": str(picture)})
+            raise
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    if hashlib.sha256(disk.read_bytes()).hexdigest() != before:
+        raise RuntimeError("Read-only diagnostic changed its boot disk")
+    (BUILD / f"{stem}.data.json").write_text(json.dumps({
+        "image": disk.name, "before_sha256": before, "after_sha256": before,
+        "usb_medium": "snapshot overlay" if case == "normal" and firmware == "uefi"
+            else "read-only" if case in ("normal", "read-only-media") else "none",
+        "qemu_fully_exited": True,
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"PASS {firmware}/diagnostic-{case}: explicit diagnostics, image preserved", flush=True)
 
 
 def console_case(disk: Path, firmware: str, timeout: int) -> None:
@@ -876,7 +984,7 @@ def check() -> None:
         if case:
             args += ["--features", CASES[case][0]]
         cargo(*args, "--", "-D", "warnings")
-    for features in ("usb", "usb,test-shell"):
+    for features in ("usb", "usb,test-shell", "usb-diagnostic"):
         cargo("clippy", "--locked", "--release", "--package", "zos-kernel",
               "--no-default-features", "--features", features, "--", "-D", "warnings")
 
@@ -888,8 +996,9 @@ def source_hashes() -> dict[str, str]:
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files}
 
 
-def accept(timeout: int, *, usb: bool = False) -> None:
-    phase = 8 if usb else 7
+def accept(timeout: int, *, usb: bool = False, diagnostic: bool = False) -> None:
+    usb = usb or diagnostic
+    phase = 9 if diagnostic else 8 if usb else 7
     result = BUILD / f"phase-{phase}-acceptance.json"
     BUILD.mkdir(exist_ok=True)
     result.unlink(missing_ok=True)
@@ -919,6 +1028,12 @@ def accept(timeout: int, *, usb: bool = False) -> None:
         for firmware in ("bios", "uefi"):
             screenshot(normal_usb, firmware, timeout, data_disk=data_usb, usb=True)
             usb_cases.append(f"{firmware}/usb-normal")
+    if diagnostic:
+        disk = image(build(diagnostic=True), "diagnostic")
+        for firmware in ("bios", "uefi"):
+            for case in ("normal", "read-only-media", "no-storage", "empty", "unsupported", "no-controller"):
+                diagnostic_case(disk, firmware, timeout, case)
+                usb_cases.append(f"{firmware}/diagnostic-{case}")
     if any(hashlib.sha256((BUILD / name).read_bytes()).hexdigest() != digest
            for name, digest in user_volumes.items()):
         raise RuntimeError("Acceptance modified an existing user data volume")
@@ -931,6 +1046,7 @@ def accept(timeout: int, *, usb: bool = False) -> None:
         "git_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "source_sha256": tested_sources,
         "preserved_user_volume_sha256": user_volumes,
+        "physical_hardware": "not tested",
         "cases": [f"{firmware}/{case}" for case in CASES for firmware in ("bios", "uefi")] + usb_cases,
     }, indent=2) + "\n", encoding="utf-8")
     print(f"AUTOMATED STEP {phase} PASS. Inspect normal, console and shell screenshots.", flush=True)
@@ -943,13 +1059,16 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=90)
     parser.add_argument("--data-image", help="Dedicated volume name inside build (default: data.img or data-usb.img)")
     parser.add_argument("--usb", action="store_true", help="QEMU xHCI USB keyboard/mouse and data disk")
+    parser.add_argument("--diagnostic", action="store_true", help="Read-only Intel/QEMU USB diagnostics; no filesystem or shell")
     parser.add_argument("--force", action="store_true", help="Explicitly overwrite the selected data volume (mkfs only)")
     args = parser.parse_args()
-    args.data_image = args.data_image or ("data-usb.img" if args.usb else "data.img")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.force and args.command != "mkfs":
         parser.error("--force is only valid with mkfs")
+    if args.diagnostic and (args.usb or args.data_image is not None or args.command == "mkfs"):
+        parser.error("--diagnostic cannot be combined with --usb, --data-image or mkfs")
+    args.data_image = args.data_image or ("data-usb.img" if args.usb else "data.img")
     if args.command == "mkfs":
         print(f"Formatted: {format_disk(args.data_image, force=args.force)}")
     elif args.command == "fmt":
@@ -957,13 +1076,15 @@ def main() -> None:
     elif args.command == "check":
         check()
     elif args.command == "test":
-        accept(args.timeout, usb=args.usb)
+        accept(args.timeout, usb=args.usb, diagnostic=args.diagnostic)
     else:
-        kernel = build(usb=args.usb)
+        kernel = build(usb=args.usb, diagnostic=args.diagnostic)
         if args.command != "build":
-            disk = image(kernel, "usb" if args.usb else None)
+            disk = image(kernel, "diagnostic" if args.diagnostic else "usb" if args.usb else None)
             if args.command in ("run", "debug"):
-                command = qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image), usb=args.usb) + ["-serial", "stdio"]
+                command = (diagnostic_command(disk, args.firmware) if args.diagnostic else
+                    qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image),
+                                 usb=args.usb)) + ["-serial", "stdio"]
                 if args.command == "debug":
                     command += ["-s", "-S", "-d", "int,cpu_reset",
                                 "-D", str(BUILD / "qemu-debug.log")]

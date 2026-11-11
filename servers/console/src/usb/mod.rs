@@ -1,5 +1,6 @@
 mod descriptors;
 mod hid;
+mod policy;
 mod xhci;
 
 use crate::keyboard::Key;
@@ -9,6 +10,7 @@ pub use xhci::Controller;
 pub enum Error {
     Invalid,
     Unsupported,
+    ReadOnly,
     Timeout,
     Completion(u8),
     Io,

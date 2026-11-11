@@ -35,6 +35,7 @@ pub fn log(args: core::fmt::Arguments<'_>) {
         bytes: [u8; 64],
         length: usize,
     }
+
     impl Write for Buffer {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
             let end = self.length + text.len();
@@ -52,4 +53,33 @@ pub fn log(args: core::fmt::Arguments<'_>) {
     };
     buffer.write_fmt(args).unwrap();
     zos_libos::debug_write(core::str::from_utf8(&buffer.bytes[..buffer.length]).unwrap()).unwrap();
+}
+
+pub fn diagnostic(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    struct Writer {
+        bytes: [u8; 128],
+        length: usize,
+    }
+    impl Write for Writer {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            if self.length + text.len() > self.bytes.len() {
+                return Err(core::fmt::Error);
+            }
+            self.bytes[self.length..self.length + text.len()].copy_from_slice(text.as_bytes());
+            self.length += text.len();
+            Ok(())
+        }
+    }
+    let mut buffer = Writer {
+        bytes: [0; 128],
+        length: 0,
+    };
+    buffer.write_fmt(args).unwrap();
+    let bytes = &buffer.bytes[..buffer.length];
+    output(bytes);
+    output(b"\n");
+    for part in bytes.chunks(64) {
+        zos_libos::debug_write(core::str::from_utf8(part).unwrap()).unwrap();
+    }
 }

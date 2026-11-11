@@ -7,7 +7,7 @@ use zos_libos as os;
 static mut TERMINAL: Terminal = Terminal::new();
 
 #[no_mangle]
-pub extern "C" fn _start(_: usize) -> ! {
+pub extern "C" fn _start(role: usize) -> ! {
     assert_eq!(os::channel_create(), Ok(CONSOLE));
     assert_eq!(os::io_port_grant(0x60, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(CONSOLE, 1), Err(os::Error::Denied));
@@ -42,10 +42,15 @@ pub extern "C" fn _start(_: usize) -> ! {
     terminal.clear();
     terminal.write(b"ZOS - Zombie OS\nRing-3 console and input\n\n");
     terminal.colors(0xffcc66, 0x081008);
-    terminal.write(b"Keyboard and mouse use isolated user-space drivers.\n");
-    terminal.colors(0x90ee90, 0x081008);
-    terminal.write(b"Edit: arrows, Home/End, Backspace/Delete; Up/Down: history\n");
-    terminal.write(b"Ctrl+A/E: start/end; Ctrl+L: clear; mouse: move/click crosshair\n\n");
+    if role & 16 != 0 {
+        terminal.write(b"Intel / QEMU xHCI diagnostic - storage READ ONLY\n");
+        terminal.write(b"No filesystem or shell. Unsupported devices are reported.\n\n");
+    } else {
+        terminal.write(b"Keyboard and mouse use isolated user-space drivers.\n");
+        terminal.colors(0x90ee90, 0x081008);
+        terminal.write(b"Edit: arrows, Home/End, Backspace/Delete; Up/Down: history\n");
+        terminal.write(b"Ctrl+A/E: start/end; Ctrl+L: clear; mouse: move/click crosshair\n\n");
+    }
     terminal.render(pixels, fb);
     let mut bytes = [0; 128];
     loop {

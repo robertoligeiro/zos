@@ -38,6 +38,9 @@ A single-core x86-64 microkernel project following the supplied
 - Step 8: **QEMU xHCI USB keyboard/mouse and persistent USB storage**.
   PCI discovery and hardware-capability mappings remain in the kernel; controller,
   HID and bulk-only SCSI drivers run in ring 3. Physical-PC validation is deferred.
+- Step 9: **read-only Intel/QEMU USB diagnostics** and a guarded Windows USB
+  preparation script. Intel `8086:4ded` is allowed only in this diagnostic build.
+  Physical-laptop validation is still required; this is not a hardware-ready shell.
 
 The `phase-2` tag preserves the verified boot checkpoint. The `phase-3` memory
 checkpoint preserves **Step 3 / Phase 2** in the supplied plan. The
@@ -163,6 +166,99 @@ hotplug/recovery and arbitrary physical controllers are not supported.
 Missing/unsupported devices fail explicitly without a PS/2/ATA fallback.
 Disconnecting an enumerated device takes the driver offline; transport failures
 poison the disk until restart. No physical disk or USB stick has been written.
+
+## Intel laptop diagnostic checkpoint
+
+```powershell
+python tools\zos.py image --diagnostic
+python tools\zos.py run --diagnostic --firmware uefi
+```
+
+This creates `build\zos-diagnostic.img` and the separate five-file UEFI package
+`build\usb-diagnostic-files`. Only console and USB input/diagnostic services
+start: **no filesystem, block server, process manager, or shell**. Regular
+`run --usb` remains the QEMU-only persistent shell configuration.
+
+The diagnostic kernel allows QEMU `1b36:000d` or Intel Jasper Lake `8086:4ded`,
+one eligible controller, a 4-64 KiB BAR, up to 32 scratchpad buffers, and 64
+DMA pages below 4 GiB. It requests firmware ownership, validates standard
+USB2/USB3 speed-ID tables, resets the controller and reports capabilities,
+connected root ports, supported device IDs, capacity, and a first-sector read.
+Enumeration can succeed with zero devices; unsupported protocols/devices and
+duplicate device kinds are reported and skipped. At most one direct-root boot
+keyboard, mouse and bulk-only SCSI disk can be configured. Hubs, composite
+interfaces, UAS, nonstandard speed tables, multi-LUN disks and hotplug recovery
+remain unsupported. READ CAPACITY(10) limits disk discovery to fewer than
+2^32 blocks; the normal 16 MiB geometry restriction is removed only here.
+Non-512-byte block sizes are reported without a sector read.
+
+The SCSI transport allowlists only readiness, inquiry, sense, capacity and read
+commands in diagnostic mode. WRITE, FLUSH and every block RPC are denied before
+submitting USB transfers. No diagnostic command mounts or modifies a disk.
+The screen reports `DIAGNOSTIC READ ONLY PASS` and `DIAGNOSTIC READY`; typing
+shows key events and moving the mouse moves the pointer. Device disconnect or
+an initialization/runtime error is displayed explicitly and requires reboot.
+
+QEMU tests boot this image from USB in BIOS/UEFI, exercise HID and disconnect,
+and separately attach its 128 MiB disk strictly read-only. The bundled EDK2
+USB mass-storage firmware driver faults on write-protected media, so UEFI USB boot
+uses a disposable QEMU snapshot overlay. The independent read-only-media case
+boots via IDE, inserts the USB disk after firmware exits but before ZOS driver
+initialization, and checks USB read/write-denial proofs and unchanged image hashes.
+This firmware workaround does not add a writable path to the ZOS driver.
+
+### Prepare a physical USB key (Windows, UEFI only)
+
+Use an expendable USB key of **1 GiB-2 TiB with 512-byte logical sectors**.
+The script removes all its partitions, creates a **512 MiB MBR/FAT32 volume**,
+copies just the five hashed diagnostic files and verifies their readback.
+The remainder stays unallocated; this is not a secure erase. Using standard
+Windows partition/format APIs avoids writing a fixed-size GPT image with an
+incorrect backup-header position on a larger disk.
+
+Build the package above, then preview from the repository directory:
+
+```powershell
+.\tools\prepare-usb.ps1 -List
+.\tools\prepare-usb.ps1 -DiskNumber N
+.\tools\prepare-usb.ps1 -DiskNumber N -Write -WhatIf
+```
+
+Replace `N` with the USB disk number you verified by size/model. No disk is
+selected automatically. The script refuses non-USB, boot/system, offline,
+read-only, undersized, unsupported-sector and changed-identity targets, and
+targets containing its own script/package/current directory. It validates the
+package before any destructive operation.
+
+When ready, run in a PowerShell session that already has disk-administration
+rights (the script never elevates itself):
+
+```powershell
+.\tools\prepare-usb.ps1 -DiskNumber N -Write
+```
+
+Enter the exact requested `ERASE USB DISK N` confirmation only for the intended
+key. If policy blocks execution or access, stop and resolve that policy;
+do not bypass it. Safely eject after `VERIFIED`.
+
+On the **target Intel laptop**, connect the key and simple wired USB boot
+keyboard/mouse directly (no hub/dock), use the one-time **UEFI USB boot menu**,
+and ensure the firmware permits this unsigned bootloader (Secure Boot cannot
+authenticate it). The laptop's internal/I2C keyboard or touchpad may not work.
+Photograph the complete capability/device/readiness or error screen. Type a
+few keys and move the mouse; there is deliberately no command prompt. Power
+off, remove the key, then select the normal Windows boot entry to return.
+Do not treat QEMU success as confirmation that the Intel laptop works.
+
+Mock-only script tests (no USB key or real disk API calls):
+
+```powershell
+powershell.exe -NoProfile -File .\tools\test_prepare_usb.ps1
+$LASTEXITCODE
+```
+
+Expect `USB SCRIPT PASS` and exit code 0. Phase 9 host/native acceptance is
+`python tools\zos.py test --diagnostic`; existing user data images are preserved.
 
 ## Interactive shell and processes
 
@@ -482,7 +578,8 @@ QEMU runs a single CPU with 256 MiB RAM using software emulation, except for the
 QEMU package's EDK2 code and a fresh per-image copy of its variable store.
 Disk access is restricted to generated image files. Only the boot image uses
 snapshot mode; the selected dedicated data volume persists writes.
-No tools here enumerate, format, or write a physical drive.
+The QEMU tools never enumerate, format, or write a physical drive. Only the
+explicit `tools\prepare-usb.ps1 -Write` workflow above prepares a physical USB key.
 
 ## Repository and sharing
 

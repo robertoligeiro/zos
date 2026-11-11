@@ -94,3 +94,13 @@ real keys/mouse, concurrent copying/input, ring wraps, full-restart persistence,
 power controls, explicit unsupported/disconnect errors and complete teardown.
 Physical hardware, hotplug recovery, hubs and UAS remain unvalidated/unsupported;
 the driver is trusted for DMA because there is no IOMMU.
+
+The `usb-diagnostic` kernel feature instead starts **only console and input**.
+Its separate boot configuration packages those two ELFs and skips the regression
+demo, filesystem and shell. The input driver reports controller/port/device
+state to the framebuffer as well as serial, supports bounded scratchpad setup
+and reuses disabled-slot DMA allocations while skipping unsupported devices.
+Its transport-level read-only allowlist and unconditional block-RPC rejection
+apply even when no storage device was enumerated. The normal USB/shell identity
+and writable 16 MiB volume contracts are unchanged. Intel `8086:4ded` is gated
+to this diagnostic kernel, and physical-controller validation is pending.

@@ -68,6 +68,15 @@ fn discover() -> Result<(u32, u64, u64), Error> {
                 if read(device, 0) & 0xffff == 0xffff || read(device, 8) >> 8 != 0x0c0330 {
                     continue;
                 }
+                let identity = read(device, 0);
+                crate::logln!("PCI XHCI FOUND: bdf={:#x} id={:#010x}", device, identity);
+                if cfg!(feature = "usb-diagnostic")
+                    && identity != 0x000d_1b36
+                    && identity != 0x4ded_8086
+                {
+                    crate::logln!("PCI XHCI SKIP: unsupported controller");
+                    continue;
+                }
                 if found.replace(device).is_some() {
                     return Err(Error::Limit);
                 }
@@ -75,8 +84,10 @@ fn discover() -> Result<(u32, u64, u64), Error> {
         }
     }
     let device = found.ok_or(Error::Invalid)?;
-    // This checkpoint deliberately supports the selected QEMU target only.
-    if read(device, 0) != 0x000d_1b36 || read(device, 12) & 0x7f0000 != 0 {
+    let identity = read(device, 0);
+    if (identity != 0x000d_1b36 && !(cfg!(feature = "usb-diagnostic") && identity == 0x4ded_8086))
+        || read(device, 12) & 0x7f0000 != 0
+    {
         return Err(Error::Denied);
     }
     let saved = read(device, 4) as u16;
@@ -100,6 +111,7 @@ fn discover() -> Result<(u32, u64, u64), Error> {
     }
     let physical = (high as u64) << 32 | (low & !15) as u64;
     let length = (!((mask_high as u64) << 32 | mask_low as u64)).wrapping_add(1);
+    crate::logln!("PCI XHCI BAR: base={:#x} bytes={}", physical, length);
     let Some(end) = physical.checked_add(length) else {
         command(device, saved);
         return Err(Error::Invalid);

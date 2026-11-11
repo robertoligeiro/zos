@@ -23,6 +23,7 @@ test-fs-create = []
 test-fs-read = []
 test-shell = []
 usb = []
+usb-diagnostic = ["usb"]
 
 [dependencies]
 limine = "=0.6.5"

@@ -1,7 +1,7 @@
 use super::{
     descriptors::{self, Configuration, Endpoint, Kind},
     hid::BootKeyboard,
-    Error, Event, Result,
+    policy, Error, Event, Result,
 };
 use core::sync::atomic::{fence, Ordering};
 use zos_libos as os;
@@ -44,10 +44,19 @@ mod tests {
 struct Page(os::DmaPage);
 impl Page {
     fn new() -> Result<Self> {
-        os::usb_dma_page().map(Self).map_err(|error| {
+        let page = os::usb_dma_page().map(Self).map_err(|error| {
             crate::log(format_args!("USB DMA ERROR: {error:?}"));
             Error::Io
-        })
+        })?;
+        if page.0.physical > u32::MAX as u64 - 4095 {
+            return Err(Error::Unsupported);
+        }
+        Ok(page)
+    }
+    fn clear(&self) {
+        for offset in (0..4096).step_by(4) {
+            self.write(offset, 0);
+        }
     }
     fn physical(&self, offset: usize) -> u64 {
         assert!(offset < 4096);
@@ -120,6 +129,12 @@ impl Ring {
         }
         physical
     }
+    fn reset(&mut self) {
+        self.page.clear();
+        self.index = 0;
+        self.cycle = 1;
+        self.wraps = 0;
+    }
 }
 
 struct Pipe {
@@ -175,12 +190,15 @@ impl Completion {
 }
 
 pub struct Controller {
+    read_only: bool,
     registers: os::UsbController,
     operational: usize,
     runtime: usize,
     doorbells: usize,
     context_size: usize,
     dcbaa: Page,
+    scratch_array: Option<Page>,
+    scratch: [Option<Page>; 32],
     _erst: Page,
     events: Page,
     event_index: usize,
@@ -188,13 +206,14 @@ pub struct Controller {
     event_wraps: usize,
     commands: Ring,
     devices: [Option<Device>; 3],
+    spare: Option<Device>,
     keyboard: BootKeyboard,
     queue: [Option<Event>; 64],
     queued: usize,
     consumed: usize,
     storage: usize,
     tag: u32,
-    sectors: u32,
+    sectors: u64,
     poisoned: bool,
     transfers: u64,
 }
@@ -231,14 +250,44 @@ impl Controller {
         Ok(())
     }
     pub fn new() -> Result<Self> {
+        Self::initialize(false)
+    }
+    pub fn diagnostic() -> Result<Self> {
+        let mut controller = Self::initialize(true)?;
+        assert_eq!(
+            controller.scsi(&[0x2a; 10], false, &mut [0; 512]),
+            Err(Error::ReadOnly)
+        );
+        assert_eq!(
+            controller.scsi(&[0x35; 10], false, &mut []),
+            Err(Error::ReadOnly)
+        );
+        assert_eq!(
+            controller.disk_request(&[0x12], &mut [0; 512]),
+            Err(Error::ReadOnly)
+        );
+        crate::diagnostic(format_args!(
+            "DIAGNOSTIC READ ONLY PASS: WRITE/FLUSH/RPC denied"
+        ));
+        Ok(controller)
+    }
+    fn report(&self, args: core::fmt::Arguments<'_>) {
+        if self.read_only {
+            crate::diagnostic(args);
+        }
+    }
+    fn initialize(read_only: bool) -> Result<Self> {
         let registers = os::usb_controller().map_err(|_| Error::Io)?;
         let mut controller = Self {
+            read_only,
             registers,
             operational: 0,
             runtime: 0,
             doorbells: 0,
             context_size: 32,
             dcbaa: Page::new()?,
+            scratch_array: None,
+            scratch: core::array::from_fn(|_| None),
             _erst: Page::new()?,
             events: Page::new()?,
             event_index: 0,
@@ -246,6 +295,7 @@ impl Controller {
             event_wraps: 0,
             commands: Ring::new()?,
             devices: core::array::from_fn(|_| None),
+            spare: None,
             keyboard: BootKeyboard::default(),
             queue: [None; 64],
             queued: 0,
@@ -262,20 +312,29 @@ impl Controller {
         controller.doorbells = (controller.read(20) & !3) as usize;
         let structural = controller.read(4);
         let ports = (structural >> 24) as usize;
+        let scratchpads = policy::scratchpads(controller.read(8))?;
+        controller.report(format_args!(
+            "XHCI CAP: version={:#x} ports={ports}",
+            version >> 16
+        ));
+        controller.report(format_args!(
+            "XHCI CAP: scratchpads={scratchpads} DMA=32-bit"
+        ));
         if controller.operational < 32
             || structural & 255 < 3
-            || !(3..=32).contains(&ports)
+            || !(1..=32).contains(&ports)
             || controller.operational + 0x400 + ports * 16 > controller.registers.length
             || controller.runtime < 32
             || controller.runtime + 0x40 > controller.registers.length
             || controller.doorbells < 32
             || controller.doorbells + 256 * 4 > controller.registers.length
-            || controller.read(8) & 0xfbe00000 != 0
+            || (!read_only && scratchpads != 0)
         {
             return Err(Error::Unsupported);
         }
         let capability = controller.read(16);
         controller.context_size = if capability & 4 != 0 { 64 } else { 32 };
+        let mut protocols = [0_u8; 33];
         let mut extended = ((capability >> 16) * 4) as usize;
         for _ in 0..64 {
             if extended == 0 {
@@ -286,9 +345,44 @@ impl Controller {
             }
             let cap = controller.read(extended);
             if cap & 255 == 1 {
+                controller.report(format_args!("XHCI ownership: requesting firmware handoff"));
                 controller.write(extended, cap | (1 << 24));
                 controller.wait_register(extended, 1 << 16, 0)?;
                 controller.write(extended + 4, 0);
+            } else if cap & 255 == 2 && read_only {
+                if extended + 16 > controller.registers.length {
+                    return Err(Error::Invalid);
+                }
+                let revision = (cap >> 24) as u8;
+                let range = controller.read(extended + 8);
+                let first = (range & 255) as usize;
+                let count = ((range >> 8) & 255) as usize;
+                let speeds = (range >> 28) as usize;
+                if first == 0
+                    || first + count > ports + 1
+                    || extended + 16 + speeds * 4 > controller.registers.length
+                {
+                    return Err(Error::Invalid);
+                }
+                let mut entries = [0; 15];
+                for (index, entry) in entries[..speeds].iter_mut().enumerate() {
+                    *entry = controller.read(extended + 16 + index * 4);
+                }
+                if policy::speeds(revision, &entries[..speeds]).is_ok() {
+                    for protocol in &mut protocols[first..first + count] {
+                        if *protocol != 0 {
+                            return Err(Error::Invalid);
+                        }
+                        *protocol = revision;
+                    }
+                } else {
+                    controller.report(format_args!(
+                        "XHCI protocol USB{revision}: speeds unsupported"
+                    ));
+                }
+                controller.report(format_args!(
+                    "XHCI protocol USB{revision}: ports {first}+{count}"
+                ));
             }
             let next = ((cap >> 8) & 255) as usize * 4;
             if next == 0 {
@@ -312,6 +406,16 @@ impl Controller {
         if capability & 1 == 0 && controller.dcbaa.physical(0) > u32::MAX as u64 {
             return Err(Error::Unsupported);
         }
+        if scratchpads != 0 {
+            let array = Page::new()?;
+            for index in 0..scratchpads {
+                let page = Page::new()?;
+                array.address(index * 8, page.physical(0));
+                controller.scratch[index] = Some(page);
+            }
+            controller.dcbaa.address(0, array.physical(0));
+            controller.scratch_array = Some(array);
+        }
         // The old firmware rings have been reset before granting bus mastering.
         // ERSTBA programming itself can cause the controller to read DMA memory.
         os::usb_enable_dma().map_err(|_| Error::Io)?;
@@ -330,21 +434,70 @@ impl Controller {
             "XHCI ready: ports={ports} context={}",
             controller.context_size
         ));
+        controller.report(format_args!(
+            "XHCI running: context={} scratchpads={scratchpads}",
+            controller.context_size
+        ));
         let mut count = 0;
-        for port in 1..=ports {
+        for (port, &protocol) in protocols.iter().enumerate().take(ports + 1).skip(1) {
             let offset = op + 0x400 + (port - 1) * 16;
-            let status = controller.read(offset);
+            let mut status = controller.read(offset);
+            if read_only && capability & 8 != 0 && status & (1 << 9) == 0 {
+                controller.write(offset, 1 << 9);
+                let deadline = Self::ticks() + 20;
+                while Self::ticks() < deadline {
+                    core::hint::spin_loop();
+                }
+                status = controller.read(offset);
+            }
             if status & 1 == 0 {
                 continue;
             }
+            if read_only {
+                controller.report(format_args!("USB PORT {port}: status={status:#010x}"));
+                if protocol == 0 {
+                    controller.report(format_args!("USB SKIP port={port}: unsupported protocol"));
+                    continue;
+                }
+            }
             if count == 3 {
+                if read_only {
+                    controller.report(format_args!("USB SKIP port={port}: three-device limit"));
+                    continue;
+                }
                 return Err(Error::Unsupported);
             }
             controller.write(offset, (status & (1 << 9)) | (1 << 4));
             controller.wait_register(offset, (1 << 4) | 3, 3)?;
             let speed = ((controller.read(offset) >> 10) & 15) as u8;
-            controller.enumerate(count, port as u8, speed)?;
+            match controller.enumerate(count, port as u8, speed) {
+                Ok(()) => (),
+                Err(Error::Unsupported) if read_only => {
+                    controller.report(format_args!("USB SKIP port={port}: unsupported device"));
+                    if let Some(device) = controller.devices[count].take() {
+                        controller.command(10, 0, device.slot)?;
+                        controller.dcbaa.address(device.slot as usize * 8, 0);
+                        controller.spare = Some(device);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    controller.report(format_args!("USB FAIL port={port}: {error:?}"));
+                    return Err(error);
+                }
+            }
+            if read_only && controller.devices[count].as_ref().unwrap().kind == Some(Kind::Storage)
+            {
+                controller.storage = count;
+                controller.initialize_disk()?;
+            }
             count += 1;
+        }
+        if read_only {
+            controller.report(format_args!(
+                "DIAGNOSTIC ENUMERATION: {count} supported devices"
+            ));
+            return Ok(controller);
         }
         if count != 3
             || controller
@@ -467,23 +620,35 @@ impl Controller {
         let packet = match speed {
             1 | 2 => 8,
             3 => 64,
-            4 => 512,
+            4 | 5 => 512,
             _ => return Err(Error::Unsupported),
         };
         let slot = self.command(9, 0, 0)?;
         if slot == 0 || slot > 3 {
             return Err(Error::Invalid);
         }
-        let device = Device {
-            slot,
-            port,
-            speed,
-            input: Page::new()?,
-            output: Page::new()?,
-            control: Ring::new()?,
-            buffer: Page::new()?,
-            kind: None,
-            pipes: core::array::from_fn(|_| None),
+        let device = if let Some(mut spare) = self.spare.take() {
+            spare.input.clear();
+            spare.output.clear();
+            spare.buffer.clear();
+            spare.control.reset();
+            spare.slot = slot;
+            spare.port = port;
+            spare.speed = speed;
+            spare.kind = None;
+            spare
+        } else {
+            Device {
+                slot,
+                port,
+                speed,
+                input: Page::new()?,
+                output: Page::new()?,
+                control: Ring::new()?,
+                buffer: Page::new()?,
+                kind: None,
+                pipes: core::array::from_fn(|_| None),
+            }
         };
         self.dcbaa
             .address(slot as usize * 8, device.output.physical(0));
@@ -519,7 +684,7 @@ impl Controller {
         if descriptor[0] != 18 || descriptor[1] != 1 || descriptor[4] == 9 {
             return Err(Error::Unsupported);
         }
-        let actual_packet = if speed == 4 {
+        let actual_packet = if speed >= 4 {
             if descriptor[7] != 9 {
                 return Err(Error::Unsupported);
             }
@@ -540,6 +705,11 @@ impl Controller {
             self.command(13, input, slot)?;
         }
         self.control(index, [0x80, 6, 0, 1, 0, 0, 18, 0], &mut descriptor)?;
+        self.report(format_args!(
+            "USB DEVICE port={port}: {:04x}:{:04x}",
+            u16::from_le_bytes([descriptor[8], descriptor[9]]),
+            u16::from_le_bytes([descriptor[10], descriptor[11]])
+        ));
         let mut bytes = [0; 512];
         self.control(index, [0x80, 6, 0, 2, 0, 0, 9, 0], &mut bytes[..9])?;
         let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
@@ -552,6 +722,15 @@ impl Controller {
             &mut bytes[..length],
         )?;
         let configuration = descriptors::parse(&bytes[..length])?;
+        if self.read_only
+            && self
+                .devices
+                .iter()
+                .flatten()
+                .any(|device| device.kind == Some(configuration.kind))
+        {
+            return Err(Error::Unsupported);
+        }
         self.configure(index, &configuration)?;
         self.control(index, [0, 9, configuration.value, 0, 0, 0, 0, 0], &mut [])?;
         if configuration.kind != Kind::Storage {
@@ -581,9 +760,19 @@ impl Controller {
             "USB ENUM PASS: slot={slot} port={port} {:?}",
             configuration.kind
         ));
+        self.report(format_args!(
+            "USB DEVICE READY: port={port} {:?}",
+            configuration.kind
+        ));
         Ok(())
     }
     fn configure(&mut self, index: usize, config: &Configuration) -> Result<()> {
+        if config.kind != Kind::Storage
+            && self.devices[index].as_ref().unwrap().speed >= 3
+            && config.input.interval > 16
+        {
+            return Err(Error::Unsupported);
+        }
         let mut maximum = config.input.index();
         if let Some(output) = config.output {
             maximum = maximum.max(output.index());
@@ -598,15 +787,20 @@ impl Controller {
             let Some(endpoint) = endpoint else {
                 continue;
             };
-            let pipe = Pipe::new(endpoint)?;
+            let pipe = if let Some(mut pipe) = device.pipes[i].take() {
+                pipe.ring.reset();
+                pipe.buffer.clear();
+                pipe.endpoint = endpoint;
+                pipe.pending = 0;
+                pipe
+            } else {
+                Pipe::new(endpoint)?
+            };
             let ep = endpoint.index();
             device.input.write(4, device.input.read(4) | 1 << ep);
             let interval = if config.kind == Kind::Storage {
                 0
             } else if speed >= 3 {
-                if endpoint.interval > 16 {
-                    return Err(Error::Unsupported);
-                }
                 endpoint.interval as u32 - 1
             } else {
                 32 - (endpoint.interval as u32 * 8 - 1).leading_zeros()
@@ -735,6 +929,11 @@ impl Controller {
             if port == 0 || port > (self.read(4) >> 24) as usize {
                 return Err(Error::Invalid);
             }
+            if self.read_only {
+                let offset = self.operational + 0x400 + (port - 1) * 16;
+                let status = self.read(offset);
+                self.write(offset, (status & (1 << 9)) | (status & 0x00fe0000));
+            }
             if self
                 .devices
                 .iter()
@@ -853,9 +1052,7 @@ impl Controller {
         Ok(())
     }
     fn scsi(&mut self, command: &[u8], input: bool, bytes: &mut [u8]) -> Result<()> {
-        if command.is_empty() || command.len() > 16 || bytes.len() > 512 {
-            return Err(Error::Invalid);
-        }
+        policy::scsi(self.read_only, command, input, bytes.len())?;
         self.tag = self.tag.checked_add(1).ok_or(Error::Io)?;
         let mut cbw = [0; 31];
         cbw[..4].copy_from_slice(&0x43425355_u32.to_le_bytes());
@@ -893,22 +1090,36 @@ impl Controller {
         }
         let mut capacity = [0; 8];
         self.scsi(&[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], true, &mut capacity)?;
-        self.sectors = u32::from_be_bytes(capacity[..4].try_into().unwrap())
-            .checked_add(1)
-            .ok_or(Error::Unsupported)?;
-        if u32::from_be_bytes(capacity[4..].try_into().unwrap()) != 512 || self.sectors != 32768 {
-            return Err(Error::Unsupported);
+        let (sectors, block) = policy::capacity(capacity, self.read_only)?;
+        self.sectors = sectors;
+        if self.read_only {
+            self.report(format_args!("USB DISK: sectors={sectors} block={block}"));
+            if block == 512 {
+                let mut sector = [0; 512];
+                let mut read = [0; 10];
+                read[0] = 0x28;
+                read[8] = 1;
+                self.scsi(&read, true, &mut sector)?;
+                self.report(format_args!(
+                    "USB READ PASS: sector0 signature={:02x}{:02x}",
+                    sector[510], sector[511]
+                ));
+            }
+            return Ok(());
         }
         os::debug_write("USB SCSI PASS: inquiry, readiness, 32768 sectors of 512 bytes").unwrap();
         Ok(())
     }
     pub fn disk_request(&mut self, request: &[u8], reply: &mut [u8; 512]) -> Result<usize> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.poisoned {
             return Err(Error::Io);
         }
         let result = match request {
             [0x13] => {
-                reply[..4].copy_from_slice(&self.sectors.to_le_bytes());
+                reply[..4].copy_from_slice(&(self.sectors as u32).to_le_bytes());
                 Ok(4)
             }
             [0x12] => self
@@ -920,7 +1131,7 @@ impl Controller {
                     return Err(Error::Invalid);
                 }
                 let sector = u32::from_le_bytes(address[..4].try_into().unwrap());
-                if sector >= self.sectors {
+                if u64::from(sector) >= self.sectors {
                     return Err(Error::Invalid);
                 }
                 let mut command = [0; 10];

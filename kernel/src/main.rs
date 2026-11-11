@@ -40,6 +40,10 @@ const _: () = match ACCEPTANCE_FEATURES {
     0 | 1 => (),
     _ => panic!("Select only one QEMU acceptance-test feature at a time"),
 };
+const _: () = assert!(
+    !cfg!(feature = "usb-diagnostic") || ACCEPTANCE_FEATURES == 0,
+    "USB diagnostics must not be combined with acceptance-test boot modes"
+);
 
 pub fn halt() -> ! {
     cpu_interrupts::disable();
