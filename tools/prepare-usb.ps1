@@ -122,7 +122,10 @@ function Invoke-ZosUsbPreparation {
     $root = Get-ZosUsbRoot $partition
     foreach ($file in $files) {
         $destination = Join-Path $root $file.Name
-        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
+        $parent = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            $null = New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop
+        }
         Copy-Item -LiteralPath $file.Path -Destination $destination -ErrorAction Stop
         if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne $file.Hash) {
             throw "USB readback checksum mismatch: $($file.Name)"

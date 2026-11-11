@@ -4,6 +4,7 @@ $root = Join-Path $PSScriptRoot "..\build\usb-script-test-$PID"
 $script:ZosPackage = Join-Path $root 'package'
 $script:Destination = Join-Path $root 'destination'
 $null = New-Item -ItemType Directory -Path $script:ZosPackage -Force
+$null = New-Item -ItemType Directory -Path $script:Destination -Force
 $names = @('EFI\BOOT\BOOTX64.EFI', 'limine.conf', 'boot\zos.elf', 'boot\console-server.elf', 'boot\input-server.elf')
 $hashes = @{}
 foreach ($name in $names) {
@@ -77,6 +78,14 @@ function Format-Volume {
 function Read-Host { param($Prompt) return $script:Answer }
 function Test-ZosAdministrator { return $true }
 function Get-ZosUsbRoot { param($Partition) return $script:Destination }
+function New-Item {
+    [CmdletBinding()]
+    param([string]$ItemType, [string]$Path, [switch]$Force)
+    if ([IO.Path]::GetFullPath($Path) -eq [IO.Path]::GetFullPath($script:Destination)) {
+        throw 'Attempted to recreate the existing USB drive root.'
+    }
+    & (Get-Command New-Item -CommandType Cmdlet) @PSBoundParameters
+}
 function Assert-True { param($Value, $Message) if (-not $Value) { throw $Message } }
 function Expect-Rejection {
     param([scriptblock]$Action, [string]$Message)
@@ -141,7 +150,7 @@ try {
     $script:Calls = @()
     Invoke-ZosUsbPreparation -DiskNumber 77 -Write
     Assert-True (($script:Calls -join ',') -eq 'refresh,partition,format') 'Retry on an already empty MBR disk failed'
-    Write-Output 'USB SCRIPT PASS: mocked targets, refusal/preview/identity/hash checks, verified file copy'
+    Write-Output 'USB SCRIPT PASS: mocked targets, refusal/preview/identity/hash checks, drive-root handling, verified file copy'
 } finally {
     $resolved = (Get-Item -LiteralPath $root).FullName
     if ((Split-Path -Leaf $resolved) -ne "usb-script-test-$PID") { throw 'Unexpected test cleanup path' }
