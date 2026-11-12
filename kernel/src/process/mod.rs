@@ -1037,7 +1037,11 @@ fn start_console() -> ! {
         (
             "input-server",
             1,
-            if cfg!(feature = "usb") { 0 } else { 6 },
+            if cfg!(feature = "usb") && !cfg!(feature = "usb-diagnostic") {
+                0
+            } else {
+                6
+            },
             if cfg!(feature = "usb") {
                 1
             } else {

@@ -70,24 +70,16 @@ fn discover() -> Result<(u32, u64, u64), Error> {
                 }
                 let identity = read(device, 0);
                 crate::logln!("PCI XHCI FOUND: bdf={:#x} id={:#010x}", device, identity);
-                if cfg!(feature = "usb-diagnostic")
-                    && identity != 0x000d_1b36
-                    && identity != 0x4ded_8086
-                {
-                    crate::logln!("PCI XHCI SKIP: unsupported controller");
-                    continue;
-                }
-                if found.replace(device).is_some() {
-                    return Err(Error::Limit);
+                if found.is_none() {
+                    found = Some(device);
+                } else {
+                    crate::logln!("PCI XHCI SKIP: additional controller; using first PCI match");
                 }
             }
         }
     }
     let device = found.ok_or(Error::Invalid)?;
-    let identity = read(device, 0);
-    if (identity != 0x000d_1b36 && !(cfg!(feature = "usb-diagnostic") && identity == 0x4ded_8086))
-        || read(device, 12) & 0x7f0000 != 0
-    {
+    if read(device, 12) & 0x7f0000 != 0 {
         return Err(Error::Denied);
     }
     let saved = read(device, 4) as u16;
@@ -186,7 +178,7 @@ impl Scheduler {
             if process.usb.device.is_none() {
                 return Err(Error::Denied);
             }
-            if process.usb.pages == 64 {
+            if process.usb.pages == zos_libos::USB_DMA_PAGES {
                 return Err(Error::Limit);
             }
             let base = 0x3000_0000 + process.usb.pages * PAGE_SIZE;

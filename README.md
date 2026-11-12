@@ -5,6 +5,19 @@ A single-core x86-64 microkernel project following the supplied
 
 ## Current checkpoint
 
+**Integration status:** `main` also preserves unfinished generic-PC USB/input
+work. Its host tests and targeted Clippy checks pass, but its native/hardware
+acceptance and source/license/organizational policy gate are unresolved. Do not treat
+it as an accepted replacement for the existing diagnostic USB package.
+See the root [project plan and execution record](MICROKERNEL_OS_PLAN.md) for
+completed phases, all research, outstanding checks and deferred implementation
+prompts. The checkpoint descriptions below document the last accepted baseline.
+
+Generated boot images, executables, USB staging binaries, and build caches were
+removed at the user's cleanup request. Source/Git history, portable tools, data
+disks, screenshots and test evidence remain; the retained USB manifest is
+historical metadata, not a complete ready-to-copy package.
+
 - Step 1: workspace and local Git repository created; tagged `phase-1`.
 - Step 0: portable Rust, MinGW, QEMU, and Limine installed and validated.
 - Step 2: compiled and boot-tested in **both BIOS and UEFI**. Includes COM1,

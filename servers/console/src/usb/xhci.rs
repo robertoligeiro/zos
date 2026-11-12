@@ -1,7 +1,8 @@
 use super::{
     descriptors::{self, Configuration, Endpoint, Kind},
     hid::BootKeyboard,
-    policy, Error, Event, Result,
+    policy::{self, Protocol, Speed},
+    Error, Event, Result,
 };
 use core::sync::atomic::{fence, Ordering};
 use zos_libos as os;
@@ -155,6 +156,13 @@ struct Device {
     slot: u8,
     port: u8,
     speed: u8,
+    speed_kind: Speed,
+    protocol: Protocol,
+    route: u32,
+    tt: u32,
+    hub_ports: u8,
+    hub_multi_tt: bool,
+    hub_think_time: u32,
     input: Page,
     output: Page,
     control: Ring,
@@ -203,7 +211,8 @@ pub struct Controller {
     event_cycle: u32,
     event_wraps: usize,
     commands: Ring,
-    devices: [Option<Device>; 3],
+    devices: [Option<Device>; os::USB_MAX_DEVICES],
+    max_slots: u8,
     spare: Option<Device>,
     keyboard: BootKeyboard,
     queue: [Option<Event>; 64],
@@ -323,6 +332,7 @@ impl Controller {
             event_wraps: 0,
             commands: Ring::new()?,
             devices: core::array::from_fn(|_| None),
+            max_slots: (structural & 255).min(os::USB_MAX_DEVICES as u32) as u8,
             spare: None,
             keyboard: BootKeyboard::default(),
             queue: [None; 64],
@@ -338,20 +348,19 @@ impl Controller {
         controller.runtime = (controller.read(24) & !31) as usize;
         controller.doorbells = (controller.read(20) & !3) as usize;
         if controller.operational < 32
-            || structural & 255 < 3
-            || !(1..=32).contains(&ports)
+            || controller.max_slots == 0
+            || ports == 0
             || controller.operational + 0x400 + ports * 16 > controller.registers.length
             || controller.runtime < 32
             || controller.runtime + 0x40 > controller.registers.length
             || controller.doorbells < 32
             || controller.doorbells + 256 * 4 > controller.registers.length
-            || (!read_only && scratchpads != 0)
         {
             return Err(Error::Unsupported);
         }
         let capability = controller.read(16);
         controller.context_size = if capability & 4 != 0 { 64 } else { 32 };
-        let mut protocols = [0_u8; 33];
+        let mut protocols = [None; 256];
         let mut extended = ((capability >> 16) * 4) as usize;
         for _ in 0..64 {
             if extended == 0 {
@@ -366,7 +375,7 @@ impl Controller {
                 controller.write(extended, cap | (1 << 24));
                 controller.wait_register(extended, 1 << 16, 0)?;
                 controller.write(extended + 4, 0);
-            } else if cap & 255 == 2 && read_only {
+            } else if cap & 255 == 2 {
                 if extended + 16 > controller.registers.length {
                     return Err(Error::Invalid);
                 }
@@ -375,7 +384,8 @@ impl Controller {
                 let first = (range & 255) as usize;
                 let count = ((range >> 8) & 255) as usize;
                 let speeds = (range >> 28) as usize;
-                if first == 0
+                if controller.read(extended + 4) != 0x2042_5355
+                    || first == 0
                     || first + count > ports + 1
                     || extended + 16 + speeds * 4 > controller.registers.length
                 {
@@ -385,17 +395,19 @@ impl Controller {
                 for (index, entry) in entries[..speeds].iter_mut().enumerate() {
                     *entry = controller.read(extended + 16 + index * 4);
                 }
-                if policy::speeds(revision, &entries[..speeds]).is_ok() {
+                let slot_type = (controller.read(extended + 12) & 31) as u8;
+                if let Ok(mapping) = policy::speeds(revision, slot_type, &entries[..speeds]) {
                     for protocol in &mut protocols[first..first + count] {
-                        if *protocol != 0 {
+                        if protocol.is_some() {
                             return Err(Error::Invalid);
                         }
-                        *protocol = revision;
+                        *protocol = Some(mapping);
                     }
                 } else {
                     controller.report(format_args!(
                         "XHCI protocol USB{revision}: speeds unsupported"
                     ));
+                    controller.report(format_args!("XHCI PSI: {:?}", &entries[..speeds]));
                 }
                 controller.report(format_args!(
                     "XHCI protocol USB{revision}: ports {first}+{count}"
@@ -438,7 +450,7 @@ impl Controller {
         os::usb_enable_dma().map_err(|_| Error::Io)?;
         controller.address(op + 0x30, controller.dcbaa.physical(0));
         controller.address(op + 0x18, controller.commands.page.physical(0) | 1);
-        controller.write(op + 0x38, 3);
+        controller.write(op + 0x38, controller.max_slots as u32);
         controller._erst.address(0, controller.events.physical(0));
         controller._erst.write(8, 256);
         controller.write(controller.runtime + 0x28, 1);
@@ -455,41 +467,56 @@ impl Controller {
             "XHCI running: context={} scratchpads={scratchpads}",
             controller.context_size
         ));
+        if capability & 8 != 0 {
+            for port in 1..=ports {
+                let offset = op + 0x400 + (port - 1) * 16;
+                if controller.read(offset) & (1 << 9) == 0 {
+                    controller.write(offset, 1 << 9);
+                }
+            }
+        }
+        let deadline = Self::ticks() + 20;
+        while Self::ticks() < deadline {
+            core::hint::spin_loop();
+        }
         let mut count = 0;
         for (port, &protocol) in protocols.iter().enumerate().take(ports + 1).skip(1) {
             let offset = op + 0x400 + (port - 1) * 16;
-            let mut status = controller.read(offset);
-            if read_only && capability & 8 != 0 && status & (1 << 9) == 0 {
-                controller.write(offset, 1 << 9);
-                let deadline = Self::ticks() + 20;
-                while Self::ticks() < deadline {
-                    core::hint::spin_loop();
-                }
-                status = controller.read(offset);
-            }
+            let status = controller.read(offset);
             if status & 1 == 0 {
                 continue;
             }
             if read_only {
                 controller.report(format_args!("USB PORT {port}: status={status:#010x}"));
-                if protocol == 0 {
-                    controller.report(format_args!("USB SKIP port={port}: unsupported protocol"));
-                    continue;
-                }
             }
-            if count == 3 {
+            let Some(protocol) = protocol else {
+                controller.report(format_args!("USB SKIP port={port}: unsupported protocol"));
+                continue;
+            };
+            if count == controller.max_slots as usize {
                 if read_only {
-                    controller.report(format_args!("USB SKIP port={port}: three-device limit"));
+                    controller.report(format_args!("USB SKIP port={port}: device-slot limit"));
                     continue;
                 }
                 return Err(Error::Unsupported);
             }
-            controller.write(offset, (status & (1 << 9)) | (1 << 4));
-            controller.wait_register(offset, (1 << 4) | 3, 3)?;
+            if protocol.revision == 2 || status & 2 == 0 {
+                let reset = if protocol.revision == 3 {
+                    1 << 31
+                } else {
+                    1 << 4
+                };
+                controller.write(offset, (status & (1 << 9)) | reset);
+                controller.wait_register(offset, (1 << 31) | (1 << 4) | 3, 3)?;
+            }
+            controller.write(
+                offset,
+                (controller.read(offset) & 0x00fe_0000) | (status & (1 << 9)),
+            );
             let speed = ((controller.read(offset) >> 10) & 15) as u8;
-            match controller.enumerate(count, port as u8, speed) {
+            match controller.enumerate(count, port as u8, speed, protocol, 0, 0) {
                 Ok(()) => (),
-                Err(Error::Unsupported) if read_only => {
+                Err(Error::Unsupported) => {
                     controller.report(format_args!("USB SKIP port={port}: unsupported device"));
                     if let Some(device) = controller.devices[count].take() {
                         controller.command(10, 0, device.slot)?;
@@ -510,38 +537,33 @@ impl Controller {
             }
             count += 1;
         }
+        let mut hub = 0;
+        while hub < count {
+            if controller.devices[hub].as_ref().unwrap().kind == Some(Kind::Hub) {
+                controller.enumerate_hub(hub, &mut count)?;
+            }
+            hub += 1;
+        }
         if read_only {
             controller.report(format_args!(
                 "DIAGNOSTIC ENUMERATION: {count} supported devices"
             ));
             return Ok(controller);
         }
-        if count != 3
-            || controller
-                .devices
-                .iter()
-                .filter(|d| d.as_ref().unwrap().kind == Some(Kind::Keyboard))
-                .count()
-                != 1
-            || controller
-                .devices
-                .iter()
-                .filter(|d| d.as_ref().unwrap().kind == Some(Kind::Mouse))
-                .count()
-                != 1
-            || controller
-                .devices
-                .iter()
-                .filter(|d| d.as_ref().unwrap().kind == Some(Kind::Storage))
-                .count()
-                != 1
+        if controller
+            .devices
+            .iter()
+            .flatten()
+            .filter(|d| d.kind == Some(Kind::Storage))
+            .count()
+            != 1
         {
             return Err(Error::Unsupported);
         }
         controller.storage = controller
             .devices
             .iter()
-            .position(|d| d.as_ref().unwrap().kind == Some(Kind::Storage))
+            .position(|d| d.as_ref().is_some_and(|d| d.kind == Some(Kind::Storage)))
             .unwrap();
         controller.initialize_disk()?;
         os::debug_write("USB ready: boot HID keyboard/mouse, bulk-only SCSI storage").unwrap();
@@ -586,6 +608,14 @@ impl Controller {
         let deadline = Self::ticks() + 500;
         loop {
             if let Some(event) = self.next_completion()? {
+                if kind == 32
+                    && event.kind() == 32
+                    && event.slot() == slot
+                    && event.endpoint() == endpoint
+                    && !matches!(event.code(), 1 | 13)
+                {
+                    return Err(Error::Completion(event.code()));
+                }
                 if event.kind() == kind
                     && event.parameter & !15 == parameter
                     && (kind == 33 || (event.slot() == slot && event.endpoint() == endpoint))
@@ -633,15 +663,23 @@ impl Controller {
             page.write(index * self.context_size + word * 4, value);
         }
     }
-    fn enumerate(&mut self, index: usize, port: u8, speed: u8) -> Result<()> {
-        let packet = match speed {
-            1 | 2 => 8,
-            3 => 64,
-            4 | 5 => 512,
-            _ => return Err(Error::Unsupported),
-        };
-        let slot = self.command(9, 0, 0)?;
-        if slot == 0 || slot > 3 {
+    fn enumerate(
+        &mut self,
+        index: usize,
+        port: u8,
+        speed: u8,
+        protocol: Protocol,
+        route: u32,
+        tt: u32,
+    ) -> Result<()> {
+        let speed_kind = protocol.speed(speed)?;
+        let packet = speed_kind.packet();
+        let physical = self
+            .commands
+            .push(0, 0, (9 << 10) | (protocol.slot_type as u32) << 16);
+        self.write(self.doorbells, 0);
+        let slot = self.wait(33, physical, 0, 0)?.slot();
+        if slot == 0 || slot > self.max_slots {
             return Err(Error::Invalid);
         }
         let device = if let Some(mut spare) = self.spare.take() {
@@ -652,6 +690,13 @@ impl Controller {
             spare.slot = slot;
             spare.port = port;
             spare.speed = speed;
+            spare.speed_kind = speed_kind;
+            spare.protocol = protocol;
+            spare.route = route;
+            spare.tt = tt;
+            spare.hub_ports = 0;
+            spare.hub_multi_tt = false;
+            spare.hub_think_time = 0;
             spare.kind = None;
             spare
         } else {
@@ -659,6 +704,13 @@ impl Controller {
                 slot,
                 port,
                 speed,
+                speed_kind,
+                protocol,
+                route,
+                tt,
+                hub_ports: 0,
+                hub_multi_tt: false,
+                hub_think_time: 0,
                 input: Page::new()?,
                 output: Page::new()?,
                 control: Ring::new()?,
@@ -674,9 +726,9 @@ impl Controller {
             &device.input,
             1,
             [
-                (1 << 27) | (speed as u32) << 20,
+                (1 << 27) | (speed as u32) << 20 | route | ((tt >> 6) & (1 << 25)),
                 (port as u32) << 16,
-                0,
+                tt & 0x3ffff,
                 0,
                 0,
             ],
@@ -698,10 +750,10 @@ impl Controller {
         self.command(11, input, slot)?;
         let mut descriptor = [0; 18];
         self.control(index, [0x80, 6, 0, 1, 0, 0, 8, 0], &mut descriptor[..8])?;
-        if descriptor[0] != 18 || descriptor[1] != 1 || descriptor[4] == 9 {
+        if descriptor[0] != 18 || descriptor[1] != 1 {
             return Err(Error::Unsupported);
         }
-        let actual_packet = if speed >= 4 {
+        let actual_packet = if speed_kind == Speed::Super {
             if descriptor[7] != 9 {
                 return Err(Error::Unsupported);
             }
@@ -723,7 +775,7 @@ impl Controller {
         }
         self.control(index, [0x80, 6, 0, 1, 0, 0, 18, 0], &mut descriptor)?;
         self.report(format_args!(
-            "USB DEVICE port={port}: {:04x}:{:04x}",
+            "USB DEVICE port={port} route={route:#x} speed-id={speed} {speed_kind:?}: {:04x}:{:04x}",
             u16::from_le_bytes([descriptor[8], descriptor[9]]),
             u16::from_le_bytes([descriptor[10], descriptor[11]])
         ));
@@ -739,7 +791,7 @@ impl Controller {
             &mut bytes[..length],
         )?;
         let configuration = descriptors::parse(&bytes[..length])?;
-        if self.read_only
+        if configuration.kind != Kind::Hub
             && self
                 .devices
                 .iter()
@@ -748,30 +800,80 @@ impl Controller {
         {
             return Err(Error::Unsupported);
         }
+        let hub_delay = if configuration.kind == Kind::Hub {
+            self.initialize_hub(index, configuration.hub_multi_tt)?
+        } else {
+            0
+        };
         self.configure(index, &configuration)?;
         self.control(index, [0, 9, configuration.value, 0, 0, 0, 0, 0], &mut [])?;
-        if configuration.kind != Kind::Storage {
+        if configuration.alternate != 0 {
+            self.control(
+                index,
+                [
+                    1,
+                    11,
+                    configuration.alternate,
+                    0,
+                    configuration.interface,
+                    0,
+                    0,
+                    0,
+                ],
+                &mut [],
+            )?;
+        }
+        self.report(format_args!(
+            "USB INTERFACE: {} alternate={} of {} interfaces",
+            configuration.interface, configuration.alternate, bytes[4]
+        ));
+        if matches!(configuration.kind, Kind::Keyboard | Kind::Mouse) {
             self.control(
                 index,
                 [0x21, 0x0b, 0, 0, configuration.interface, 0, 0, 0],
                 &mut [],
             )?;
-            self.control(
+            let idle = self.control(
                 index,
                 [0x21, 0x0a, 0, 0, configuration.interface, 0, 0, 0],
                 &mut [],
-            )?;
+            );
+            if idle == Err(Error::Completion(6)) {
+                self.recover_control(index)?;
+                self.report(format_args!("USB HID: optional SET_IDLE stalled"));
+            } else {
+                idle?;
+            }
             self.post_hid(index);
-        } else {
+        } else if configuration.kind == Kind::Storage {
             let mut lun = [0];
-            self.control(
+            let result = self.control(
                 index,
                 [0xa1, 0xfe, 0, 0, configuration.interface, 0, 1, 0],
                 &mut lun,
-            )?;
-            if lun[0] != 0 {
-                return Err(Error::Unsupported);
+            );
+            if result == Err(Error::Completion(6)) {
+                self.recover_control(index)?;
+                self.report(format_args!(
+                    "USB STORAGE: GET_MAX_LUN stalled; using LUN 0"
+                ));
+            } else {
+                result?;
+                self.report(format_args!(
+                    "USB STORAGE: max LUN {}; selecting LUN 0",
+                    lun[0]
+                ));
             }
+        } else {
+            let ports = self.devices[index].as_ref().unwrap().hub_ports;
+            for port in 1..=ports {
+                self.control(index, [0x23, 3, 8, 0, port, 0, 0, 0], &mut [])?;
+            }
+            let deadline = Self::ticks() + hub_delay;
+            while Self::ticks() < deadline {
+                core::hint::spin_loop();
+            }
+            self.report(format_args!("USB HUB READY: slot={slot} ports={ports}"));
         }
         crate::log(format_args!(
             "USB ENUM PASS: slot={slot} port={port} {:?}",
@@ -785,13 +887,21 @@ impl Controller {
     }
     fn configure(&mut self, index: usize, config: &Configuration) -> Result<()> {
         if config.kind != Kind::Storage
-            && self.devices[index].as_ref().unwrap().speed >= 3
+            && matches!(
+                self.devices[index].as_ref().unwrap().speed_kind,
+                Speed::High | Speed::Super
+            )
             && config.input.interval > 16
         {
             return Err(Error::Unsupported);
         }
+        let output = if config.kind == Kind::Storage {
+            config.output
+        } else {
+            None
+        };
         let mut maximum = config.input.index();
-        if let Some(output) = config.output {
+        if let Some(output) = output {
             maximum = maximum.max(output.index());
         }
         let device = self.devices[index].as_mut().unwrap();
@@ -799,11 +909,14 @@ impl Controller {
         device.input.write(0, 0);
         device.input.write(4, 1);
         let (slot, input) = (device.slot, device.input.physical(0));
-        let (speed, port) = (device.speed, device.port);
-        for (i, endpoint) in [Some(config.input), config.output].into_iter().enumerate() {
+        let (speed, port, speed_kind) = (device.speed, device.port, device.speed_kind);
+        for (i, endpoint) in [Some(config.input), output].into_iter().enumerate() {
             let Some(endpoint) = endpoint else {
                 continue;
             };
+            if speed_kind == Speed::Super && !endpoint.companion {
+                return Err(Error::Invalid);
+            }
             let pipe = if let Some(mut pipe) = device.pipes[i].take() {
                 pipe.ring.reset();
                 pipe.buffer.clear();
@@ -817,7 +930,7 @@ impl Controller {
             device.input.write(4, device.input.read(4) | 1 << ep);
             let interval = if config.kind == Kind::Storage {
                 0
-            } else if speed >= 3 {
+            } else if matches!(speed_kind, Speed::High | Speed::Super) {
                 endpoint.interval as u32 - 1
             } else {
                 32 - (endpoint.interval as u32 * 8 - 1).leading_zeros()
@@ -830,7 +943,17 @@ impl Controller {
             } else {
                 2
             };
-            let payload = endpoint.packet as u32 * (endpoint.burst as u32 + 1);
+            let payload = if speed_kind == Speed::Super && config.kind != Kind::Storage {
+                if endpoint.bytes_per_interval == 0
+                    || endpoint.bytes_per_interval as u32
+                        > endpoint.packet as u32 * (endpoint.burst as u32 + 1)
+                {
+                    return Err(Error::Invalid);
+                }
+                endpoint.bytes_per_interval as u32
+            } else {
+                endpoint.packet as u32 * (endpoint.burst as u32 + 1)
+            };
             let words = [
                 interval << 16,
                 (endpoint.packet as u32) << 16 | (endpoint.burst as u32) << 8 | typ << 3 | 6,
@@ -849,19 +972,156 @@ impl Controller {
             }
             device.pipes[i] = Some(pipe);
         }
-        let page = &self.devices[index].as_ref().unwrap().input;
+        let device = self.devices[index].as_ref().unwrap();
+        let page = &device.input;
+        let hub_flags = if config.kind == Kind::Hub {
+            (1 << 26) | if device.hub_multi_tt { 1 << 25 } else { 0 }
+        } else {
+            0
+        };
         self.context(
             page,
             1,
             [
-                (maximum as u32) << 27 | (speed as u32) << 20,
-                (port as u32) << 16,
-                0,
+                hub_flags
+                    | (maximum as u32) << 27
+                    | (speed as u32) << 20
+                    | self.devices[index].as_ref().unwrap().route
+                    | ((self.devices[index].as_ref().unwrap().tt >> 6) & (1 << 25)),
+                (port as u32) << 16 | (device.hub_ports as u32) << 24,
+                (device.tt & 0xffff) | device.hub_think_time << 16,
                 0,
                 0,
             ],
         );
         self.command(12, input, slot)?;
+        Ok(())
+    }
+    fn initialize_hub(&mut self, index: usize, multi_tt: bool) -> Result<u64> {
+        let super_speed = self.devices[index].as_ref().unwrap().speed_kind == Speed::Super;
+        // SuperSpeed hubs require a separate depth/latency policy; reject before child addressing.
+        if super_speed {
+            return Err(Error::Unsupported);
+        }
+        let mut descriptor = [0; 7];
+        self.control(index, [0xa0, 6, 0, 0x29, 0, 0, 7, 0], &mut descriptor)?;
+        let ports = descriptor[2];
+        if descriptor[0] < 7 || descriptor[1] != 0x29 || !(1..=15).contains(&ports) {
+            return Err(Error::Unsupported);
+        }
+        let device = self.devices[index].as_mut().unwrap();
+        device.hub_ports = ports;
+        device.hub_multi_tt = multi_tt;
+        let characteristics = u16::from_le_bytes([descriptor[3], descriptor[4]]);
+        device.hub_think_time = if device.speed_kind == Speed::High {
+            (characteristics as u32 >> 5) & 3
+        } else {
+            0
+        };
+        Ok((descriptor[5] as u64 * 2).div_ceil(10).max(20))
+    }
+    fn hub_status(&mut self, index: usize, port: u8) -> Result<u16> {
+        let mut status = [0; 4];
+        self.control(index, [0xa3, 0, 0, 0, port, 0, 4, 0], &mut status)?;
+        Ok(u16::from_le_bytes([status[0], status[1]]))
+    }
+    fn enumerate_hub(&mut self, index: usize, count: &mut usize) -> Result<()> {
+        let parent = self.devices[index].as_ref().unwrap();
+        let (root, route, protocol, ports, parent_slot, parent_speed, parent_tt, multi_tt) = (
+            parent.port,
+            parent.route,
+            parent.protocol,
+            parent.hub_ports,
+            parent.slot,
+            parent.speed_kind,
+            parent.tt,
+            parent.hub_multi_tt,
+        );
+        let depth = (32 - route.leading_zeros()).div_ceil(4);
+        if depth >= 5 {
+            return Err(Error::Unsupported);
+        }
+        for port in 1..=ports {
+            if self.hub_status(index, port)? & 1 == 0 {
+                continue;
+            }
+            if *count == self.max_slots as usize {
+                self.report(format_args!(
+                    "USB HUB SKIP: slot={parent_slot} port={port} device-slot limit"
+                ));
+                continue;
+            }
+            self.control(index, [0x23, 3, 4, 0, port, 0, 0, 0], &mut [])?;
+            let deadline = Self::ticks() + 100;
+            let status = loop {
+                let status = self.hub_status(index, port)?;
+                if status & 0x13 == 3 {
+                    break status;
+                }
+                if Self::ticks() >= deadline {
+                    return Err(Error::Timeout);
+                }
+            };
+            self.control(index, [0x23, 1, 20, 0, port, 0, 0, 0], &mut [])?;
+            let kind = if status & (1 << 9) != 0 {
+                Speed::Low
+            } else if status & (1 << 10) != 0 {
+                Speed::High
+            } else {
+                Speed::Full
+            };
+            let speed = protocol
+                .speeds
+                .iter()
+                .position(|speed| *speed == Some(kind))
+                .ok_or(Error::Unsupported)? as u8;
+            let tt = if matches!(kind, Speed::Low | Speed::Full) && parent_speed == Speed::High {
+                parent_slot as u32 | (port as u32) << 8 | if multi_tt { 1 << 31 } else { 0 }
+            } else {
+                parent_tt
+            };
+            let child_route = route | (port as u32) << (depth * 4);
+            match self.enumerate(*count, root, speed, protocol, child_route, tt) {
+                Ok(()) => {
+                    if self.read_only
+                        && self.devices[*count].as_ref().unwrap().kind == Some(Kind::Storage)
+                    {
+                        self.storage = *count;
+                        self.initialize_disk()?;
+                    }
+                    *count += 1;
+                }
+                Err(Error::Unsupported) => {
+                    self.discard_device(*count)?;
+                    self.report(format_args!(
+                        "USB HUB SKIP: slot={parent_slot} port={port} unsupported device"
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    fn discard_device(&mut self, index: usize) -> Result<()> {
+        if let Some(device) = self.devices[index].take() {
+            self.command(10, 0, device.slot)?;
+            self.dcbaa.address(device.slot as usize * 8, 0);
+            self.spare = Some(device);
+        }
+        Ok(())
+    }
+    fn recover_control(&mut self, index: usize) -> Result<()> {
+        let device = self.devices[index].as_ref().unwrap();
+        let slot = device.slot;
+        let dequeue =
+            device.control.page.physical(device.control.index * 16) | device.control.cycle as u64;
+        for (kind, parameter) in [(14, 0), (16, dequeue)] {
+            let physical =
+                self.commands
+                    .push(parameter, 0, kind << 10 | 1 << 16 | (slot as u32) << 24);
+            self.write(self.doorbells, 0);
+            self.wait(33, physical, 0, 0)?;
+        }
         Ok(())
     }
     fn control(&mut self, index: usize, setup: [u8; 8], bytes: &mut [u8]) -> Result<()> {

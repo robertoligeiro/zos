@@ -47,6 +47,23 @@ class UsbTests(unittest.TestCase):
             for name, digest in manifest["files"].items():
                 self.assertEqual(hashlib.sha256((package / name).read_bytes()).hexdigest(), digest)
 
+    def test_generic_topologies_preserve_read_only_media_and_route_devices(self):
+        disk = BUILD / "zos-diagnostic.img"
+        for case in ("usb2", "superspeed", "nec", "hub", "integrated", "no-ps2"):
+            command = diagnostic_command(disk, "bios", case)
+            self.assertTrue(any("id=diagnostic-boot,readonly=on" in part for part in command))
+            if case == "hub":
+                for name, port in (("usb-kbd", "1.1"), ("usb-mouse", "1.2"), ("usb-storage", "1.3")):
+                    self.assertTrue(any(part.startswith(name + ",") and f"port={port}" in part for part in command))
+            elif case == "integrated":
+                self.assertFalse(any(part.startswith(("usb-kbd,", "usb-mouse,")) for part in command))
+            elif case == "usb2":
+                self.assertIn("qemu-xhci,id=xhci,p3=0", command)
+            elif case == "nec":
+                self.assertIn("nec-usb-xhci,id=xhci", command)
+            elif case == "no-ps2":
+                self.assertIn("pc,i8042=off", command)
+
     def test_usb_disk_is_not_attached_as_ata(self):
         data = BUILD / "data-usb.img"
         with patch("zos.validate_disk"):

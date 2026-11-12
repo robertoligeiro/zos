@@ -1,8 +1,12 @@
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod editor;
 pub mod keyboard;
 pub mod mouse;
+pub mod ps2;
 pub mod terminal;
 pub mod usb;
 

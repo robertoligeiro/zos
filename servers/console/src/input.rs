@@ -155,9 +155,28 @@ pub extern "C" fn _start(role: usize) -> ! {
 }
 
 fn diagnostic_input() -> ! {
-    use zos_console::keyboard::Key;
     use zos_console::usb::{Controller, Error, Event};
     diagnostic(format_args!("ZOS USB DIAGNOSTIC: storage writes disabled"));
+    os::io_port_grant(0x60, 1).unwrap();
+    os::io_port_grant(0x64, 1).unwrap();
+    let mut legacy_bus = LegacyBus;
+    let mut legacy = match ps2::initialize(&mut legacy_bus) {
+        Ok(devices) => {
+            diagnostic(format_args!(
+                "INTEGRATED PS2: keyboard={:?} mouse={:?}",
+                devices.keyboard, devices.mouse
+            ));
+            Some(devices)
+        }
+        Err(error) => {
+            diagnostic(format_args!(
+                "INTEGRATED PS2 UNAVAILABLE: {error:?}; I2C/SPI HID not implemented"
+            ));
+            None
+        }
+    };
+    let mut keyboard = Keyboard::default();
+    let mut mouse = Mouse::default();
     let result = Controller::diagnostic();
     let mut controller = match result {
         Ok(controller) => controller,
@@ -185,6 +204,31 @@ fn diagnostic_input() -> ! {
             continue;
         }
         assert_eq!(length, 8);
+        if let Some(devices) = &legacy {
+            let result = ps2::drain(&mut legacy_bus, |auxiliary, byte| {
+                if auxiliary {
+                    if devices.mouse.is_ok() {
+                        if let Some(motion) = mouse.feed(byte) {
+                            let (x, y) = (motion.dx.to_le_bytes(), motion.dy.to_le_bytes());
+                            os::send(
+                                CONSOLE,
+                                &[POINTER, x[0], x[1], y[0], y[1], motion.buttons],
+                                &mut [],
+                            )
+                            .unwrap();
+                        }
+                    }
+                } else if devices.keyboard.is_ok() {
+                    if let Some(key) = keyboard.feed(byte) {
+                        diagnostic_key(key);
+                    }
+                }
+            });
+            if let Err(error) = result {
+                diagnostic(format_args!("INTEGRATED PS2 OFFLINE: {error:?}"));
+                legacy = None;
+            }
+        }
         if let Err(error) = controller.poll() {
             diagnostic(format_args!(
                 "DIAGNOSTIC OFFLINE: {error:?}; restart required"
@@ -194,13 +238,7 @@ fn diagnostic_input() -> ! {
         while let Some(event) = controller.event() {
             match event {
                 Event::Key(key) => {
-                    match key {
-                        Key::Character(byte) => output(&[byte]),
-                        Key::Enter => output(b"\n"),
-                        Key::Clear => os::send(CONSOLE, &[CLEAR], &mut []).map(|_| ()).unwrap(),
-                        _ => (),
-                    }
-                    log(format_args!("DIAGNOSTIC KEY: {key:?}"));
+                    diagnostic_key(key);
                 }
                 Event::Pointer { dx, dy, buttons } => {
                     let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
@@ -215,6 +253,33 @@ fn diagnostic_input() -> ! {
             controller.consume_event();
         }
     }
+}
+
+struct LegacyBus;
+impl ps2::Bus for LegacyBus {
+    fn read(&mut self, port: u16) -> u8 {
+        read(port)
+    }
+    fn write(&mut self, port: u16, value: u8) {
+        // SAFETY: diagnostic input holds grants for the two i8042 ports only.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
+        }
+    }
+    fn ticks(&self) -> u64 {
+        os::usb_ticks().unwrap()
+    }
+}
+
+fn diagnostic_key(key: keyboard::Key) {
+    use keyboard::Key;
+    match key {
+        Key::Character(byte) => output(&[byte]),
+        Key::Enter => output(b"\n"),
+        Key::Clear => os::send(CONSOLE, &[CLEAR], &mut []).map(|_| ()).unwrap(),
+        _ => (),
+    }
+    log(format_args!("DIAGNOSTIC KEY: {key:?}"));
 }
 
 fn usb_input(test: bool) -> ! {
@@ -235,7 +300,7 @@ fn usb_input(test: bool) -> ! {
             os::raw(os::Call::UsbDmaPage as u64, [u64::MAX, 16, 0, 0, 0])
         };
         assert_eq!(bad_address, -(os::Error::BadAddress as i64));
-        for _ in 0..64 {
+        for _ in 0..os::USB_DMA_PAGES {
             match os::usb_dma_page() {
                 Ok(_) => (),
                 Err(error) => {

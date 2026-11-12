@@ -411,21 +411,40 @@ def wait_serial(process, log: Path, marker: str, timeout: int, *, start: int = 0
 
 def diagnostic_command(disk: Path, firmware: str, case: str = "normal") -> list[str]:
     command = qemu_command(disk, firmware, usb=case != "no-controller")
-    if case in ("normal", "read-only-media"):
+    storage_cases = ("normal", "read-only-media", "usb2", "superspeed", "nec", "hub", "integrated", "no-ps2")
+    if case in storage_cases:
         if case == "normal":
             index = command.index("-drive")
             del command[index:index + 2]
         # Bundled EDK2's USB mass-storage driver faults on a write-protected medium.
         protection = "snapshot=on" if case == "normal" and firmware == "uefi" else "readonly=on"
         command += ["-drive", f"file={disk},format=raw,if=none,id=diagnostic-boot,{protection}"]
-        if case == "normal":
+        if case in storage_cases and case != "read-only-media":
             command += ["-device", "usb-storage,id=zos-usb-disk,bus=xhci.0,port=3,drive=diagnostic-boot,bootindex=1"]
-    if case == "empty":
+    if case in ("empty", "integrated"):
         for prefix in ("usb-kbd,", "usb-mouse,"):
             index = next(i for i, value in enumerate(command) if value.startswith(prefix))
             del command[index - 1:index + 1]
     if case == "unsupported":
         command += ["-device", "usb-tablet,id=unsupported,bus=xhci.0,port=4"]
+    if case == "usb2":
+        command[command.index("qemu-xhci,id=xhci")] = "qemu-xhci,id=xhci,p3=0"
+    if case == "nec":
+        command[command.index("qemu-xhci,id=xhci")] = "nec-usb-xhci,id=xhci"
+    if case == "no-ps2":
+        command[command.index("pc")] = "pc,i8042=off"
+    if case == "hub":
+        for i, value in enumerate(command):
+            if value.startswith(("usb-kbd,", "usb-mouse,", "usb-storage,")):
+                for port in (1, 2, 3):
+                    value = value.replace(f"port={port},", f"port=1.{port},")
+                if value.endswith("port=1"):
+                    value = value[:-1] + "1.1"
+                elif value.endswith("port=2"):
+                    value = value[:-1] + "1.2"
+                command[i] = value
+        index = command.index("qemu-xhci,id=xhci") + 1
+        command[index:index] = ["-device", "usb-hub,id=zos-hub,bus=xhci.0,port=1"]
     return command
 
 
@@ -466,13 +485,30 @@ def diagnostic_case(disk: Path, firmware: str, timeout: int, case: str = "normal
                         {"type": "rel", "data": {"axis": "x", "value": 20}},
                         {"type": "rel", "data": {"axis": "y", "value": -10}}]})
                     wait_serial(process, log, "MOUSE: x=532 y=374", timeout)
-                if case in ("normal", "read-only-media"):
+                if case in ("normal", "read-only-media", "usb2", "superspeed", "nec", "hub", "integrated", "no-ps2"):
                     text = wait_serial(process, log, "USB READ PASS:", timeout)
                     if "USB DISK: sectors=262144 block=512" not in text:
                         raise RuntimeError("Diagnostics did not read the non-16MiB USB boot disk")
                     if case == "normal":
                         qmp.execute("device_del", {"id": "zos-usb-disk"})
                         wait_serial(process, log, "DIAGNOSTIC OFFLINE: Io", timeout)
+                if case == "superspeed":
+                    if "speed-id=4 Super:" not in text:
+                        raise RuntimeError("SuperSpeed test did not enumerate a SuperSpeed device")
+                if case == "usb2":
+                    if "speed-id=3 High:" not in text or " Super:" in text:
+                        raise RuntimeError("USB2 test did not force high-speed storage")
+                if case == "nec" and "id=0x01941033" not in text:
+                    raise RuntimeError("Non-QEMU PCI controller ID was not exercised")
+                if case == "hub":
+                    for marker in ("USB HUB READY:", "route=0x1 ", "route=0x2 ", "route=0x3 "):
+                        if marker not in text:
+                            raise RuntimeError(f"Missing hub proof {marker}")
+                if case == "integrated":
+                    if "INTEGRATED PS2: keyboard=Ok(()) mouse=Ok(())" not in text or "USB HID KEY PASS:" in text:
+                        raise RuntimeError("Integrated input did not use the PS/2 path")
+                if case == "no-ps2" and "INTEGRATED PS2 UNAVAILABLE:" not in text:
+                    raise RuntimeError("Absent i8042 was not handled explicitly")
                 if case == "unsupported":
                     wait_serial(process, log, "unsupported device", timeout)
             text = log.read_text(encoding="utf-8")
@@ -499,7 +535,7 @@ def diagnostic_case(disk: Path, firmware: str, timeout: int, case: str = "normal
     (BUILD / f"{stem}.data.json").write_text(json.dumps({
         "image": disk.name, "before_sha256": before, "after_sha256": before,
         "usb_medium": "snapshot overlay" if case == "normal" and firmware == "uefi"
-            else "read-only" if case in ("normal", "read-only-media") else "none",
+            else "read-only" if case in ("normal", "read-only-media", "usb2", "superspeed", "nec", "hub", "integrated", "no-ps2") else "none",
         "qemu_fully_exited": True,
     }, indent=2) + "\n", encoding="utf-8")
     print(f"PASS {firmware}/diagnostic-{case}: explicit diagnostics, image preserved", flush=True)

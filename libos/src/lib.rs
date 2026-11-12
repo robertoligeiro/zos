@@ -2,6 +2,9 @@
 
 pub const MAX_MESSAGE: usize = 64;
 pub const MAX_STORAGE_MESSAGE: usize = 1024;
+pub const USB_MAX_DEVICES: usize = 8;
+pub const USB_MAX_SCRATCHPADS: usize = 64;
+pub const USB_DMA_PAGES: u64 = 5 + USB_MAX_SCRATCHPADS as u64 + USB_MAX_DEVICES as u64 * 8;
 
 #[repr(u64)]
 pub enum Call {

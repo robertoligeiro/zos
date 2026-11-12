@@ -1,6 +1,41 @@
 use super::{Error, Result};
 
-pub const MAX_SCRATCHPADS: usize = 34;
+pub const MAX_SCRATCHPADS: usize = zos_libos::USB_MAX_SCRATCHPADS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speed {
+    Low,
+    Full,
+    High,
+    Super,
+}
+
+impl Speed {
+    pub fn packet(self) -> u32 {
+        match self {
+            Self::Low | Self::Full => 8,
+            Self::High => 64,
+            Self::Super => 512,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Protocol {
+    pub revision: u8,
+    pub slot_type: u8,
+    pub speeds: [Option<Speed>; 16],
+}
+
+impl Protocol {
+    pub fn speed(self, id: u8) -> Result<Speed> {
+        self.speeds
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .ok_or(Error::Unsupported)
+    }
+}
 
 pub fn dma_page(physical: u64) -> Result<()> {
     if physical > u32::MAX as u64 - 4095 {
@@ -17,26 +52,59 @@ pub fn scratchpads(structural: u32) -> Result<usize> {
     Ok(count)
 }
 
-pub fn speeds(revision: u8, entries: &[u32]) -> Result<()> {
+pub fn speeds(revision: u8, slot_type: u8, entries: &[u32]) -> Result<Protocol> {
     if !matches!(revision, 2 | 3) {
         return Err(Error::Unsupported);
     }
-    for &entry in entries {
-        let id = entry & 15;
+    let mut protocol = Protocol {
+        revision,
+        slot_type,
+        speeds: [None; 16],
+    };
+    if entries.is_empty() {
+        if revision == 2 {
+            protocol.speeds[1] = Some(Speed::Full);
+            protocol.speeds[2] = Some(Speed::Low);
+            protocol.speeds[3] = Some(Speed::High);
+        } else {
+            protocol.speeds[4] = Some(Speed::Super);
+        }
+        return Ok(protocol);
+    }
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        let id = (entry & 15) as usize;
         let rate = (entry >> 16) as u64 * 1000_u64.pow((entry >> 4) & 3);
-        let expected = match (revision, id) {
-            (2, 1) => 12_000_000,
-            (2, 2) => 1_500_000,
-            (2, 3) => 480_000_000,
-            (3, 4) => 5_000_000_000,
-            (3, 5) => 10_000_000_000,
+        let speed = match (revision, rate) {
+            (2, 1_500_000) => Speed::Low,
+            (2, 12_000_000) => Speed::Full,
+            (2, 480_000_000) => Speed::High,
+            (3, 5_000_000_000 | 10_000_000_000 | 20_000_000_000) => Speed::Super,
             _ => return Err(Error::Unsupported),
         };
-        if entry & 0xc0 != 0 || rate != expected {
-            return Err(Error::Unsupported);
+        if id == 0 || protocol.speeds[id].is_some() {
+            return Err(Error::Invalid);
         }
+        match (entry >> 6) & 3 {
+            0 => (),
+            2 if revision == 3 => {
+                let tx = *entries.get(index + 1).ok_or(Error::Invalid)?;
+                let tx_rate = (tx >> 16) as u64 * 1000_u64.pow((tx >> 4) & 3);
+                if tx & 15 != id as u32 || (tx >> 6) & 3 != 3 {
+                    return Err(Error::Invalid);
+                }
+                if !matches!(tx_rate, 5_000_000_000 | 10_000_000_000 | 20_000_000_000) {
+                    return Err(Error::Unsupported);
+                }
+                index += 1;
+            }
+            _ => return Err(Error::Invalid),
+        }
+        protocol.speeds[id] = Some(speed);
+        index += 1;
     }
-    Ok(())
+    Ok(protocol)
 }
 
 pub fn scsi(read_only: bool, command: &[u8], input: bool, length: usize) -> Result<()> {
@@ -92,27 +160,35 @@ mod tests {
         assert_eq!(scratchpads(1 << 21), Ok(32));
         assert_eq!(scratchpads((1 << 21) | (1 << 27)), Ok(33));
         assert_eq!(scratchpads(0x1420_0054), Ok(34));
-        assert_eq!(scratchpads((1 << 21) | (3 << 27)), Err(Error::Unsupported));
+        assert_eq!(scratchpads((1 << 21) | (3 << 27)), Ok(35));
+        assert_eq!(scratchpads(2 << 21), Ok(64));
+        assert_eq!(scratchpads((2 << 21) | (1 << 27)), Err(Error::Unsupported));
         assert_eq!(scratchpads(0xfbe0_0000), Err(Error::Unsupported));
     }
 
     #[test]
-    fn protocol_speed_tables_require_recognized_symmetric_ids() {
-        assert_eq!(speeds(2, &[]), Ok(()));
-        assert_eq!(speeds(3, &[4 | (3 << 4) | (5 << 16)]), Ok(()));
-        assert_eq!(speeds(3, &[5 | (3 << 4) | (10 << 16)]), Ok(()));
-        assert_eq!(
-            speeds(3, &[6 | (3 << 4) | (5 << 16)]),
-            Err(Error::Unsupported)
-        );
-        assert_eq!(
-            speeds(3, &[4 | (3 << 4) | (10 << 16)]),
-            Err(Error::Unsupported)
-        );
-        assert_eq!(
-            speeds(3, &[4 | (3 << 4) | (1 << 6) | (5 << 16)]),
-            Err(Error::Unsupported)
-        );
+    fn protocol_tables_map_rates_not_assumed_ids() {
+        assert_eq!(speeds(2, 0, &[]).unwrap().speed(2), Ok(Speed::Low));
+        assert_eq!(speeds(3, 0, &[]).unwrap().speed(4), Ok(Speed::Super));
+        let protocol = speeds(3, 7, &[6 | (3 << 4) | (10 << 16)]).unwrap();
+        assert_eq!(protocol.slot_type, 7);
+        assert_eq!(protocol.speed(6), Ok(Speed::Super));
+        assert_eq!(protocol.speed(4), Err(Error::Unsupported));
+        let full = speeds(2, 0, &[7 | (2 << 4) | (12 << 16)]).unwrap();
+        assert_eq!(full.speed(7), Ok(Speed::Full));
+    }
+
+    #[test]
+    fn asymmetric_protocol_speeds_require_an_adjacent_matching_pair() {
+        let rx = 6 | (3 << 4) | (2 << 6) | (10 << 16);
+        let tx = 6 | (3 << 4) | (3 << 6) | (5 << 16);
+        assert_eq!(speeds(3, 0, &[rx, tx]).unwrap().speed(6), Ok(Speed::Super));
+        for entries in [&[rx][..], &[tx], &[rx, tx + 1], &[rx, rx], &[0]] {
+            assert!(speeds(3, 0, entries).is_err());
+        }
+        let symmetric = 4 | (3 << 4) | (5 << 16);
+        assert!(speeds(3, 0, &[symmetric, symmetric]).is_err());
+        assert!(speeds(3, 0, &[4 | (3 << 4) | (1 << 6) | (5 << 16)]).is_err());
     }
 
     #[test]
