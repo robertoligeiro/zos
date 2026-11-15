@@ -86,6 +86,10 @@ impl Terminal {
         self.x = 0;
         self.y = 0;
     }
+    /// Marks every row for repaint (for example after something else drew on the screen).
+    pub fn invalidate(&mut self) {
+        self.dirty.fill(true);
+    }
     fn newline(&mut self) {
         self.x = 0;
         self.y += 1;

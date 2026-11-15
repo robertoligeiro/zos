@@ -30,13 +30,15 @@ pub extern "C" fn _start(role: usize) -> ! {
         )
     };
     terminal.configure(fb.width, fb.height);
+    // Boot screen: the logo stays up until the first real message arrives, so the
+    // exercise and header below are only drawn when it is dismissed.
+    let mut splash_up = zos_console::splash::draw(pixels, fb);
     terminal.colors(0xffcc66, 0x081008);
     terminal.write(b"backspace: ab\x08c\n");
     for _ in 0..55 {
         terminal.write(b"Console scrolling exercise\n");
     }
     assert!(terminal.scrolls > 0);
-    terminal.render(pixels, fb);
     os::debug_write("CONSOLE PASS: cursor, colors, backspace, scrolling").unwrap();
     terminal.colors(0x90ee90, 0x081008);
     terminal.clear();
@@ -51,12 +53,20 @@ pub extern "C" fn _start(role: usize) -> ! {
         terminal.write(b"Edit: arrows, Home/End, Backspace/Delete; Up/Down: history\n");
         terminal.write(b"Ctrl+A/E: start/end; Ctrl+L: clear; mouse: move/click crosshair\n\n");
     }
-    terminal.render(pixels, fb);
+    if !splash_up {
+        terminal.render(pixels, fb);
+    }
     let mut bytes = [0; 128];
     loop {
         let (token, length) = os::receive(CONSOLE, &mut bytes).unwrap();
         assert!(token != 0 && length > 0);
         let message = &bytes[..length];
+        // Anything but pointer motion or a scroll-count query is real output (the
+        // shell banner, a diagnostic, an error): replace the logo with the text.
+        if splash_up && !matches!(message, [POINTER, ..] | [SCROLLS]) {
+            splash_up = false;
+            terminal.invalidate();
+        }
         match message {
             [WRITE, text @ ..] => terminal.write(text),
             [COLORS, fr, fg, fb, br, bg, bb] => terminal.colors(
@@ -75,6 +85,11 @@ pub extern "C" fn _start(role: usize) -> ! {
                     "MOUSE: x={} y={} buttons={}",
                     terminal.mouse_x, terminal.mouse_y, buttons
                 ));
+                if splash_up {
+                    // The pointer does not dismiss the logo, and is not drawn over it.
+                    os::reply_live(token, &[]).unwrap();
+                    continue;
+                }
             }
             [SCROLLS] => {
                 os::reply(token, &(terminal.scrolls as u64).to_le_bytes()).unwrap();

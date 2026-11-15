@@ -699,5 +699,13 @@ above, without any additional terms or conditions. Third-party components and th
 licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
 
 **Artwork.** `assets/zos-logo.png` and `assets/zos-logo-article.png` are AI-generated
-images. They carry their own notice ("All rights reserved") and are not part of the
-MIT OR Apache-2.0 licensed source.
+images, and `assets/zos-splash.bin` is the boot-screen bitmap derived from the logo
+(`python tools\mksplash.py`). They carry their own notice ("All rights reserved") and
+are not part of the MIT OR Apache-2.0 licensed source.
+
+**Boot screen.** In normal builds the kernel paints the boot blue and keeps its log
+text off the screen (it goes to the serial port; a fault still shows its message). The
+console server then draws the logo and keeps it up until the first real output arrives
+(the shell banner, or an error such as a missing USB stick); moving the mouse does not
+dismiss it. Acceptance-test kernels keep their on-screen log, and the QEMU `splash`
+case freezes the VM, captures the framebuffer and checks the logo pixels.

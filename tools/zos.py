@@ -1122,6 +1122,62 @@ def accept_case(disk: Path, firmware: str, case: str, timeout: int) -> None:
     print(f"PASS {firmware}/{case}: serial, framebuffer initialized, timer, expected exit", flush=True)
 
 
+def read_ppm(path: Path) -> tuple[int, int, bytes]:
+    data = path.read_bytes()
+    magic, size, depth, pixels = data.split(b"\n", 3)
+    width, height = (int(value) for value in size.split())
+    if magic != b"P6" or depth != b"255" or len(pixels) != width * height * 3:
+        raise RuntimeError(f"{path.name} is not a valid QEMU framebuffer dump")
+    return width, height, pixels
+
+
+def splash_case(disk: Path, firmware: str, timeout: int) -> None:
+    """Boots the normal build, freezes the VM as soon as the console is up (before the
+    shell banner can replace the logo) and inspects the real framebuffer pixels."""
+    data = format_disk(f"data-splash-{firmware}.img", force=True)
+    log = BUILD / f"{firmware}-splash.serial.log"
+    picture = BUILD / f"{firmware}-splash.ppm"
+    log.unlink(missing_ok=True)
+    picture.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, data_disk=data) + [
+        "-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio"]
+    with (BUILD / f"{firmware}-splash.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-splash.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            wait_serial(process, log, "CONSOLE PASS: cursor", timeout)
+            qmp.execute("stop", identity="stop")
+            if SHELL_READY in log.read_text(encoding="utf-8", errors="replace"):
+                raise RuntimeError("Splash capture was too late: the shell banner was already up")
+            qmp.execute("screendump", {"filename": str(picture)}, identity="capture")
+            qmp.execute("quit", identity="quit")
+            process.wait(timeout=timeout)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    width, height, pixels = read_ppm(picture)
+    at = lambda x, y: tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+    boot_blue = (0x01, 0x1d, 0x94)
+    for x, y in ((4, 4), (width - 5, height - 5), (4, height - 5), (width - 5, 4)):
+        if any(abs(a - b) > 4 for a, b in zip(at(x, y), boot_blue)):
+            raise RuntimeError(f"Splash background at ({x},{y}) is {at(x, y)}, expected {boot_blue}")
+    white = green = 0
+    for index in range(0, len(pixels), 3):
+        r, g, b = pixels[index], pixels[index + 1], pixels[index + 2]
+        white += r > 200 and g > 200 and b > 200
+        green += g > 200 and r < 190 and b < 190  # the kernel/console text color
+    if white < 20000:
+        raise RuntimeError(f"The logo is missing from the boot screen ({white} white pixels)")
+    if green:
+        raise RuntimeError(f"Kernel or console text leaked onto the boot screen ({green} green pixels)")
+    print(f"PASS {firmware}/splash: logo on the real framebuffer ({width}x{height}, {white} logo pixels, no text)", flush=True)
+
+
 def screenshot(disk: Path, firmware: str, timeout: int, *, data_disk: Path | None = None, usb: bool = False) -> None:
     flavor = "usb-screen" if usb else "screen"
     log = BUILD / f"{firmware}-{flavor}.serial.log"
@@ -1227,6 +1283,7 @@ def accept(timeout: int, *, usb: bool = False, diagnostic: bool = False) -> None
     data = format_disk("data-normal-acceptance.img", force=True)
     for firmware in ("bios", "uefi"):
         screenshot(normal, firmware, timeout, data_disk=data)
+        splash_case(normal, firmware, timeout)
     usb_cases = []
     if usb:
         disk = image(build("shell", usb=True), "usb-shell")

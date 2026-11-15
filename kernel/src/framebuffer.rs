@@ -1,8 +1,15 @@
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use spin::Mutex;
 
 static TERMINAL: Mutex<Option<Terminal>> = Mutex::new(None);
+/// Normal builds keep the boot screen clean: after the framebuffer is up, kernel log
+/// text goes to the serial port only, until a fault needs to be shown (`reveal`).
+static QUIET: AtomicBool = AtomicBool::new(false);
+/// Background of the boot logo (tools\mksplash.py palette[0]); the console server
+/// draws the logo over the same color, so the screen never flashes.
+const BOOT_BACKGROUND: (u32, u32, u32) = (0x01, 0x1d, 0x94);
 
 struct Terminal {
     base: usize,
@@ -13,6 +20,8 @@ struct Terminal {
     y: usize,
     foreground: u32,
     background: u32,
+    /// Background used for fault text (the dark green of the test/boot console).
+    fault_background: u32,
 }
 
 impl Terminal {
@@ -98,6 +107,9 @@ pub fn init() {
     let color = |r: u32, g: u32, b: u32| {
         (r << fb.red_mask_shift) | (g << fb.green_mask_shift) | (b << fb.blue_mask_shift)
     };
+    // Acceptance-test kernels keep their log text on screen for review.
+    let quiet = crate::ACCEPTANCE_FEATURES == 0;
+    let fault_background = color(0x08, 0x10, 0x08);
     let mut terminal = Terminal {
         base: fb.address() as usize,
         pitch: fb.pitch as usize,
@@ -106,7 +118,12 @@ pub fn init() {
         x: 0,
         y: 0,
         foreground: color(0x90, 0xee, 0x90),
-        background: color(0x08, 0x10, 0x08),
+        background: if quiet {
+            color(BOOT_BACKGROUND.0, BOOT_BACKGROUND.1, BOOT_BACKGROUND.2)
+        } else {
+            fault_background
+        },
+        fault_background,
     };
     terminal.clear();
     *TERMINAL.lock() = Some(terminal);
@@ -115,6 +132,20 @@ pub fn init() {
         fb.width,
         fb.height
     );
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Ends quiet mode with a cleared, readable screen so fault text is visible. Safe to
+/// call from fault handlers: it never waits for a lock.
+pub fn reveal() {
+    if QUIET.swap(false, Ordering::Relaxed) {
+        if let Some(mut guard) = TERMINAL.try_lock() {
+            if let Some(terminal) = guard.as_mut() {
+                terminal.background = terminal.fault_background;
+                terminal.clear();
+            }
+        }
+    }
 }
 
 pub fn clear() {
@@ -130,6 +161,9 @@ pub fn handoff() {
 }
 
 pub fn print(args: fmt::Arguments<'_>) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     // Fault-time screen output is best effort; never deadlock on an interrupted writer.
     if let Some(mut terminal) = TERMINAL.try_lock() {
         if let Some(terminal) = terminal.as_mut() {

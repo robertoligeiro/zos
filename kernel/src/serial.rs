@@ -54,5 +54,7 @@ pub fn emergency(args: fmt::Arguments<'_>) {
     interrupts::disable();
     // A CPU fault can interrupt a locked framebuffer writer; serial has no lock.
     Serial.write_fmt(args).expect("Serial formatting failed");
+    // A fault must be readable even if the boot logo is up.
+    crate::framebuffer::reveal();
     crate::framebuffer::print(args);
 }
