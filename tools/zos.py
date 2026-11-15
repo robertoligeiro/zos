@@ -667,9 +667,12 @@ class ShellKeys:
 
     def type(self, text: str) -> None:
         plain = {" ": "spc", "/": "slash", ".": "dot", ";": "semicolon", "'": "apostrophe",
-                 "-": "minus", "\\": "backslash", "=": "equal"}
+                 "-": "minus", "\\": "backslash", "=": "equal", ",": "comma",
+                 "[": "bracket_left", "]": "bracket_right"}
         shifted = {'"': "apostrophe", ">": "dot", "&": "7", "~": "grave_accent",
-                   "_": "minus", "!": "1", ":": "semicolon"}
+                   "_": "minus", "!": "1", ":": "semicolon", "$": "4", "|": "backslash",
+                   "<": "comma", "#": "3", "*": "8", "?": "slash", "{": "bracket_left",
+                   "}": "bracket_right", "(": "9", ")": "0", "%": "5", "@": "2", "^": "6", "+": "equal"}
         for char in text:
             if char in shifted:
                 self.key(shifted[char], shift=True)
@@ -729,6 +732,48 @@ def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False, gp
                     keys.line('echo "with spaces" > "two words"; cat "two words"', [0, 0])
                     keys.line('echo "unterminated', [])
                     keys.line("uname; help", [0, 0])
+                    # Shell 2.0 language. Output is checked through files (`cat` prints a file in
+                    # one piece), and every command's exact exit status is asserted.
+                    def shown(text: str) -> bool:
+                        return f"SHELL OUT: {text}" in log.read_text(encoding="utf-8")
+                    keys.line("FOO=bar; echo $FOO \"x $FOO\" '$FOO' \\$FOO > o; cat o", [0, 0, 0])
+                    if not shown("bar x bar $FOO $FOO\n"):
+                        raise RuntimeError("Variable expansion or quoting is wrong")
+                    keys.line("false || echo or-ok > o; true && echo and-ok >> o; false && echo never >> o; "
+                              "echo after >> o; cat o", [1, 0, 0, 0, 1, 0, 0])
+                    if not shown("or-ok\nand-ok\nafter\n"):
+                        raise RuntimeError("&& / || short-circuit semantics are wrong")
+                    keys.line("! false; ! true; false || ! false", [0, 1, 1, 0])
+                    keys.line("echo a > o # a comment ; echo hidden >> o", [0])
+                    keys.line("cat o", [0])
+                    if not shown("a\n") or shown("a\nhidden"):
+                        raise RuntimeError("A comment was executed")
+                    keys.line("echo ${FOO}${FOO} > o; cat o", [0, 0])
+                    if not shown("barbar\n"):
+                        raise RuntimeError("${NAME} expansion is wrong")
+                    keys.line("echo a | cat", [])
+                    keys.line("echo hi < f", [])
+                    keys.line("echo ${NOPE", [1])
+                    # Environment: only exported variables (and per-command prefixes) are inherited.
+                    keys.line("export X=1 Y; printenv X > o; printenv Y >> o; printenv FOO; cat o", [0, 0, 0, 1, 0])
+                    if not shown("1\n\n"):
+                        raise RuntimeError("Exported variables were not inherited")
+                    keys.line("Z=temp printenv Z > o; printenv Z >> o; env > e; cat o", [0, 1, 0, 0])
+                    if not shown("temp\n"):
+                        raise RuntimeError("A command-prefix assignment was not inherited")
+                    keys.line("cat e", [0])
+                    if not shown("PATH=/bin\nHOME=/\nX=1\nY=\n"):
+                        raise RuntimeError("env output is wrong")
+                    keys.line("unset X; printenv X", [0, 1])
+                    # Filename patterns: sorted matches, quoted patterns are literal, no match keeps the text.
+                    keys.line("mkdir g; cd g; touch b.txt; touch a.txt; touch c.log", [0] * 5)
+                    keys.line("echo *.txt > o; echo '*.txt' >> o; echo nomatch* >> o; ls *.log >> o; "
+                              "echo [ab].txt >> o; cat o", [0] * 6)
+                    if not shown("a.txt b.txt\n*.txt\nnomatch*\nc.log\na.txt b.txt\n"):
+                        raise RuntimeError("Filename pattern expansion is wrong")
+                    keys.line("cd ..; echo g/*.log > o; cat o; cd /a", [0] * 4)
+                    if not shown("g/c.log\n"):
+                        raise RuntimeError("A pattern with a directory part is wrong")
                     keys.line("kill 3", [1])
                     keys.line("spin &", [0])
                     pid = re.findall(r"SHELL BACKGROUND: (\d+)", log.read_text(encoding="utf-8"))[-1]

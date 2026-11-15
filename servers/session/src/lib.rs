@@ -3,13 +3,24 @@
 extern crate std;
 
 pub mod client;
+pub mod env;
 pub mod parser;
 
 use zos_storage::{vfs, Error, Result};
 pub const PROCMGR: usize = 7;
 pub const MANAGER_TID: usize = 8;
-pub const PROGRAMS: [&[u8]; 10] = [
-    b"echo", b"cat", b"cp", b"true", b"false", b"spin", b"block", b"fault", b"leak", b"uname",
+pub const PROGRAMS: [&[u8]; 11] = [
+    b"echo",
+    b"cat",
+    b"cp",
+    b"true",
+    b"false",
+    b"spin",
+    b"block",
+    b"fault",
+    b"leak",
+    b"uname",
+    b"printenv",
 ];
 
 pub fn path(cwd: &[u8], input: &[u8]) -> Result<vfs::Path> {

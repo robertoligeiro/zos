@@ -81,6 +81,27 @@ fn execute(inv: &client::Invocation<'_>, out: Option<u64>) -> Result<i64> {
         b"true" if inv.argc == 1 => (),
         b"false" if inv.argc == 1 => return Ok(1),
         b"uname" if inv.argc == 1 => output(out, b"ZOS - Zombie OS (x86_64)\n")?,
+        // printenv [NAME]: the variables this program inherited from the shell.
+        b"printenv" if inv.argc <= 2 => {
+            let mut found = inv.argc == 1;
+            for (name, value) in &inv.env[..inv.envc] {
+                if inv.argc == 2 {
+                    if *name != inv.argv[1] {
+                        continue;
+                    }
+                    found = true;
+                    output(out, value)?;
+                } else {
+                    output(out, name)?;
+                    output(out, b"=")?;
+                    output(out, value)?;
+                }
+                output(out, b"\n")?;
+            }
+            if !found {
+                return Ok(1);
+            }
+        }
         b"spin" if inv.argc == 1 => loop {
             core::hint::spin_loop();
         },

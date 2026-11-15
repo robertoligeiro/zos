@@ -9,11 +9,86 @@ use zos_console::{
 };
 use zos_libos as os;
 use zos_session::{
-    client::{self, Startup},
-    parser::{self, Command, Parsed},
+    client::{self, Startup, ENV_MAX},
+    env::{self, glob_match, Env},
+    parser::{self, Command, Connector, Parsed, Pipeline, WORDS},
     *,
 };
 use zos_storage::{protocol as api, vfs::*, Error, Result};
+
+/// Expanded words of one command, stored back to back in a fixed buffer.
+struct Words {
+    bytes: [u8; 512],
+    used: usize,
+    spans: [(usize, usize); WORDS],
+    count: usize,
+}
+impl Words {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 512],
+            used: 0,
+            spans: [(0, 0); WORDS],
+            count: 0,
+        }
+    }
+    fn push(&mut self, text: &[u8]) -> Result<()> {
+        if self.count == WORDS || self.used + text.len() > self.bytes.len() {
+            return Err(Error::TooLarge);
+        }
+        self.bytes[self.used..self.used + text.len()].copy_from_slice(text);
+        self.spans[self.count] = (self.used, text.len());
+        self.used += text.len();
+        self.count += 1;
+        Ok(())
+    }
+    fn get(&self, index: usize) -> &[u8] {
+        let (start, length) = self.spans[index];
+        &self.bytes[start..start + length]
+    }
+}
+
+fn is_builtin(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"help"
+            | b"clear"
+            | b"ls"
+            | b"cd"
+            | b"pwd"
+            | b"mkdir"
+            | b"rmdir"
+            | b"touch"
+            | b"rm"
+            | b"mv"
+            | b"free"
+            | b"ps"
+            | b"kill"
+            | b"wait"
+            | b"uname"
+            | b"dmesg"
+            | b"export"
+            | b"unset"
+            | b"env"
+            | b"set"
+            | b"reboot"
+            | b"halt"
+    )
+}
+
+/// Removes the backslash escapes `env::expand` adds in pattern mode.
+fn unescape(pattern: &[u8], out: &mut [u8; PATH]) -> usize {
+    let (mut length, mut index) = (0, 0);
+    while index < pattern.len() && length < out.len() {
+        if pattern[index] == b'\\' && index + 1 < pattern.len() {
+            index += 1;
+        }
+        out[length] = pattern[index];
+        length += 1;
+        index += 1;
+    }
+    length
+}
 
 struct Output(Option<u64>);
 impl Output {
@@ -36,12 +111,21 @@ impl fmt::Write for Output {
 struct Shell {
     cwd: [u8; PATH],
     length: usize,
+    env: Env,
 }
 impl Shell {
     fn new() -> Self {
         let mut cwd = [0; PATH];
         cwd[0] = b'/';
-        Self { cwd, length: 1 }
+        let mut env = Env::new();
+        env.set(b"PATH", b"/bin", Some(true)).unwrap();
+        env.set(b"HOME", b"/", Some(true)).unwrap();
+        env.set(b"PWD", b"/", Some(false)).unwrap();
+        Self {
+            cwd,
+            length: 1,
+            env,
+        }
     }
     fn cwd(&self) -> &[u8] {
         &self.cwd[..self.length]
@@ -79,6 +163,48 @@ impl Shell {
                 }
                 self.length = path.bytes().len();
                 self.cwd[..self.length].copy_from_slice(path.bytes());
+                self.env.set(b"PWD", path.bytes(), None)?;
+            }
+            b"export" => {
+                if args.len() == 1 {
+                    for (name, value, exported) in self.env.all() {
+                        if exported {
+                            out.bytes(b"export ")?;
+                            out.bytes(name)?;
+                            out.bytes(b"=")?;
+                            out.bytes(value)?;
+                            out.bytes(b"\n")?;
+                        }
+                    }
+                }
+                for arg in &args[1..] {
+                    match arg.iter().position(|&b| b == b'=') {
+                        Some(at) => self.env.set(&arg[..at], &arg[at + 1..], Some(true))?,
+                        None => self.env.export(arg, true)?,
+                    }
+                }
+            }
+            b"unset" => {
+                if args.len() < 2 {
+                    return Err(Error::Invalid);
+                }
+                for arg in &args[1..] {
+                    if !env::valid_name(arg) {
+                        return Err(Error::Invalid);
+                    }
+                    self.env.unset(arg);
+                }
+            }
+            b"env" | b"set" => {
+                exact(1)?;
+                for (name, value, exported) in self.env.all() {
+                    if exported || args[0] == b"set" {
+                        out.bytes(name)?;
+                        out.bytes(b"=")?;
+                        out.bytes(value)?;
+                        out.bytes(b"\n")?;
+                    }
+                }
             }
             b"ls" => {
                 if args.len() > 2 {
@@ -205,93 +331,249 @@ impl Shell {
         }
         Ok(true)
     }
-    fn execute(&mut self, parsed: &Parsed, command: Command) -> Result<i64> {
-        let mut args = [b"".as_slice(); 12];
-        for (arg, span) in args.iter_mut().zip(&command.arguments[..command.count]) {
-            *arg = parsed.word(*span);
-        }
-        let args = &args[..command.count];
-        let output = command
-            .output
-            .map(|span| path(self.cwd(), parsed.word(span)))
-            .transpose()?;
-        let name = args[0];
-        let spawned = !matches!(
-            name,
-            b"help"
-                | b"clear"
-                | b"ls"
-                | b"cd"
-                | b"pwd"
-                | b"mkdir"
-                | b"rmdir"
-                | b"touch"
-                | b"rm"
-                | b"mv"
-                | b"free"
-                | b"ps"
-                | b"kill"
-                | b"wait"
-                | b"uname"
-                | b"dmesg"
-                | b"reboot"
-                | b"halt"
-        );
-        if spawned {
-            let executable = if name.contains(&b'/') {
-                path(self.cwd(), name)?
-            } else {
-                path(b"/bin", name)?
-            };
-            let startup = Startup::new(
-                self.cwd(),
-                output.as_ref().map(|p| (p.bytes(), command.append)),
-                args,
-            )?;
-            let pid = client::spawn(executable.bytes(), &startup)?;
-            if command.background {
-                zos_console::log(format_args!("SHELL BACKGROUND: {pid}"));
-                writeln!(Output(None), "[PID {pid}]").map_err(|_| Error::Io)?;
-                Ok(0)
-            } else {
-                client::wait(pid)
+    /// Expands a filename pattern against its directory (only the last path
+    /// component may contain wildcards) and adds the sorted matches as words.
+    /// Returns how many words were added; 0 means nothing matched.
+    fn glob(&self, pattern: &[u8], words: &mut Words) -> Result<usize> {
+        let split = pattern
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map_or(0, |i| i + 1);
+        let (dir, name) = pattern.split_at(split);
+        let mut escaped = false;
+        for &b in dir {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if matches!(b, b'*' | b'?' | b'[') {
+                return Err(Error::Invalid);
             }
+        }
+        let mut plain = [0; PATH];
+        let dir_length = unescape(dir, &mut plain);
+        let resolved;
+        let base: &[u8] = if dir_length == 0 {
+            self.cwd()
         } else {
-            if command.background {
+            resolved = path(self.cwd(), &plain[..dir_length])?;
+            resolved.bytes()
+        };
+        let mut names = [[0u8; 24]; 32];
+        let mut lengths = [0usize; 32];
+        let mut found = 0;
+        let mut ordinal = 0;
+        while let Some(entry) = api::readdir(base, ordinal)? {
+            ordinal += 1;
+            let entry_name = &entry.name[..entry.length as usize];
+            if glob_match(name, entry_name) {
+                if found == names.len() {
+                    return Err(Error::TooLarge);
+                }
+                names[found][..entry_name.len()].copy_from_slice(entry_name);
+                lengths[found] = entry_name.len();
+                found += 1;
+            }
+        }
+        for i in 1..found {
+            let mut j = i;
+            while j > 0 && names[j - 1][..lengths[j - 1]] > names[j][..lengths[j]] {
+                names.swap(j - 1, j);
+                lengths.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        for i in 0..found {
+            let mut text = [0u8; PATH + 24];
+            text[..dir_length].copy_from_slice(&plain[..dir_length]);
+            text[dir_length..dir_length + lengths[i]].copy_from_slice(&names[i][..lengths[i]]);
+            words.push(&text[..dir_length + lengths[i]])?;
+        }
+        Ok(found)
+    }
+    /// Finds a program: a name with a '/' is a path; otherwise each directory of
+    /// $PATH is tried in order.
+    fn find_executable(&self, name: &[u8]) -> Result<Path> {
+        if name.contains(&b'/') {
+            return path(self.cwd(), name);
+        }
+        let search = self.env.get(b"PATH").unwrap_or(b"/bin");
+        for dir in search.split(|&b| b == b':').filter(|d| !d.is_empty()) {
+            let mut candidate = [0u8; PATH];
+            if dir.len() + 1 + name.len() > candidate.len() {
+                continue;
+            }
+            candidate[..dir.len()].copy_from_slice(dir);
+            candidate[dir.len()] = b'/';
+            candidate[dir.len() + 1..dir.len() + 1 + name.len()].copy_from_slice(name);
+            let candidate = path(self.cwd(), &candidate[..dir.len() + 1 + name.len()])?;
+            if api::stat(candidate.bytes()).is_ok_and(|entry| entry.kind == 2) {
+                return Ok(candidate);
+            }
+        }
+        Err(Error::NotFound)
+    }
+    fn execute(&mut self, parsed: &Parsed, command: &Command, background: bool) -> Result<i64> {
+        let mut words = Words::new();
+        for &word in &command.words[..command.count] {
+            let raw = parsed.word(word);
+            let mut pattern = [0u8; PATH];
+            let expanded = env::expand(raw, &self.env, &mut pattern, true)?;
+            if expanded.glob && self.glob(&pattern[..expanded.length], &mut words)? > 0 {
+                continue;
+            }
+            // No wildcard, or nothing matched: the word stands for its own text.
+            let mut plain = [0u8; PATH];
+            let length = env::expand(raw, &self.env, &mut plain, false)?.length;
+            words.push(&plain[..length])?;
+        }
+        let mut values = [[0u8; env::VALUE]; parser::ASSIGNS];
+        let mut value_lengths = [0usize; parser::ASSIGNS];
+        for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
+            value_lengths[i] =
+                env::expand(parsed.word(assign.value), &self.env, &mut values[i], false)?.length;
+        }
+        if words.count == 0 {
+            // Only assignments: they set shell variables.
+            for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
+                self.env.set(
+                    parsed.word(assign.name),
+                    &values[i][..value_lengths[i]],
+                    None,
+                )?;
+            }
+            return Ok(0);
+        }
+        let output = match command.redirects.output {
+            Some(target) => {
+                let mut buffer = [0u8; PATH];
+                let length =
+                    env::expand(parsed.word(target.path), &self.env, &mut buffer, false)?.length;
+                Some((path(self.cwd(), &buffer[..length])?, target.append))
+            }
+            None => None,
+        };
+        let args: [&[u8]; WORDS] =
+            core::array::from_fn(|i| if i < words.count { words.get(i) } else { b"" });
+        let args = &args[..words.count];
+        if is_builtin(args[0]) {
+            if background {
                 return Err(Error::Invalid);
             }
             let fd = output
                 .as_ref()
-                .map(|p| {
+                .map(|(p, append)| {
                     api::open(
                         p.bytes(),
-                        WRITE | CREATE | if command.append { APPEND } else { TRUNCATE },
+                        WRITE | CREATE | if *append { APPEND } else { TRUNCATE },
                     )
                 })
                 .transpose()?;
             let result = self.builtin(args, &mut Output(fd));
             let closed = fd.map_or(Ok(()), api::close);
-            result.and_then(|_| closed.map(|_| 0))
+            return result.and_then(|_| closed.map(|_| 0));
         }
-    }
-    fn line(&mut self, bytes: &[u8]) {
-        match parser::parse(bytes) {
-            Ok(parsed) => {
-                for command in parsed.commands[..parsed.count].iter().copied() {
-                    match self.execute(&parsed, command) {
-                        Ok(status) => zos_console::log(format_args!("SHELL STATUS: {status}")),
-                        Err(error) => {
-                            let name =
-                                core::str::from_utf8(parsed.word(command.arguments[0])).unwrap();
-                            writeln!(Output(None), "shell: {name}: {error:?}").unwrap();
-                            zos_console::log(format_args!("SHELL STATUS: 1"));
-                        }
-                    }
+        let executable = self.find_executable(args[0])?;
+        // The child sees the exported variables, with this command's own
+        // `NAME=value` prefixes applied on top.
+        let mut pairs: [(&[u8], &[u8]); ENV_MAX] = [(b"", b""); ENV_MAX];
+        let mut count = 0;
+        for (name, value, exported) in self.env.all() {
+            if exported {
+                *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
+                count += 1;
+            }
+        }
+        for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
+            let name = parsed.word(assign.name);
+            let value = &values[i][..value_lengths[i]];
+            match pairs[..count]
+                .iter_mut()
+                .find(|(existing, _)| *existing == name)
+            {
+                Some(entry) => entry.1 = value,
+                None => {
+                    *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
+                    count += 1;
                 }
             }
+        }
+        let startup = Startup::new(
+            self.cwd(),
+            output.as_ref().map(|(p, append)| (p.bytes(), *append)),
+            args,
+            &pairs[..count],
+        )?;
+        let pid = client::spawn(executable.bytes(), &startup)?;
+        if background {
+            zos_console::log(format_args!("SHELL BACKGROUND: {pid}"));
+            writeln!(Output(None), "[PID {pid}]").map_err(|_| Error::Io)?;
+            Ok(0)
+        } else {
+            client::wait(pid)
+        }
+    }
+    /// Runs one pipeline (a single command at this checkpoint) and records `$?`.
+    fn run(&mut self, parsed: &Parsed, pipeline: &Pipeline) {
+        let command = &pipeline.commands[0];
+        let status = match self.execute(parsed, command, pipeline.background) {
+            Ok(status) => status,
+            Err(error) => {
+                let mut name = [0u8; 32];
+                let length = if command.count == 0 {
+                    name[..10].copy_from_slice(b"assignment");
+                    10
+                } else {
+                    parsed.plain(command.words[0], &mut name)
+                };
+                let name = core::str::from_utf8(&name[..length]).unwrap_or("?");
+                writeln!(Output(None), "shell: {name}: {error:?}").unwrap();
+                1
+            }
+        };
+        let status = if pipeline.negate {
+            i64::from(status == 0)
+        } else {
+            status
+        };
+        self.env.status = status;
+        zos_console::log(format_args!("SHELL STATUS: {status}"));
+    }
+    fn line(&mut self, bytes: &[u8]) {
+        let parsed = match parser::parse(bytes) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 writeln!(Output(None), "shell: parse: {error:?}").unwrap();
+                return;
             }
+        };
+        // Refuse what this build cannot run before running any part of the line.
+        for pipeline in parsed.pipelines() {
+            let redirects = pipeline.commands[..pipeline.count].iter().any(|c| {
+                c.redirects.input.is_some()
+                    || c.redirects.error.is_some()
+                    || c.redirects.error_to_output
+            });
+            if pipeline.count > 1 || redirects {
+                writeln!(
+                    Output(None),
+                    "shell: pipes, <, 2> and 2>&1 are not supported yet"
+                )
+                .unwrap();
+                return;
+            }
+        }
+        let mut previous = Connector::Seq;
+        for pipeline in parsed.pipelines() {
+            let run = match previous {
+                Connector::Seq | Connector::End => true,
+                Connector::And => self.env.status == 0,
+                Connector::Or => self.env.status != 0,
+            };
+            if run {
+                self.run(&parsed, pipeline);
+            }
+            previous = pipeline.connector;
         }
     }
 }
@@ -307,7 +589,7 @@ fn redraw(editor: &Editor) {
 fn launch(name: &[u8], args: &[&[u8]]) -> u64 {
     client::spawn(
         path(b"/bin", name).unwrap().bytes(),
-        &Startup::new(b"/", None, args).unwrap(),
+        &Startup::new(b"/", None, args, &[]).unwrap(),
     )
     .unwrap()
 }
@@ -346,7 +628,10 @@ fn self_test() {
     write_all(fd, b"not an executable").unwrap();
     api::close(fd).unwrap();
     assert_eq!(
-        client::spawn(b"/bad-elf", &Startup::new(b"/", None, &[b"bad"]).unwrap()),
+        client::spawn(
+            b"/bad-elf",
+            &Startup::new(b"/", None, &[b"bad"], &[]).unwrap()
+        ),
         Err(Error::Invalid)
     );
     api::unlink(b"/bad-elf").unwrap();
@@ -375,7 +660,11 @@ fn self_test() {
         client::wait(launch(b"cp", &[b"cp", b"/bin/true", b"/custom"])),
         Ok(0)
     );
-    let pid = client::spawn(b"/custom", &Startup::new(b"/", None, &[b"true"]).unwrap()).unwrap();
+    let pid = client::spawn(
+        b"/custom",
+        &Startup::new(b"/", None, &[b"true"], &[]).unwrap(),
+    )
+    .unwrap();
     assert_eq!(client::wait(pid), Ok(0));
     api::unlink(b"/custom").unwrap();
     os::debug_write("PATH SPAWN PASS: executable copied to filesystem path").unwrap();

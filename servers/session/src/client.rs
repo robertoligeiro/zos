@@ -17,16 +17,25 @@ impl Default for Startup {
         }
     }
 }
+pub const ENV_MAX: usize = 16;
 pub struct Invocation<'a> {
     pub cwd: &'a [u8],
     pub output: &'a [u8],
     pub append: bool,
     pub argv: [&'a [u8]; 12],
     pub argc: usize,
+    /// Exported shell variables as (name, value).
+    pub env: [(&'a [u8], &'a [u8]); ENV_MAX],
+    pub envc: usize,
 }
 impl Startup {
-    pub fn new(cwd: &[u8], output: Option<(&[u8], bool)>, argv: &[&[u8]]) -> Result<Self> {
-        if argv.is_empty() || argv.len() > 12 {
+    pub fn new(
+        cwd: &[u8],
+        output: Option<(&[u8], bool)>,
+        argv: &[&[u8]],
+        env: &[(&[u8], &[u8])],
+    ) -> Result<Self> {
+        if argv.is_empty() || argv.len() > 12 || env.len() > ENV_MAX {
             return Err(Error::Invalid);
         }
         let mut request = Request::new(output.is_some_and(|(_, a)| a) as u8);
@@ -45,6 +54,13 @@ impl Startup {
         for arg in argv {
             request.u16(arg.len().try_into().map_err(|_| Error::TooLarge)?)?;
             request.push(arg)?;
+        }
+        request.byte(env.len() as u8)?;
+        for (name, value) in env {
+            request.byte(name.len().try_into().map_err(|_| Error::TooLarge)?)?;
+            request.push(name)?;
+            request.byte(value.len().try_into().map_err(|_| Error::TooLarge)?)?;
+            request.push(value)?;
         }
         if request.bytes().len() > 768 {
             return Err(Error::TooLarge);
@@ -87,6 +103,21 @@ impl Startup {
                 return Err(Error::Invalid);
             }
         }
+        let envc = reader.byte()? as usize;
+        if envc > ENV_MAX {
+            return Err(Error::Invalid);
+        }
+        let mut env = [(b"".as_slice(), b"".as_slice()); ENV_MAX];
+        for entry in &mut env[..envc] {
+            let name_length = reader.byte()? as usize;
+            let name = reader.take(name_length)?;
+            let value_length = reader.byte()? as usize;
+            let value = reader.take(value_length)?;
+            if !crate::env::valid_name(name) || value.iter().any(|b| !(32..=126).contains(b)) {
+                return Err(Error::Invalid);
+            }
+            *entry = (name, value);
+        }
         reader.end()?;
         Ok(Invocation {
             cwd,
@@ -94,6 +125,8 @@ impl Startup {
             append,
             argv,
             argc,
+            env,
+            envc,
         })
     }
 }
@@ -182,7 +215,9 @@ mod tests {
     use super::*;
     #[test]
     fn invocation_round_trip_and_malformed_packets() {
-        let startup = Startup::new(b"/a", Some((b"/a/f", true)), &[b"echo", b"a b", b""]).unwrap();
+        let env: [(&[u8], &[u8]); 2] = [(b"PATH", b"/bin"), (b"EMPTY", b"")];
+        let startup =
+            Startup::new(b"/a", Some((b"/a/f", true)), &[b"echo", b"a b", b""], &env).unwrap();
         let invocation = startup.decode().unwrap();
         assert_eq!(invocation.cwd, b"/a");
         assert_eq!(invocation.output, b"/a/f");
@@ -191,6 +226,7 @@ mod tests {
             &invocation.argv[..invocation.argc],
             [b"echo".as_slice(), b"a b", b""]
         );
+        assert_eq!(&invocation.env[..invocation.envc], env);
         for length in 0..startup.length {
             let mut truncated = startup;
             truncated.length = length;
@@ -199,7 +235,20 @@ mod tests {
         let mut trailing = startup;
         trailing.length += 1;
         assert!(trailing.decode().is_err());
-        assert!(Startup::new(b"/../escape", None, &[b"true"]).is_err());
+        assert!(Startup::new(b"/../escape", None, &[b"true"], &[]).is_err());
+        // Hostile or oversized environments are refused, not truncated.
+        let bad_name: [(&[u8], &[u8]); 1] = [(b"1BAD", b"x")];
+        assert!(Startup::new(b"/", None, &[b"true"], &bad_name).is_err());
+        let bad_value: [(&[u8], &[u8]); 1] = [(b"X", b"a\nb")];
+        assert!(Startup::new(b"/", None, &[b"true"], &bad_value).is_err());
+        let many: [(&[u8], &[u8]); ENV_MAX + 1] = [(b"X", b"1"); ENV_MAX + 1];
+        assert!(Startup::new(b"/", None, &[b"true"], &many).is_err());
+        let big_value = [b'v'; 60];
+        let big: [(&[u8], &[u8]); ENV_MAX] = [(b"BIGNAME", &big_value); ENV_MAX];
+        assert_eq!(
+            Startup::new(b"/", None, &[b"true"], &big).err(),
+            Some(Error::TooLarge)
+        );
         let oversized = Startup {
             length: 769,
             ..Startup::default()
