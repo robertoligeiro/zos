@@ -734,7 +734,11 @@ pointer state machine) is a host-tested library (`zos_wm`); QEMU acceptance runs
 desktop with PS/2 and with USB keyboard, mouse and storage, in BIOS and UEFI, checking
 real framebuffer pixels. Not yet: more than one terminal session, application
 windows, resizing. The USB stick's boot menu offers **Desktop (GUI)** (default after 5
-seconds) and **Command line**; the QEMU test images boot straight to one entry.
+seconds), **Command line** and **Diagnostic (show boot log)**; the QEMU test images
+boot straight to one entry. Diagnostic is the command line with no logo, the kernel's
+boot log kept on screen and the console drawing nothing, so a hang on real hardware
+shows exactly how far boot got (photograph the screen). It is selected by an extra
+boot module whose command line is `screenlog`; no special build is needed.
 
 **Artwork.** `assets/zos-logo.png` and `assets/zos-logo-article.png` are AI-generated
 images, and `assets/zos-splash.bin` is the boot-screen bitmap derived from the logo

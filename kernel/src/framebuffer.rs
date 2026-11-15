@@ -108,7 +108,7 @@ pub fn init() {
         (r << fb.red_mask_shift) | (g << fb.green_mask_shift) | (b << fb.blue_mask_shift)
     };
     // Acceptance-test kernels keep their log text on screen for review.
-    let quiet = crate::ACCEPTANCE_FEATURES == 0;
+    let quiet = crate::ACCEPTANCE_FEATURES == 0 && !crate::boot::screenlog();
     let fault_background = color(0x08, 0x10, 0x08);
     let mut terminal = Terminal {
         base: fb.address() as usize,

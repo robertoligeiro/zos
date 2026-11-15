@@ -18,8 +18,16 @@ class BootMenuTests(unittest.TestCase):
         self.assertIn("default_entry: 1", self.header)
         self.assertIn("serial: yes", self.header)
 
-    def test_two_entries_in_order_desktop_first(self):
-        self.assertEqual(list(self.entries), ["ZOS - Desktop (GUI)", "ZOS - Command line"])
+    def test_three_entries_in_order_desktop_first(self):
+        self.assertEqual(list(self.entries), [
+            "ZOS - Desktop (GUI)", "ZOS - Command line", "ZOS - Diagnostic (show boot log)"])
+
+    def test_only_the_diagnostic_entry_has_the_screenlog_marker(self):
+        for name, entry in self.entries.items():
+            self.assertEqual("module_cmdline: screenlog" in entry, "Diagnostic" in name, name)
+        diagnostic = self.entries["ZOS - Diagnostic (show boot log)"]
+        self.assertIn("module_cmdline: console-server", diagnostic)
+        self.assertNotIn("wm-server", diagnostic)
 
     def test_the_desktop_loads_the_window_manager_as_the_console_server(self):
         desktop, plain = self.entries["ZOS - Desktop (GUI)"], self.entries["ZOS - Command line"]
@@ -33,6 +41,9 @@ class BootMenuTests(unittest.TestCase):
             return [line.strip() for line in entry.splitlines() if "module_" in line or line.strip().startswith("path:")]
         desktop = modules(self.entries["ZOS - Desktop (GUI)"])
         plain = modules(self.entries["ZOS - Command line"])
+        diagnostic = modules(self.entries["ZOS - Diagnostic (show boot log)"])
+        marker = diagnostic.index("module_cmdline: screenlog")
+        self.assertEqual(diagnostic[:marker - 1] + diagnostic[marker + 1:], plain)
         self.assertEqual(len(desktop), len(plain))
         differing = [(a, b) for a, b in zip(desktop, plain) if a != b]
         self.assertEqual(differing, [("module_path: boot():/boot/wm-server.elf", "module_path: boot():/boot/console-server.elf")])

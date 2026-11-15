@@ -207,8 +207,15 @@ def boot_menu() -> bytes:
     if "timeout: 0" not in header:
         raise RuntimeError("boot/limine.conf no longer starts with 'timeout: 0'")
     header = header.replace("timeout: 0", "timeout: 5\ndefault_entry: 1")
+    # Diagnostic: the command line plus a marker module. The kernel then keeps its boot
+    # log on screen and the console draws nothing, so a hang shows how far boot got.
+    marker = "    module_path: boot():/boot/echo-server.elf\n    module_cmdline: screenlog\n"
+    diagnostic = command_entry.rstrip("\n").replace("    resolution:", marker + "    resolution:", 1)
+    if marker not in diagnostic:
+        raise RuntimeError("boot/limine.conf has no resolution line to put the marker before")
     menu = (header + "/ZOS - Desktop (GUI)" + desktop_entry.rstrip("\n") + "\n\n"
-            + "/ZOS - Command line" + command_entry)
+            + "/ZOS - Command line" + command_entry.rstrip("\n") + "\n\n"
+            + "/ZOS - Diagnostic (show boot log)" + diagnostic + "\n")
     return menu.encode("ascii")
 
 

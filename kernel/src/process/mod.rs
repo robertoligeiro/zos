@@ -1014,7 +1014,9 @@ fn start_console() -> ! {
     } else {
         crate::logln!("Starting ring-3 console, input and TTY servers");
     }
-    crate::framebuffer::handoff();
+    if !crate::boot::screenlog() {
+        crate::framebuffer::handoff();
+    }
     let mut scheduler = Scheduler {
         threads: Vec::new(),
         channels: Vec::new(),
@@ -1095,6 +1097,11 @@ fn start_console() -> ! {
             (cfg!(feature = "test-console") || cfg!(feature = "test-shell")) as u64
                 | if cfg!(feature = "usb-diagnostic") {
                     16
+                } else {
+                    0
+                }
+                | if name == "console-server" && crate::boot::screenlog() {
+                    32
                 } else {
                     0
                 }

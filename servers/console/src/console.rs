@@ -32,7 +32,9 @@ pub extern "C" fn _start(role: usize) -> ! {
     terminal.configure(fb.width, fb.height);
     // Boot screen: the logo stays up until the first real message arrives, so the
     // exercise and header below are only drawn when it is dismissed.
-    let mut splash_up = zos_console::splash::draw(pixels, fb);
+    // Role bit 32 (boot menu "Diagnostic"): the kernel's log is on screen, so draw nothing.
+    let quiet_screen = role & 32 != 0;
+    let mut splash_up = !quiet_screen && zos_console::splash::draw(pixels, fb);
     terminal.colors(0xffcc66, 0x081008);
     terminal.write(b"backspace: ab\x08c\n");
     for _ in 0..55 {
@@ -53,7 +55,7 @@ pub extern "C" fn _start(role: usize) -> ! {
         terminal.write(b"Edit: arrows, Home/End, Backspace/Delete; Up/Down: history\n");
         terminal.write(b"Ctrl+A/E: start/end; Ctrl+L: clear; mouse: move/click crosshair\n\n");
     }
-    if !splash_up {
+    if !splash_up && !quiet_screen {
         terminal.render(pixels, fb);
     }
     let mut bytes = [0; 128];
@@ -81,10 +83,12 @@ pub extern "C" fn _start(role: usize) -> ! {
                     i16::from_le_bytes([*y0, *y1]),
                     *buttons,
                 );
-                log(format_args!(
-                    "MOUSE: x={} y={} buttons={}",
-                    terminal.mouse_x, terminal.mouse_y, buttons
-                ));
+                if !quiet_screen {
+                    log(format_args!(
+                        "MOUSE: x={} y={} buttons={}",
+                        terminal.mouse_x, terminal.mouse_y, buttons
+                    ));
+                }
                 if splash_up {
                     // The pointer does not dismiss the logo, and is not drawn over it.
                     os::reply_live(token, &[]).unwrap();
@@ -99,7 +103,9 @@ pub extern "C" fn _start(role: usize) -> ! {
             [ALT, _] => (),
             _ => panic!("Invalid console protocol"),
         }
-        terminal.render(pixels, fb);
+        if !quiet_screen {
+            terminal.render(pixels, fb);
+        }
         os::reply_live(token, &[]).unwrap();
     }
 }

@@ -44,6 +44,18 @@ static STACK: StackSizeRequest = StackSizeRequest::new(64 * 1024);
 #[link_section = ".limine_requests_end"]
 static END: limine::RequestsEndMarker = limine::RequestsEndMarker::new();
 
+/// True when the boot menu's "Diagnostic" entry added a module with the command line
+/// `screenlog`: the kernel then keeps its boot log on screen (no logo, no hand-off) and
+/// the console server draws nothing, so a hang shows exactly how far boot got.
+pub fn screenlog() -> bool {
+    MODULES.response().is_some_and(|response| {
+        response
+            .modules()
+            .iter()
+            .any(|file| file.cmdline() == "screenlog")
+    })
+}
+
 pub fn report() {
     let memory = MEMORY_MAP.response().expect("Limine memory map missing");
     let hhdm = HHDM.response().expect("Limine HHDM missing");
