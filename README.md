@@ -304,6 +304,28 @@ In USB mode the input service also owns the i8042 ports (0x60/0x64) so a laptop'
 built-in PS/2 keyboard works alongside USB devices; ATA and all other legacy ports
 stay denied. I2C/SPI keyboards and touchpads are not implemented.
 
+**Keyboard.** The built-in i8042 keyboard is asked for scancode set 2 with the
+controller's translation enabled (laptop embedded controllers often acknowledge
+but ignore a request for set 1, which produced garbage characters on hardware). The
+keyboard raises IRQ1 so each byte is read immediately; the 100 Hz timer poll stays
+as a backup.
+
+**Logs.** The kernel keeps the last 32 KiB of everything the kernel and services
+log. In the shell, `dmesg` prints it and `dmesg > /name` saves a copy; the shell
+also saves `/boot.log` on every USB boot. To read them on another computer, from an
+elevated PowerShell (the script is read-only and never elevates itself):
+
+```powershell
+.\tools\read-zos-volume.ps1 -List
+.\tools\read-zos-volume.ps1 -DiskNumber N
+python tools\zosfs.py ls  build\zos-volume-dump.img
+python tools\zosfs.py cat build\zos-volume-dump.img /boot.log
+```
+
+`tools\zosfs.py` also reads a volume inside a disk image
+(`--offset-sectors 16384` for the QEMU test sticks). Mock-only script test:
+`powershell.exe -NoProfile -File .\tools\test_read_zos_volume.ps1`.
+
 QEMU acceptance covers the layout (`usb-gpt-shell`, which also checks that every
 byte outside the partition is unchanged), `usb-ps2` (no USB keyboard/mouse),
 `usb-no-zos-partition` and `usb-unformatted-zos-partition`. The raw volume write

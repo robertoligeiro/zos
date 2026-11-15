@@ -161,6 +161,21 @@ pub fn startup() -> Result<Startup> {
 pub fn control(action: u8) -> Result<()> {
     rpc(PROCMGR, &[6, action], &mut [0]).map(|_| ())
 }
+/// One chunk of the kernel/service log from absolute `offset`: the offset to
+/// continue from and the number of bytes placed in `bytes`. An offset past the end
+/// (for example `u64::MAX`) returns the current end of the log with no data.
+pub fn log(offset: u64, bytes: &mut [u8; 960]) -> Result<(u64, usize)> {
+    let mut request = [9; 9];
+    request[1..].copy_from_slice(&offset.to_le_bytes());
+    let mut reply = [0; 969];
+    let length = rpc(PROCMGR, &request, &mut reply)?;
+    if !(8..=968).contains(&length) {
+        return Err(Error::Corrupt);
+    }
+    let count = length - 8;
+    bytes[..count].copy_from_slice(&reply[9..9 + count]);
+    Ok((u64::from_le_bytes(reply[1..9].try_into().unwrap()), count))
+}
 
 #[cfg(test)]
 mod tests {

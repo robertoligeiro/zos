@@ -241,6 +241,17 @@ fn handle(
             os::system_control(action as u64).map_err(kernel)?;
             Ok(Some(0))
         }
+        9 => {
+            // Kernel/service log text for the shell's dmesg: 8-byte next offset, then data.
+            if owner != 3 {
+                return Err(Error::Denied);
+            }
+            let offset = reader.u64()?;
+            reader.end()?;
+            let (next, count) = os::log_read(offset, &mut response[8..968]).map_err(kernel)?;
+            response[..8].copy_from_slice(&next.to_le_bytes());
+            Ok(Some(8 + count))
+        }
         8 => {
             reader.end()?;
             let job = jobs

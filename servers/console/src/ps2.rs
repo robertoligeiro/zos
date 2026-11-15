@@ -74,7 +74,9 @@ fn command(bus: &mut impl Bus, mouse: bool, value: u8) -> Result<(), Error> {
     Err(Error::Response(0xfe))
 }
 
-pub fn initialize(bus: &mut impl Bus) -> Result<Devices, Error> {
+/// `keyboard_irq` lets the keyboard interrupt (IRQ1) so each byte is read at once
+/// instead of waiting for the next timer poll; the mouse stays polled.
+pub fn initialize(bus: &mut impl Bus, keyboard_irq: bool) -> Result<Devices, Error> {
     if bus.read(0x64) == 0xff {
         return Err(Error::Absent);
     }
@@ -89,10 +91,13 @@ pub fn initialize(bus: &mut impl Bus) -> Result<Devices, Error> {
     write(bus, 0x64, 0x60)?;
     write(bus, 0x60, (configuration & !0x73) | 0x30)?;
     write(bus, 0x64, 0xae)?;
+    // Select scancode set 2 (the power-on default that every keyboard supports; a
+    // laptop's embedded controller often acknowledges but ignores any other set)
+    // and let the i8042 translate it to set 1 for the decoder.
     let keyboard = (|| {
         command(bus, false, 0xf5)?;
         command(bus, false, 0xf0)?;
-        command(bus, false, 1)
+        command(bus, false, 2)
     })();
     if keyboard.is_err() {
         write(bus, 0x64, 0xad)?;
@@ -115,6 +120,8 @@ pub fn initialize(bus: &mut impl Bus) -> Result<Devices, Error> {
         bus,
         0x60,
         (configuration & !0x73)
+            | 0x40 // translation: set-2 scancodes arrive as set 1
+            | if keyboard.is_ok() && keyboard_irq { 0x01 } else { 0 }
             | if keyboard.is_err() { 0x10 } else { 0 }
             | if mouse.is_err() { 0x20 } else { 0 },
     )?;
@@ -154,6 +161,8 @@ mod tests {
         auxiliary: bool,
         queue: VecDeque<(bool, u8)>,
         clock: Cell<u64>,
+        last_configuration: u8,
+        keyboard_commands: std::vec::Vec<u8>,
     }
     impl Bus for Mock {
         fn read(&mut self, port: u16) -> u8 {
@@ -177,10 +186,18 @@ mod tests {
                     _ => (),
                 }
             } else if self.configuration {
-                assert_eq!(value & 0x43, 0, "translation and IRQs must remain disabled");
+                assert_eq!(
+                    value & 0x02,
+                    0,
+                    "the mouse IRQ must remain disabled (polled)"
+                );
+                self.last_configuration = value;
                 self.configuration = false;
             } else {
                 let auxiliary = core::mem::take(&mut self.auxiliary);
+                if !auxiliary {
+                    self.keyboard_commands.push(value);
+                }
                 if if auxiliary { self.mouse } else { self.keyboard } {
                     self.queue.push_back((auxiliary, 0xfa));
                     if auxiliary && value == 0xf2 {
@@ -206,16 +223,27 @@ mod tests {
                 auxiliary: false,
                 queue: VecDeque::new(),
                 clock: Cell::new(0),
+                last_configuration: 0,
+                keyboard_commands: std::vec::Vec::new(),
             };
-            let devices = initialize(&mut bus).unwrap();
+            let devices = initialize(&mut bus, false).unwrap();
             assert_eq!(devices.keyboard.is_ok(), keyboard);
             assert_eq!(devices.mouse.is_ok(), mouse);
+            // Translation on, IRQs off; the keyboard is asked for set 2, never set 1.
+            assert_eq!(bus.last_configuration & 0x43, 0x40);
+            if keyboard {
+                assert_eq!(bus.keyboard_commands, [0xf5, 0xf0, 2, 0xf4]);
+            }
+            // With the keyboard interrupt requested, only a working keyboard gets IRQ1.
+            bus.queue.clear();
+            initialize(&mut bus, true).unwrap();
+            assert_eq!(bus.last_configuration & 0x43, 0x40 | u8::from(keyboard));
             bus.queue.extend([(false, 0x1e), (true, 8)]);
             let mut bytes = std::vec::Vec::new();
             drain(&mut bus, |mouse, byte| bytes.push((mouse, byte))).unwrap();
             assert_eq!(bytes, [(false, 0x1e), (true, 8)]);
             bus.absent = true;
-            assert!(matches!(initialize(&mut bus), Err(Error::Absent)));
+            assert!(matches!(initialize(&mut bus, false), Err(Error::Absent)));
         }
     }
 }

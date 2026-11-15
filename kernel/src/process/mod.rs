@@ -704,7 +704,9 @@ impl Scheduler {
                 crate::logln!("USER tid={}: {}", id + 1, text);
                 Ok(Some(0))
             }
-            x if (Call::ProcessSpawn as u64..=Call::SystemControl as u64).contains(&x) => {
+            x if (Call::ProcessSpawn as u64..=Call::SystemControl as u64).contains(&x)
+                || x == Call::LogRead as u64 =>
+            {
                 self.management(id, frame)
             }
             x if (Call::UsbController as u64..=Call::UsbEnableDma as u64).contains(&x) => {
@@ -1041,7 +1043,8 @@ fn start_console() -> ! {
             // ATA and every other legacy port stay denied in USB mode.
             6,
             if cfg!(feature = "usb") {
-                1
+                // IRQ0 (timer) and IRQ1 (the built-in i8042 keyboard).
+                1 | (1 << 1)
             } else {
                 (1 << 1) | (1 << 12)
             },

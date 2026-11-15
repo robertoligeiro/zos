@@ -25,6 +25,7 @@ impl Write for Serial {
                 self.write_byte(b'\r');
             }
             self.write_byte(byte);
+            crate::klog::push(byte);
         }
         Ok(())
     }

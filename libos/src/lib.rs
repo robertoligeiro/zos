@@ -33,6 +33,7 @@ pub enum Call {
     UsbTicks = 22,
     UsbEnableDma = 23,
     SendReady = 24,
+    LogRead = 25,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,6 +379,28 @@ pub fn boot_program(bytes: &mut [u8]) -> Result<usize, Error> {
 }
 pub fn system_control(action: u64) -> Result<(), Error> {
     call(Call::SystemControl, [action, 0, 0, 0, 0]).map(|_| ())
+}
+/// Process-manager only. Copies kernel and service log text starting at absolute
+/// `offset` into `buffer` (at most 1024 bytes). Returns the offset to continue
+/// from and the number of bytes copied.
+pub fn log_read(offset: u64, buffer: &mut [u8]) -> Result<(u64, usize), Error> {
+    if buffer.len() > 1024 {
+        return Err(Error::TooLarge);
+    }
+    let mut bytes = [0; 1032];
+    let (total, _) = call(
+        Call::LogRead,
+        [
+            bytes.as_mut_ptr() as u64,
+            (8 + buffer.len()) as u64,
+            offset,
+            0,
+            0,
+        ],
+    )?;
+    let count = total.checked_sub(8).ok_or(Error::Invalid)?;
+    buffer[..count].copy_from_slice(&bytes[8..8 + count]);
+    Ok((u64::from_le_bytes(bytes[..8].try_into().unwrap()), count))
 }
 
 pub fn reply_live(token: usize, bytes: &[u8]) -> Result<(), Error> {

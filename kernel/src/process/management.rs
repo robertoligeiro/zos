@@ -178,6 +178,18 @@ impl Scheduler {
                 self.copy_result(id, frame.rdi, &bytes)?;
                 Ok(Some(0))
             }
+            x if x == Call::LogRead as u64 => {
+                // rdi = user buffer, rsi = 8 + data bytes wanted, rdx = absolute offset.
+                if !(9..=1032).contains(&frame.rsi) {
+                    return Err(Error::TooLarge);
+                }
+                let mut bytes = [0; 1032];
+                let (start, count) =
+                    crate::klog::read(frame.rdx, &mut bytes[8..frame.rsi as usize]);
+                bytes[..8].copy_from_slice(&(start + count as u64).to_le_bytes());
+                self.copy_result(id, frame.rdi, &bytes[..8 + count])?;
+                Ok(Some(8 + count))
+            }
             x if x == Call::BootProgram as u64 => {
                 let file = crate::boot::MODULES
                     .response()

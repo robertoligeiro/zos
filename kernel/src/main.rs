@@ -9,6 +9,7 @@ extern crate alloc;
 mod boot;
 mod framebuffer;
 mod interrupts;
+mod klog;
 mod memory;
 mod process;
 mod serial;

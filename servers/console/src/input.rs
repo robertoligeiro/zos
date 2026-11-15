@@ -160,7 +160,7 @@ fn diagnostic_input() -> ! {
     os::io_port_grant(0x60, 1).unwrap();
     os::io_port_grant(0x64, 1).unwrap();
     let mut legacy_bus = LegacyBus;
-    let mut legacy = match ps2::initialize(&mut legacy_bus) {
+    let mut legacy = match ps2::initialize(&mut legacy_bus, false) {
         Ok(devices) => {
             diagnostic(format_args!(
                 "INTEGRATED PS2: keyboard={:?} mouse={:?}",
@@ -339,7 +339,6 @@ fn deliver(event: zos_console::usb::Event) -> Result<(), os::Error> {
 fn usb_input(test: bool) -> ! {
     use zos_console::usb::{Controller, Error, Event};
     assert_eq!(os::io_port_grant(0x170, 8), Err(os::Error::Denied));
-    assert_eq!(os::irq_attach(INPUT, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(INPUT, 12), Err(os::Error::Denied));
     // Most laptops wire the built-in keyboard to the legacy i8042 controller, so
     // its two ports are granted. Without it (or without a USB keyboard) the
@@ -347,13 +346,17 @@ fn usb_input(test: bool) -> ! {
     os::io_port_grant(0x60, 1).unwrap();
     os::io_port_grant(0x64, 1).unwrap();
     let mut bus = LegacyBus;
-    let mut legacy = match ps2::initialize(&mut bus) {
+    let mut legacy = match ps2::initialize(&mut bus, true) {
         Ok(devices) => {
             log(format_args!(
                 "INTEGRATED PS2: kbd={} mouse={}",
                 devices.keyboard.is_ok(),
                 devices.mouse.is_ok()
             ));
+            if devices.keyboard.is_ok() {
+                // Wake on every keyboard byte (the timer poll below stays as a backup).
+                os::irq_attach(INPUT, 1).unwrap();
+            }
             Some(devices)
         }
         Err(error) => {
@@ -410,8 +413,12 @@ fn usb_input(test: bool) -> ! {
     loop {
         let (token, length) = os::receive(INPUT, &mut request).unwrap();
         if token == 0 {
+            // IRQ notification: 0 is the timer tick, 1 the keyboard.
             assert_eq!(length, 8);
-            assert_eq!(u64::from_le_bytes(request[..8].try_into().unwrap()), 0);
+            assert!(matches!(
+                u64::from_le_bytes(request[..8].try_into().unwrap()),
+                0 | 1
+            ));
         } else if token & 0xffff == TTY && &request[..length] == b"ready" && !ready {
             ready = true;
             os::reply(token, &[]).unwrap();

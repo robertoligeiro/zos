@@ -58,7 +58,7 @@ impl Shell {
         match args[0] {
             b"help" => {
                 exact(1)?;
-                out.bytes(b"ZOS shell: quotes, escapes, ;, >, >> and background &\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv\nfree ps kill wait uname reboot halt\nPrograms load from /bin or an explicit path.\n")?;
+                out.bytes(b"ZOS shell: quotes, escapes, ;, >, >> and background &\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv\nfree ps kill wait uname dmesg reboot halt\ndmesg prints the system log; dmesg > /name saves it.\nPrograms load from /bin or an explicit path.\n")?;
             }
             b"clear" => {
                 exact(1)?;
@@ -176,6 +176,22 @@ impl Shell {
                 exact(1)?;
                 out.bytes(b"ZOS - Zombie OS (x86_64)\n")?;
             }
+            b"dmesg" => {
+                // A snapshot of the log: text produced while printing it is not
+                // chased, so `dmesg > /file` terminates.
+                exact(1)?;
+                let mut chunk = [0; 960];
+                let (end, _) = client::log(u64::MAX, &mut chunk)?;
+                let mut offset = 0;
+                while offset < end {
+                    let (next, count) = client::log(offset, &mut chunk)?;
+                    if count == 0 {
+                        break;
+                    }
+                    out.bytes(&chunk[..count])?;
+                    offset = next;
+                }
+            }
             b"reboot" | b"halt" => {
                 exact(1)?;
                 out.bytes(if args[0] == b"reboot" {
@@ -217,6 +233,7 @@ impl Shell {
                 | b"kill"
                 | b"wait"
                 | b"uname"
+                | b"dmesg"
                 | b"reboot"
                 | b"halt"
         );
@@ -364,6 +381,27 @@ fn self_test() {
     os::debug_write("PATH SPAWN PASS: executable copied to filesystem path").unwrap();
 }
 
+/// Writes the log collected so far to `path`, replacing any previous copy.
+fn save_log(path: &[u8]) -> Result<()> {
+    let mut chunk = [0; 960];
+    let (end, _) = client::log(u64::MAX, &mut chunk)?;
+    let fd = api::open(path, WRITE | CREATE | TRUNCATE)?;
+    let result = (|| {
+        let mut offset = 0;
+        while offset < end {
+            let (next, count) = client::log(offset, &mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            write_all(fd, &chunk[..count])?;
+            offset = next;
+        }
+        Ok(())
+    })();
+    api::close(fd)?;
+    result
+}
+
 #[no_mangle]
 pub extern "C" fn _start(test: usize) -> ! {
     let usb = test & 8 != 0;
@@ -398,6 +436,14 @@ pub extern "C" fn _start(test: usize) -> ! {
     }
     let mut shell = Shell::new();
     let mut editor = Editor::default();
+    if usb {
+        // Keep a copy of this boot's log on the stick so it can be read from another
+        // computer (tools\zosfs.py). A failure here must never stop the shell.
+        match save_log(b"/boot.log") {
+            Ok(()) => os::debug_write("BOOT LOG saved to /boot.log").unwrap(),
+            Err(_) => os::debug_write("BOOT LOG could not be saved").unwrap(),
+        }
+    }
     console(b"ZOS - Zombie OS\nInteractive shell ready. Type help for commands.\n");
     redraw(&editor);
     os::send(INPUT, b"ready", &mut []).unwrap();

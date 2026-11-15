@@ -16,8 +16,9 @@ import sys
 import time
 
 from mkimage import BUILD, ROOT, create_image, image_path
-from mkfs import (ZOS_PARTITION_TYPE, data_path, ensure_disk, format_disk, format_gpt_disk, outside_zos_sha256,
-                  validate_disk, volume_image)
+from mkfs import (ZOS_FIRST, ZOS_PARTITION_TYPE, data_path, ensure_disk, format_disk, format_gpt_disk,
+                  outside_zos_sha256, validate_disk, volume_image)
+from zosfs import load as load_volume
 
 TOOLS = ROOT / ".tools"
 CASES = {
@@ -864,6 +865,7 @@ def usb_ps2_case(disk: Path, firmware: str, timeout: int) -> None:
             keys = ShellKeys(process, qmp, log, timeout)
             keys.line("mkdir p; cd p; echo ps2 > f; cat f; pwd", [0] * 5)
             keys.line("cp f g; cat g; ls", [0, 0, 0])
+            keys.line("dmesg > /k.log; ls /", [0, 0])
             keys.type("echo abxc")
             keys.key("left")
             keys.key("left")
@@ -895,6 +897,15 @@ def usb_ps2_case(disk: Path, firmware: str, timeout: int) -> None:
             process.stdout.close()
     if outside_zos_sha256(data) != outside:
         raise RuntimeError("PS/2 shell wrote outside the ZOS partition")
+    # The saved logs must be readable from the host, straight off the stick image.
+    volume = load_volume(data, ZOS_FIRST)
+    boot_log = volume.read(volume.lookup("/boot.log")).decode("ascii", "replace")
+    for expected in ("INTEGRATED PS2: kbd=true mouse=true", "USB WINDOW: base=16384", "FS ready: checkpoint="):
+        if expected not in boot_log:
+            raise RuntimeError(f"/boot.log on the stick lacks {expected!r}")
+    shell_log = volume.read(volume.lookup("/k.log")).decode("ascii", "replace")
+    if "SHELL LINE DONE: 2" not in shell_log or "USB WINDOW: base=16384" not in shell_log:
+        raise RuntimeError("dmesg > /k.log did not save the running log")
     print(f"PASS {firmware}/usb-ps2: built-in keyboard and mouse drive the shell on USB storage", flush=True)
 
 
