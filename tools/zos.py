@@ -72,7 +72,10 @@ SHELL_PROOFS = (
 USB_MARKERS = (
     "PCI XHCI PASS:", "XHCI ready:", "USB ENUM PASS: slot=1 port=3 Storage",
     "USB ENUM PASS: slot=2 port=5 Keyboard", "USB ENUM PASS: slot=3 port=6 Mouse",
-    "USB SCSI PASS:", "USB ready:", "USB CAPABILITIES PASS:",
+    "USB SCSI PASS:", "USB ready:",
+    # QEMU has no serial-IO controller: the I2C touchpad probe must run and say so.
+    "I2C: no serial-IO controller on PCI", "I2C: no touchpad found",
+    "USB CAPABILITIES PASS:",
     "CAPABILITIES PASS: framebuffer, USB MMIO/DMA and IRQs isolated",
     "BLOCK ready: USB bulk-only SCSI", "FS ready: checkpoint=", "VFS ready: root mount",
     "CONSOLE PASS: cursor, colors, backspace, scrolling", READY_MARKER,
@@ -217,9 +220,13 @@ def boot_menu() -> bytes:
     diagnostic = command_entry.rstrip("\n").replace("    resolution:", marker + "    resolution:", 1)
     if marker not in diagnostic:
         raise RuntimeError("boot/limine.conf has no resolution line to put the marker before")
+    # Safe mode: the command line with the touchpad (I2C) probe switched off.
+    safe_marker = "    module_path: boot():/boot/echo-server.elf\n    module_cmdline: no-i2c\n"
+    safe = command_entry.rstrip("\n").replace("    resolution:", safe_marker + "    resolution:", 1)
     menu = (header + "/ZOS - Desktop (GUI)" + desktop_entry.rstrip("\n") + "\n\n"
             + "/ZOS - Command line" + command_entry.rstrip("\n") + "\n\n"
-            + "/ZOS - Diagnostic (show boot log)" + diagnostic + "\n")
+            + "/ZOS - Diagnostic (show boot log)" + diagnostic + "\n\n"
+            + "/ZOS - Safe mode (no touchpad probe)" + safe + "\n")
     return menu.encode("ascii")
 
 
@@ -1574,12 +1581,15 @@ def main() -> None:
     parser.add_argument("--data-image", help="Dedicated volume name inside build (default: data.img or data-usb.img)")
     parser.add_argument("--usb", action="store_true", help="QEMU xHCI USB keyboard/mouse and data disk")
     parser.add_argument("--diagnostic", action="store_true", help="Read-only Intel/QEMU USB diagnostics; no filesystem or shell")
+    parser.add_argument("--gui", action="store_true", help="Boot the window manager desktop instead of the text console (run/image)")
     parser.add_argument("--force", action="store_true", help="Explicitly overwrite the selected data volume (mkfs only)")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.force and args.command != "mkfs":
         parser.error("--force is only valid with mkfs")
+    if args.gui and (args.diagnostic or args.command not in ("image", "run", "debug")):
+        parser.error("--gui is only valid with image, run or debug (not --diagnostic)")
     if args.diagnostic and (args.usb or args.data_image is not None or args.command == "mkfs"):
         parser.error("--diagnostic cannot be combined with --usb, --data-image or mkfs")
     args.data_image = args.data_image or ("data-usb.img" if args.usb else "data.img")
@@ -1594,7 +1604,9 @@ def main() -> None:
     else:
         kernel = build(usb=args.usb, diagnostic=args.diagnostic)
         if args.command != "build":
-            disk = image(kernel, "diagnostic" if args.diagnostic else "usb" if args.usb else None)
+            disk = image(kernel, "diagnostic" if args.diagnostic else
+                         ("usb-gui" if args.usb else "gui") if args.gui else
+                         "usb" if args.usb else None)
             if args.command in ("run", "debug"):
                 command = (diagnostic_command(disk, args.firmware) if args.diagnostic else
                     qemu_command(disk, args.firmware, data_disk=ensure_disk(args.data_image),

@@ -48,12 +48,20 @@ static END: limine::RequestsEndMarker = limine::RequestsEndMarker::new();
 /// `screenlog`: the kernel then keeps its boot log on screen (no logo, no hand-off) and
 /// the console server draws nothing, so a hang shows exactly how far boot got.
 pub fn screenlog() -> bool {
-    MODULES.response().is_some_and(|response| {
-        response
-            .modules()
-            .iter()
-            .any(|file| file.cmdline() == "screenlog")
-    })
+    has_marker("screenlog")
+}
+
+/// True when the boot menu's "Safe mode" entry added a module with the command line
+/// `no-i2c`: the touchpad probe is skipped, in case a machine's serial-IO controller
+/// misbehaves when touched.
+pub fn no_i2c() -> bool {
+    has_marker("no-i2c")
+}
+
+fn has_marker(name: &str) -> bool {
+    MODULES
+        .response()
+        .is_some_and(|response| response.modules().iter().any(|file| file.cmdline() == name))
 }
 
 pub fn report() {

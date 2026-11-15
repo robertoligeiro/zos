@@ -4,6 +4,7 @@
 extern crate std;
 
 pub mod editor;
+pub mod i2c;
 pub mod keyboard;
 pub mod mouse;
 pub mod ps2;

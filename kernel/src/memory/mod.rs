@@ -343,7 +343,10 @@ impl AddressSpace {
     }
 
     pub fn map_device(&mut self, physical: u64, length: u64) -> Result<u64, Error> {
-        let base = 0x2800_0000;
+        self.map_device_at(0x2800_0000, physical, length)
+    }
+
+    pub fn map_device_at(&mut self, base: u64, physical: u64, length: u64) -> Result<u64, Error> {
         if physical % PAGE_SIZE != 0 || length == 0 || length > 65536 || length % PAGE_SIZE != 0 {
             return Err(Error::InvalidAddress);
         }

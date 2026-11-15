@@ -709,7 +709,9 @@ impl Scheduler {
             {
                 self.management(id, frame)
             }
-            x if (Call::UsbController as u64..=Call::UsbEnableDma as u64).contains(&x) => {
+            x if (Call::UsbController as u64..=Call::UsbEnableDma as u64).contains(&x)
+                || x == Call::I2cController as u64 =>
+            {
                 self.hardware(id, frame)
             }
             _ => Err(Error::Invalid),

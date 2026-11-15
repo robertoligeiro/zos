@@ -344,6 +344,64 @@ fn deliver(event: zos_console::usb::Event) -> Result<(), os::Error> {
     .map(|_| ())
 }
 
+/// A serial-IO controller's register window, mapped by the kernel.
+struct Mmio {
+    base: usize,
+    length: usize,
+}
+
+impl zos_console::i2c::Regs for Mmio {
+    fn read(&mut self, offset: usize) -> u32 {
+        if offset + 4 > self.length {
+            return u32::MAX;
+        }
+        // SAFETY: the kernel mapped `length` bytes of this controller at `base`
+        // (uncached, device memory) for this process alone; the offset is in range.
+        unsafe { core::ptr::read_volatile((self.base + offset) as *const u32) }
+    }
+    fn write(&mut self, offset: usize, value: u32) {
+        if offset + 4 <= self.length {
+            // SAFETY: as in `read`.
+            unsafe { core::ptr::write_volatile((self.base + offset) as *mut u32, value) }
+        }
+    }
+    fn ticks(&self) -> u64 {
+        os::usb_ticks().unwrap_or(0)
+    }
+}
+
+/// Looks on every Intel serial-IO controller for a HID-over-I2C touchpad. Never fails
+/// the boot: everything it learns goes to the log, and without one the machine simply
+/// has no built-in pointer (a USB or PS/2 mouse still works).
+fn find_touchpad(
+) -> Option<zos_console::i2c::touchpad::Touchpad<zos_console::i2c::designware::DesignWare<Mmio>>> {
+    for index in 0..16 {
+        match os::i2c_controller(index) {
+            Ok(window) => {
+                let regs = Mmio {
+                    base: window.address as usize,
+                    length: window.length,
+                };
+                let found = zos_console::i2c::touchpad::probe(index, regs, &mut |line| {
+                    let _ = os::debug_write(line);
+                });
+                if found.is_some() {
+                    return found;
+                }
+            }
+            Err(os::Error::Invalid) => {
+                if index == 0 {
+                    log(format_args!("I2C: no serial-IO controller on PCI"));
+                }
+                break;
+            }
+            Err(error) => log(format_args!("I2C{index}: no usable window ({error:?})")),
+        }
+    }
+    log(format_args!("I2C: no touchpad found"));
+    None
+}
+
 fn usb_input(test: bool) -> ! {
     use zos_console::usb::{Controller, Error, Event};
     assert_eq!(os::io_port_grant(0x170, 8), Err(os::Error::Denied));
@@ -412,6 +470,7 @@ fn usb_input(test: bool) -> ! {
         controller.test_rings().unwrap();
         os::debug_write("USB DMA CAPABILITY PASS: bad pointer, quota, NX MMIO").unwrap();
     }
+    let mut touchpad = find_touchpad();
     os::irq_attach(INPUT, 0).unwrap();
     os::debug_write("USB CAPABILITIES PASS: controller/DMA + i8042; no ATA").unwrap();
     let mut ready = false;
@@ -420,13 +479,13 @@ fn usb_input(test: bool) -> ! {
     let mut reply = [0; 513];
     loop {
         let (token, length) = os::receive(INPUT, &mut request).unwrap();
+        let mut timer_tick = false;
         if token == 0 {
             // IRQ notification: 0 is the timer tick, 1 the keyboard.
             assert_eq!(length, 8);
-            assert!(matches!(
-                u64::from_le_bytes(request[..8].try_into().unwrap()),
-                0 | 1
-            ));
+            let source = u64::from_le_bytes(request[..8].try_into().unwrap());
+            assert!(matches!(source, 0 | 1));
+            timer_tick = source == 0;
         } else if token & 0xffff == TTY && &request[..length] == b"ready" && !ready {
             ready = true;
             os::reply(token, &[]).unwrap();
@@ -481,6 +540,22 @@ fn usb_input(test: bool) -> ! {
         if offline {
             log(format_args!("INTEGRATED PS2 OFFLINE"));
             legacy = None;
+        }
+        // The built-in I2C touchpad has no interrupt we can use: poll it on the tick.
+        if timer_tick {
+            if let Some(pad) = touchpad.as_mut() {
+                if let Some(motion) = pad.poll() {
+                    pending.push(Event::Pointer {
+                        dx: motion.dx,
+                        dy: motion.dy,
+                        buttons: motion.buttons,
+                    });
+                }
+                if pad.dead() {
+                    log(format_args!("I2C touchpad stopped answering"));
+                    touchpad = None;
+                }
+            }
         }
         while let Some(event) = pending.front() {
             if !ready {

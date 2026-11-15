@@ -34,6 +34,7 @@ pub enum Call {
     UsbEnableDma = 23,
     SendReady = 24,
     LogRead = 25,
+    I2cController = 26,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +236,29 @@ pub fn usb_controller() -> Result<UsbController, Error> {
         [bytes.as_mut_ptr() as u64, 16, 0, 0, 0],
     )?;
     Ok(UsbController {
+        address: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        length: u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize,
+    })
+}
+
+/// Register window of an Intel serial-IO (I2C) controller found on PCI.
+#[derive(Debug)]
+pub struct I2cController {
+    pub address: u64,
+    pub length: usize,
+}
+
+/// The `index`th I2C controller (PCI vendor 8086, class 0x118000), mapped uncached at
+/// its own address. `Invalid` means there is no such controller (end of the list);
+/// `Denied` means it exists but cannot be used (no BAR, bridge, overlapping RAM).
+/// Available only to the boot input service in USB images.
+pub fn i2c_controller(index: usize) -> Result<I2cController, Error> {
+    let mut bytes = [0; 16];
+    call(
+        Call::I2cController,
+        [bytes.as_mut_ptr() as u64, 16, index as u64, 0, 0],
+    )?;
+    Ok(I2cController {
         address: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
         length: u64::from_le_bytes(bytes[8..].try_into().unwrap()) as usize,
     })

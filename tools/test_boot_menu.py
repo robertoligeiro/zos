@@ -18,9 +18,18 @@ class BootMenuTests(unittest.TestCase):
         self.assertIn("default_entry: 1", self.header)
         self.assertIn("serial: yes", self.header)
 
-    def test_three_entries_in_order_desktop_first(self):
+    def test_four_entries_in_order_desktop_first(self):
         self.assertEqual(list(self.entries), [
-            "ZOS - Desktop (GUI)", "ZOS - Command line", "ZOS - Diagnostic (show boot log)"])
+            "ZOS - Desktop (GUI)", "ZOS - Command line", "ZOS - Diagnostic (show boot log)",
+            "ZOS - Safe mode (no touchpad probe)"])
+
+    def test_safe_mode_is_the_command_line_with_only_the_no_i2c_marker(self):
+        safe = self.entries["ZOS - Safe mode (no touchpad probe)"]
+        self.assertIn("module_cmdline: no-i2c", safe)
+        self.assertNotIn("screenlog", safe)
+        self.assertNotIn("wm-server", safe)
+        for name, entry in self.entries.items():
+            self.assertEqual("module_cmdline: no-i2c" in entry, "Safe mode" in name, name)
 
     def test_only_the_diagnostic_entry_has_the_screenlog_marker(self):
         for name, entry in self.entries.items():
@@ -41,9 +50,11 @@ class BootMenuTests(unittest.TestCase):
             return [line.strip() for line in entry.splitlines() if "module_" in line or line.strip().startswith("path:")]
         desktop = modules(self.entries["ZOS - Desktop (GUI)"])
         plain = modules(self.entries["ZOS - Command line"])
-        diagnostic = modules(self.entries["ZOS - Diagnostic (show boot log)"])
-        marker = diagnostic.index("module_cmdline: screenlog")
-        self.assertEqual(diagnostic[:marker - 1] + diagnostic[marker + 1:], plain)
+        for name, flag in (("ZOS - Diagnostic (show boot log)", "screenlog"),
+                           ("ZOS - Safe mode (no touchpad probe)", "no-i2c")):
+            marked = modules(self.entries[name])
+            marker = marked.index(f"module_cmdline: {flag}")
+            self.assertEqual(marked[:marker - 1] + marked[marker + 1:], plain, name)
         self.assertEqual(len(desktop), len(plain))
         differing = [(a, b) for a, b in zip(desktop, plain) if a != b]
         self.assertEqual(differing, [("module_path: boot():/boot/wm-server.elf", "module_path: boot():/boot/console-server.elf")])
