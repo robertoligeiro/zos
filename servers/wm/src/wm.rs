@@ -159,7 +159,18 @@ impl Desktop<'_> {
         if clip.is_empty() {
             return;
         }
-        self.surface.fill(content, clip, zos_wm::grid::DEFAULT_BG);
+        // Every cell paints its own background, so only the margin around the grid is
+        // filled: filling the whole area first made output visibly blink on real hardware.
+        let grid_w = COLS as i32 * GLYPH_W;
+        let grid_h = ROWS as i32 * GLYPH_H;
+        if content.w > grid_w {
+            let strip = Rect::new(content.x + grid_w, content.y, content.w - grid_w, content.h);
+            self.surface.fill(strip, clip, zos_wm::grid::DEFAULT_BG);
+        }
+        if content.h > grid_h {
+            let strip = Rect::new(content.x, content.y + grid_h, grid_w, content.h - grid_h);
+            self.surface.fill(strip, clip, zos_wm::grid::DEFAULT_BG);
+        }
         for row in 0..ROWS {
             let y = content.y + row as i32 * GLYPH_H;
             if y + GLYPH_H <= clip.y || y >= clip.bottom() {
@@ -201,6 +212,11 @@ impl Desktop<'_> {
             None,
             area.intersect(launcher),
         );
+        // Always-visible hint: the keyboard works everywhere, the pointer may not.
+        let hint: &[u8] = b"Alt+H: keyboard help";
+        let hint_x = bar.x + bar.w - hint.len() as i32 * GLYPH_W - 12;
+        self.surface
+            .text(hint_x, bar.y + 6, hint, DIMMED, None, area);
         let mut buttons = [(0usize, Rect::EMPTY); MAX_WINDOWS];
         let mut count = 0;
         for entry in self.manager.task_buttons() {
@@ -272,8 +288,30 @@ impl Desktop<'_> {
             COLS as i32 * GLYPH_W,
             (last - first + 1) * GLYPH_H,
         );
+        let visible = rows.intersect(self.manager.visible_rect(slot));
+        // Fast path: when nothing else covers those rows (and no drag is in progress),
+        // redraw only the changed text rows instead of the whole window stack.
+        let covered = self.outline.is_some()
+            || (0..MAX_WINDOWS).any(|other| {
+                other != slot
+                    && self.manager.window(other).is_some()
+                    && !self
+                        .manager
+                        .visible_rect(other)
+                        .intersect(visible)
+                        .is_empty()
+            })
+            || self.manager.window(slot).map(|w| w.state) == Some(State::Minimized);
+        if !covered {
+            let active = self.manager.focused() == Some(slot);
+            self.cursor.hide(&mut self.surface);
+            self.paint_terminal(content, visible, active);
+            let (x, y) = self.manager.pointer();
+            self.cursor.show(&mut self.surface, x, y);
+            return;
+        }
         let mut fx = Effects::default();
-        fx.add(rows.intersect(self.manager.visible_rect(slot)));
+        fx.add(visible);
         self.apply(&fx);
     }
 }
