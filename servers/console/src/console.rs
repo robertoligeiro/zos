@@ -95,6 +95,8 @@ pub extern "C" fn _start(role: usize) -> ! {
                 os::reply(token, &(terminal.scrolls as u64).to_le_bytes()).unwrap();
                 continue;
             }
+            // Window-manager shortcuts mean nothing to the plain text console.
+            [ALT, _] => (),
             _ => panic!("Invalid console protocol"),
         }
         terminal.render(pixels, fb);

@@ -142,7 +142,7 @@ impl Shell {
         match args[0] {
             b"help" => {
                 exact(1)?;
-                out.bytes(b"ZOS shell: quotes, escapes, ;, >, >> and background &\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv\nfree ps kill wait uname dmesg reboot halt\ndmesg prints the system log; dmesg > /name saves it.\nPrograms load from /bin or an explicit path.\n")?;
+                out.bytes(b"ZOS shell: quotes, escapes, $VAR, ${VAR}, $?, # comments, * ? [a-z] globs, ;, &&, ||, !, >, >> and &\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv free ps kill wait uname dmesg\nexport unset env set (printenv is a program); NAME=value cmd; reboot halt\ndmesg prints the system log; dmesg > /name saves it.\nPrograms are found through $PATH (default /bin) or an explicit path.\n")?;
             }
             b"clear" => {
                 exact(1)?;

@@ -698,6 +698,44 @@ for inclusion in ZOS by you, as defined in the Apache-2.0 license, is dual licen
 above, without any additional terms or conditions. Third-party components and their
 licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
 
+### Shell 2.0 (in progress)
+
+Checkpoint 10A of the roadmap in `MICROKERNEL_OS_PLAN.md` is in: a bounded parser and
+per-command expansion. The shell understands `NAME=value` and `$NAME` / `${NAME}` /
+`$?`, single and double quotes and backslash escapes, `#` comments, `;`, `&`, `&&`,
+`||`, a leading `!`, filename patterns (`*`, `?`, `[a-z]`, sorted; quoted or unmatched
+patterns stay literal), `$PATH` lookup, and the builtins `export`, `unset`, `env` and
+`set`. Spawned programs inherit exported variables (see `printenv`). Differences from
+Bash, on purpose: an expanded value stays one word (no word splitting), and there is
+no `$(...)`. Pipelines and the `<`, `2>`, `2>&1` redirections already parse, but the
+shell refuses to run them until real pipes land (checkpoint 10B), rather than
+pretending.
+
+### Desktop (window manager)
+
+A ring-3 window manager (`servers/wm`) runs in place of the text console. It owns the
+framebuffer and the console channel, so the shell runs unchanged inside a terminal
+window. Windows have title bars with minimize, maximize and close buttons, overlap and
+raise on click, drag by the title bar (with an XOR outline, committed on release), and
+there is a taskbar with a launcher and one button per window. The pointer works with
+a PS/2 or USB mouse; **everything is also available from the keyboard**, since many
+laptop touchpads are not supported yet:
+
+| Keys | Action |
+| --- | --- |
+| Alt+Tab, Alt+\` | next / previous window |
+| Alt+Arrows | move the focused window |
+| Alt+M, Alt+X | minimize, maximize / restore |
+| Alt+W | close (the shell terminal cannot be closed) |
+| Alt+H | show / hide the help window |
+
+The logic (geometry, clipped drawing, the text grid, windows, focus, hit testing, the
+pointer state machine) is a host-tested library (`zos_wm`); QEMU acceptance runs the
+desktop with PS/2 and with USB keyboard, mouse and storage, in BIOS and UEFI, checking
+real framebuffer pixels. Not yet: more than one terminal session, application
+windows, resizing. The USB stick's boot menu offers **Desktop (GUI)** (default after 5
+seconds) and **Command line**; the QEMU test images boot straight to one entry.
+
 **Artwork.** `assets/zos-logo.png` and `assets/zos-logo-article.png` are AI-generated
 images, and `assets/zos-splash.bin` is the boot-screen bitmap derived from the logo
 (`python tools\mksplash.py`). They carry their own notice ("All rights reserved") and

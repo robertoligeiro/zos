@@ -149,7 +149,8 @@ function Get-ZosNormalPackage {
     $names = @($manifest.files.PSObject.Properties.Name)
     $required = @('EFI\BOOT\BOOTX64.EFI', 'limine.conf', 'boot\zos.elf', 'boot\console-server.elf',
         'boot\input-server.elf', 'boot\tty-server.elf', 'boot\blkdev-server.elf', 'boot\fs-simple-server.elf',
-        'boot\vfs-server.elf', 'boot\procmgr-server.elf', 'boot\shell-server.elf', 'boot\zos-command.elf')
+        'boot\vfs-server.elf', 'boot\procmgr-server.elf', 'boot\shell-server.elf', 'boot\zos-command.elf',
+        'boot\wm-server.elf')
     foreach ($name in $required) {
         if ($names -cnotcontains $name) { throw "Normal package is missing: $name" }
     }

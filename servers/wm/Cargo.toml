@@ -1,0 +1,15 @@
+[package]
+name = "zos-wm"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wm-server"
+path = "src/wm.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }
+zos-console = { path = "../console" }
+font8x8 = { version = "=0.3.1", default-features = false, features = ["unicode"] }

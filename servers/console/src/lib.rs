@@ -20,6 +20,9 @@ pub const CLEAR: u8 = 2;
 pub const LINE: u8 = 3;
 pub const POINTER: u8 = 4;
 pub const SCROLLS: u8 = 5;
+/// `[ALT, key]`: an Alt+key shortcut (see `keyboard::Key::Alt`), sent by the input
+/// service to the console channel for the window manager. The text console ignores it.
+pub const ALT: u8 = 6;
 
 pub fn output(text: &[u8]) {
     for part in text.chunks(63) {

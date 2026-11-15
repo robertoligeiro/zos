@@ -16,6 +16,7 @@ fn scan(usage: u8) -> Option<(u8, bool)> {
         39 => 0x0b,
         40 => 0x1c,
         42 => 0x0e,
+        43 => 0x0f,
         44 => 0x39,
         45 => 0x0c,
         46 => 0x0d,
@@ -51,6 +52,8 @@ impl BootKeyboard {
             (4, 0x1d, true),
             (1, 0x2a, false),
             (5, 0x36, false),
+            (2, 0x38, false),
+            (6, 0x38, true),
         ] {
             if (bytes[0] ^ self.previous[0]) & (1 << bit) != 0 {
                 if extended {
@@ -114,5 +117,37 @@ mod tests {
         assert_eq!(report([0, 0, 57, 0, 0, 0, 0, 0]), None);
         report([0; 8]);
         assert_eq!(report([0, 0, 4, 0, 0, 0, 0, 0]), Some(Key::Character(b'A')));
+    }
+
+    #[test]
+    fn usb_alt_shortcuts_and_tab_reach_the_window_manager() {
+        use crate::keyboard::{ALT_LEFT, ALT_UP};
+        let mut keyboard = BootKeyboard::default();
+        let mut found = None;
+        let mut report = |bytes| {
+            found = None;
+            keyboard.report(bytes, |key| found = Some(key));
+            found
+        };
+        // Plain Tab is a key; with left Alt (modifier bit 2) it is Alt+Tab.
+        assert_eq!(report([0, 0, 43, 0, 0, 0, 0, 0]), Some(Key::Tab));
+        report([0; 8]);
+        assert_eq!(report([4, 0, 43, 0, 0, 0, 0, 0]), Some(Key::Alt(b'\t')));
+        report([0; 8]);
+        // Alt+H (usage 11), then right Alt (bit 6) + Alt+Left arrow (usage 80).
+        assert_eq!(report([4, 0, 11, 0, 0, 0, 0, 0]), Some(Key::Alt(b'h')));
+        report([0; 8]);
+        assert_eq!(report([64, 0, 80, 0, 0, 0, 0, 0]), Some(Key::Alt(ALT_LEFT)));
+        report([0; 8]);
+        assert_eq!(report([4, 0, 82, 0, 0, 0, 0, 0]), Some(Key::Alt(ALT_UP)));
+        report([0; 8]);
+        // Releasing Alt returns to ordinary keys, and Alt does not stick.
+        assert_eq!(
+            report([0, 0, 11, 0, 0, 0, 0, 0]),
+            Some(Key::Character(b'h'))
+        );
+        // Shift+Alt still gives the unshifted shortcut.
+        report([0; 8]);
+        assert_eq!(report([6, 0, 16, 0, 0, 0, 0, 0]), Some(Key::Alt(b'm')));
     }
 }

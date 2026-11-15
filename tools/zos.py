@@ -114,7 +114,7 @@ def build(case: str | None = None, *, usb: bool = False, diagnostic: bool = Fals
     if diagnostic and case:
         raise ValueError("Diagnostics cannot be combined with another boot test")
     cargo("build", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", user=True)
+          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", "--package", "zos-wm", user=True)
     BUILD.mkdir(exist_ok=True)
     program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / "zos-command"
     (BUILD / "zos-command.elf").write_bytes(compact_elf(program.read_bytes()))
@@ -155,13 +155,19 @@ def compact_elf(data: bytes) -> bytes:
 def image(kernel: Path, case: str | None = None) -> Path:
     limine = TOOLS / "limine"
     destination = image_path(f"zos-{case}.img" if case else "zos.img")
+    configuration = {"diagnostic": "limine-diagnostic.conf", "gui": "limine-gui.conf",
+                     "usb-gui": "limine-gui.conf"}.get(case, "limine.conf")
     payloads = {
-        "limine.conf": (ROOT / "boot" / ("limine-diagnostic.conf" if case == "diagnostic" else "limine.conf")).read_bytes(),
+        "limine.conf": (ROOT / "boot" / configuration).read_bytes(),
         "limine-bios.sys": (limine / "limine-bios.sys").read_bytes(),
         "EFI/BOOT/BOOTX64.EFI": (limine / "BOOTX64.EFI").read_bytes(),
         "boot/zos.elf": kernel.read_bytes(),
     }
-    for program in (("console-server", "input-server") if case == "diagnostic" else USER_PROGRAMS):
+    # The desktop entry loads the window manager in place of the text console server.
+    programs = ("console-server", "input-server") if case == "diagnostic" else (
+        tuple(p for p in USER_PROGRAMS if p != "console-server") + ("wm-server",) if case in ("gui", "usb-gui")
+        else USER_PROGRAMS)
+    for program in programs:
         source = BUILD / "zos-command.elf" if program == "zos-command" else (
             ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / program
         )
@@ -191,6 +197,21 @@ def image(kernel: Path, case: str | None = None) -> Path:
     return destination
 
 
+def boot_menu() -> bytes:
+    """A Limine config with two entries built from the normal and desktop configs: the
+    desktop first (the default), then the plain command line."""
+    command_line = (ROOT / "boot" / "limine.conf").read_text(encoding="ascii").replace("\r\n", "\n")
+    desktop = (ROOT / "boot" / "limine-gui.conf").read_text(encoding="ascii").replace("\r\n", "\n")
+    header, command_entry = command_line.split("/ZOS - Zombie OS", 1)
+    _, desktop_entry = desktop.split("/ZOS - Zombie OS (desktop)", 1)
+    if "timeout: 0" not in header:
+        raise RuntimeError("boot/limine.conf no longer starts with 'timeout: 0'")
+    header = header.replace("timeout: 0", "timeout: 5\ndefault_entry: 1")
+    menu = (header + "/ZOS - Desktop (GUI)" + desktop_entry.rstrip("\n") + "\n\n"
+            + "/ZOS - Command line" + command_entry)
+    return menu.encode("ascii")
+
+
 def usb_normal_package(payloads: dict[str, bytes]) -> Path:
     """The files for a bootable USB stick with the interactive shell and a writable ZOS
     volume. prepare-usb.ps1 -Normal copies the boot files to a FAT32 partition and writes
@@ -198,6 +219,11 @@ def usb_normal_package(payloads: dict[str, bytes]) -> Path:
     package = BUILD / "usb-normal-files"
     shutil.rmtree(package, ignore_errors=True)
     hashes = {}
+    # Boot menu: the desktop (default after 5 seconds) or the plain command line.
+    payloads = dict(payloads)
+    payloads["limine.conf"] = boot_menu()
+    payloads["boot/wm-server.elf"] = (ROOT / "target" / "user" / "x86_64-unknown-none" / "release"
+                                      / "wm-server").read_bytes()
     for name, data in payloads.items():
         if name == "limine-bios.sys":
             continue
@@ -1131,6 +1157,198 @@ def read_ppm(path: Path) -> tuple[int, int, bytes]:
     return width, height, pixels
 
 
+def color_box(width: int, height: int, pixels: bytes, rgb: int, tolerance: int = 2):
+    """Bounding box (x0, y0, x1, y1), inclusive, of the pixels matching 0xRRGGBB, or None."""
+    want = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)
+    x0 = y0 = 10 ** 9
+    x1 = y1 = -1
+    for y in range(height):
+        row = pixels[y * width * 3:(y + 1) * width * 3]
+        for x in range(width):
+            r, g, b = row[x * 3], row[x * 3 + 1], row[x * 3 + 2]
+            if abs(r - want[0]) <= tolerance and abs(g - want[1]) <= tolerance and abs(b - want[2]) <= tolerance:
+                x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+    return (x0, y0, x1, y1) if x1 >= 0 else None
+
+
+def count_color_in(width: int, pixels: bytes, box: tuple[int, int, int, int], rgb: int, tolerance: int = 2) -> int:
+    """Pixels matching 0xRRGGBB inside the inclusive box (x0, y0, x1, y1)."""
+    want = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)
+    x0, y0, x1, y1 = box
+    found = 0
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            i = (y * width + x) * 3
+            found += all(abs(pixels[i + k] - want[k]) <= tolerance for k in range(3))
+    return found
+
+
+def count_color(pixels: bytes, rgb: int, tolerance: int = 2) -> int:
+    want = bytes(((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255))
+    return sum(1 for i in range(0, len(pixels), 3)
+               if all(abs(pixels[i + k] - want[k]) <= tolerance for k in range(3)))
+
+
+# Window-manager colors (servers/wm/src/wm.rs).
+WM_DESKTOP, WM_FRAME, WM_TITLE_ACTIVE, WM_HELP_BACKGROUND, WM_TERMINAL_TEXT = 0x1c3f6e, 0xc8c8c8, 0x0a5c36, 0xf4f4e8, 0x90ee90
+
+
+def gui_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) -> None:
+    """Boots the desktop image and drives it with real keyboard and mouse input,
+    checking the window manager's log and the actual framebuffer pixels. With usb, the
+    keyboard, mouse and the data disk are USB devices instead of PS/2 and ATA."""
+    flavor = "usb-gui" if usb else "gui"
+    data = format_disk(f"data-{flavor}-{firmware}.img", force=True)
+    log = BUILD / f"{firmware}-{flavor}.serial.log"
+    log.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, exit_on_shutdown=True, data_disk=data, usb=usb) + [
+        "-display", "none", "-monitor", "none", "-serial", f"file:{log}",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-qmp", "stdio"]
+    shots = []
+    with (BUILD / f"{firmware}-{flavor}.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-{flavor}.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            wait_serial(process, log, SHELL_READY, timeout)
+            text = wait_serial(process, log, "WM ready:", timeout)
+
+            def shot(name: str):
+                path = BUILD / f"{firmware}-{flavor}-{name}.ppm"
+                qmp.execute("screendump", {"filename": str(path)}, identity=f"shot-{name}")
+                shots.append(path)
+                return read_ppm(path)
+
+            def alt(key: str, *, wait_for: str) -> None:
+                mark = len(log.read_text(encoding="utf-8", errors="replace"))
+                qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "alt"},
+                                                  {"type": "qcode", "data": key}], "hold-time": 5})
+                wait_serial(process, log, wait_for, timeout, start=mark)
+
+            def pointer_to(x: int, y: int) -> tuple[int, int]:
+                """Moves the pointer to a screen position in small steps; returns the final position."""
+                current = re.findall(r"MOUSE: x=(\d+) y=(\d+)", log.read_text(encoding="utf-8", errors="replace"))
+                px, py = (int(v) for v in current[-1]) if current else (512, 384)
+                while (px, py) != (x, y):
+                    dx, dy = max(-100, min(100, x - px)), max(-100, min(100, y - py))
+                    mark = len(log.read_text(encoding="utf-8", errors="replace"))
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "rel", "data": {"axis": "x", "value": dx}},
+                        {"type": "rel", "data": {"axis": "y", "value": dy}}]})
+                    wait_serial(process, log, "MOUSE:", timeout, start=mark)
+                    px, py = px + dx, py + dy
+                return px, py
+
+            def button(down: bool) -> None:
+                mark = len(log.read_text(encoding="utf-8", errors="replace"))
+                qmp.execute("input-send-event", {"events": [{"type": "btn", "data": {"button": "left", "down": down}}]})
+                wait_serial(process, log, "MOUSE:", timeout, start=mark)
+
+            def windows() -> dict[int, tuple[str, int, int, int, int, int]]:
+                """The latest 'WM WIN' line per window slot: state, x, y, w, h, focus."""
+                latest = {}
+                for slot, state, x, y, w, h, focus in re.findall(
+                        r"WM WIN (\d+) (\w+) (-?\d+),(-?\d+) (\d+)x(\d+) focus=(\d)", log.read_text(encoding="utf-8", errors="replace")):
+                    latest[int(slot)] = (state, int(x), int(y), int(w), int(h), int(focus))
+                return latest
+
+            # 1. The desktop: terminal window with the shell banner, taskbar, background.
+            width, height, pixels = shot("desktop")
+            if (width, height) != (1024, 768):
+                raise RuntimeError(f"Unexpected desktop mode {width}x{height}")
+            box = color_box(width, height, pixels, WM_TITLE_ACTIVE)
+            if box is None or box[0] != 43 or box[1] != 39 or box[3] != 58 or not 680 <= box[2] <= 683:
+                raise RuntimeError(f"Terminal title bar is not where expected: {box}")
+            for (x, y), rgb, what in (((900, 300), WM_DESKTOP, "desktop"), ((1000, 760), WM_FRAME, "taskbar")):
+                got = tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+                want = ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)
+                if any(abs(a - b) > 2 for a, b in zip(got, want)):
+                    raise RuntimeError(f"The {what} color at ({x},{y}) is {got}, expected {want}")
+            if count_color(pixels, WM_TERMINAL_TEXT) < 200:
+                raise RuntimeError("No shell text is visible in the terminal window")
+
+            # 2. The shell works inside the window.
+            keys = ShellKeys(process, qmp, log, timeout)
+            keys.line("echo gui > o; cat o", [0, 0])
+            if "SHELL OUT: gui\n" not in log.read_text(encoding="utf-8", errors="replace"):
+                raise RuntimeError("A shell command typed into the terminal window did not run")
+
+            # 3. Alt+H opens the help window, centered near the top.
+            alt("h", wait_for="WM WIN 1 Normal")
+            width, height, pixels = shot("help")
+            box = color_box(width, height, pixels, WM_HELP_BACKGROUND)
+            if box != (295, 83, 728, 356):
+                raise RuntimeError(f"Help window content is not where expected: {box}")
+            if windows()[1][5] != 1 or windows()[0][5] != 0:
+                raise RuntimeError(f"Focus did not move to the new window: {windows()}")
+            # The new window has its own task button, with its title drawn in black.
+            second_button = (212, 743, 359, 764)
+            if count_color_in(width, pixels, second_button, 0x000000) < 20:
+                raise RuntimeError("The help window has no task button in the taskbar")
+
+            # 4. Drag the help window by its title bar with the mouse.
+            pointer_to(400, 72)
+            button(True)
+            pointer_to(500, 132)
+            button(False)
+            moved = windows()[1]
+            if moved[1:3] != (292 + 100, 60 + 60):
+                raise RuntimeError(f"Dragging moved the help window to {moved[1:3]}, expected (392, 120)")
+            width, height, pixels = shot("dragged")
+            box = color_box(width, height, pixels, WM_HELP_BACKGROUND)
+            if box != (395, 143, 828, 416):
+                raise RuntimeError(f"Help window pixels did not follow the drag: {box}")
+
+            # 5. Click-to-focus the terminal, then Alt+Tab back to help.
+            pointer_to(150, 300)
+            button(True)
+            button(False)
+            if windows()[0][5] != 1 or windows()[1][5] != 0:
+                raise RuntimeError(f"Clicking the terminal did not focus it: {windows()}")
+            alt("tab", wait_for="WM WIN")
+            if windows()[1][5] != 1:
+                raise RuntimeError(f"Alt+Tab did not move the focus to the help window: {windows()}")
+
+            # 6. Minimize help with Alt+M; it disappears and its task button restores it.
+            alt("m", wait_for="WM WIN 1 Minimized")
+            width, height, pixels = shot("minimized")
+            if color_box(width, height, pixels, WM_HELP_BACKGROUND) is not None:
+                raise RuntimeError("A minimized window is still drawn")
+            if count_color_in(width, pixels, second_button, 0x909090) < 10:
+                raise RuntimeError("The minimized window button is not greyed out")
+            pointer_to(230, 752)
+            button(True)
+            button(False)
+            if windows()[1][0] != "Normal" or windows()[1][5] != 1:
+                raise RuntimeError(f"The task button did not restore the window: {windows()}")
+
+            # 7. Alt+Tab to the terminal and maximize it: its title bar spans the screen.
+            alt("tab", wait_for="WM WIN")
+            alt("x", wait_for="WM WIN 0 Maximized")
+            width, height, pixels = shot("maximized")
+            box = color_box(width, height, pixels, WM_TITLE_ACTIVE)
+            if box is None or box[0] != 3 or box[1] != 3 or box[2] < 1018:
+                raise RuntimeError(f"A maximized window does not fill the work area: {box}")
+            alt("x", wait_for="WM WIN 0 Normal")
+
+            # 8. The terminal still takes keystrokes after all that.
+            keys.line("cat o", [0])
+            keys.type("~finish")
+            keys.key("ret", wait=False)
+            if process.wait(timeout=timeout) != 33:
+                raise RuntimeError(f"Desktop acceptance exit failed; inspect {log}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    if any(marker in text for marker in ("SERVICE FAILURE", "KERNEL PANIC", "EXCEPTION:")):
+        raise RuntimeError("A service failed while the desktop was running")
+    print(f"PASS {firmware}/{flavor}: desktop, terminal, help window, mouse drag, focus, minimize/restore, maximize", flush=True)
+
+
 def splash_case(disk: Path, firmware: str, timeout: int) -> None:
     """Boots the normal build, freezes the VM as soon as the console is up (before the
     shell banner can replace the logo) and inspects the real framebuffer pixels."""
@@ -1243,11 +1461,11 @@ def check() -> None:
                     "-p", "test_*.py", "-v"], cwd=ROOT, check=True)
     cargo("fmt", "--all", "--", "--check")
     cargo("test", "--locked", "--package", "zos-console", "--lib",
-          "--package", "zos-storage", "--package", "zos-session",
+          "--package", "zos-storage", "--package", "zos-session", "--package", "zos-wm",
           "--target", "x86_64-pc-windows-gnu")
     cargo("clippy", "--locked", "--release", "--package", "zos-demo",
           "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session",
-          "--", "-D", "warnings", user=True)
+          "--package", "zos-wm", "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
         if case:
@@ -1285,7 +1503,16 @@ def accept(timeout: int, *, usb: bool = False, diagnostic: bool = False) -> None
         screenshot(normal, firmware, timeout, data_disk=data)
         splash_case(normal, firmware, timeout)
     usb_cases = []
+    # The desktop: window manager in place of the text console, driven by real input.
+    gui_disk = image(build("shell"), "gui")
+    for firmware in ("bios", "uefi"):
+        gui_case(gui_disk, firmware, timeout)
+        usb_cases.append(f"{firmware}/gui")
     if usb:
+        usb_gui_disk = image(build("shell", usb=True), "usb-gui")
+        for firmware in ("bios", "uefi"):
+            gui_case(usb_gui_disk, firmware, timeout, usb=True)
+            usb_cases.append(f"{firmware}/usb-gui")
         disk = image(build("shell", usb=True), "usb-shell")
         for firmware in ("bios", "uefi"):
             shell_case(disk, firmware, timeout, usb=True)

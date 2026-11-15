@@ -127,3 +127,12 @@ dependencies = [
  "zos-console",
  "zos-libos",
 ]
+
+[[package]]
+name = "zos-wm"
+version = "0.1.0"
+dependencies = [
+ "font8x8",
+ "zos-console",
+ "zos-libos",
+]

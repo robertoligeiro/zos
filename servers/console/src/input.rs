@@ -146,7 +146,12 @@ pub extern "C" fn _start(role: usize) -> ! {
                 }
             } else if let Some(key) = keyboard.feed(byte) {
                 if ready {
-                    os::send(TTY, &key.encode(), &mut []).unwrap();
+                    match key {
+                        zos_console::keyboard::Key::Alt(ch) => {
+                            os::send(CONSOLE, &[ALT, ch], &mut []).unwrap()
+                        }
+                        _ => os::send(TTY, &key.encode(), &mut []).unwrap(),
+                    };
                 }
             }
         }
@@ -321,8 +326,11 @@ impl Pending {
 }
 
 fn deliver(event: zos_console::usb::Event) -> Result<(), os::Error> {
-    use zos_console::usb::Event;
+    use zos_console::{keyboard::Key, usb::Event};
     match event {
+        // Alt shortcuts go to the window manager (the console channel); everything
+        // else is typing for the shell.
+        Event::Key(Key::Alt(ch)) => os::send_ready(CONSOLE, &[ALT, ch], &mut []),
         Event::Key(key) => os::send_ready(TTY, &key.encode(), &mut []),
         Event::Pointer { dx, dy, buttons } => {
             let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
