@@ -109,6 +109,12 @@ impl Ring {
         })
     }
     fn push(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
+        self.push_in_td(parameter, status, control, false)
+    }
+    /// `continues_td` marks a TRB that is followed by more TRBs of the same
+    /// transfer descriptor, so a Link TRB inserted after it must be chained
+    /// (the TRB itself keeps its Chain bit clear, as control stages require).
+    fn push_in_td(&mut self, parameter: u64, status: u32, control: u32, continues_td: bool) -> u64 {
         let offset = self.index * 16;
         let physical = self.page.physical(offset);
         self.page.address(offset, parameter);
@@ -120,8 +126,10 @@ impl Ring {
             self.page.address(4080, self.page.physical(0));
             self.page.write(4088, 0);
             fence(Ordering::Release);
-            self.page
-                .write(4092, (6 << 10) | 2 | (control & 16) | self.cycle);
+            self.page.write(
+                4092,
+                (6 << 10) | 2 | if continues_td { 16 } else { 0 } | self.cycle,
+            );
             self.index = 0;
             self.cycle ^= 1;
             self.wraps += 1;
@@ -214,6 +222,7 @@ pub struct Controller {
     devices: [Option<Device>; os::USB_MAX_DEVICES],
     max_slots: u8,
     spare: Option<Device>,
+    stage: &'static str,
     keyboard: BootKeyboard,
     queue: [Option<Event>; 64],
     queued: usize,
@@ -334,6 +343,7 @@ impl Controller {
             devices: core::array::from_fn(|_| None),
             max_slots: (structural & 255).min(os::USB_MAX_DEVICES as u32) as u8,
             spare: None,
+            stage: "idle",
             keyboard: BootKeyboard::default(),
             queue: [None; 64],
             queued: 0,
@@ -480,62 +490,132 @@ impl Controller {
             core::hint::spin_loop();
         }
         let mut count = 0;
-        for (port, &protocol) in protocols.iter().enumerate().take(ports + 1).skip(1) {
-            let offset = op + 0x400 + (port - 1) * 16;
-            let status = controller.read(offset);
-            if status & 1 == 0 {
-                continue;
-            }
-            if read_only {
-                controller.report(format_args!("USB PORT {port}: status={status:#010x}"));
-            }
-            let Some(protocol) = protocol else {
-                controller.report(format_args!("USB SKIP port={port}: unsupported protocol"));
-                continue;
-            };
-            if count == controller.max_slots as usize {
+        // Pass 0 enumerates everything except full/low-speed USB2 devices (typically
+        // internal radios or sensors, which can be slow or flaky); pass 1 then handles
+        // them, so a problem device cannot delay or hide the likely boot medium.
+        for pass in 0..2 {
+            for (port, &protocol) in protocols.iter().enumerate().take(ports + 1).skip(1) {
+                let offset = op + 0x400 + (port - 1) * 16;
+                let status = controller.read(offset);
+                if status & 1 == 0 {
+                    continue;
+                }
+                let deferred = protocol.is_some_and(|p| p.revision == 2)
+                    && matches!((status >> 10) & 15, 1 | 2);
+                if deferred != (pass == 1) {
+                    continue;
+                }
                 if read_only {
-                    controller.report(format_args!("USB SKIP port={port}: device-slot limit"));
-                    continue;
+                    controller.report(format_args!("USB PORT {port}: status={status:#010x}"));
                 }
-                return Err(Error::Unsupported);
-            }
-            if protocol.revision == 2 || status & 2 == 0 {
-                let reset = if protocol.revision == 3 {
-                    1 << 31
-                } else {
-                    1 << 4
+                let Some(protocol) = protocol else {
+                    controller.report(format_args!("USB SKIP port={port}: unsupported protocol"));
+                    continue;
                 };
-                controller.write(offset, (status & (1 << 9)) | reset);
-                controller.wait_register(offset, (1 << 31) | (1 << 4) | 3, 3)?;
-            }
-            controller.write(
-                offset,
-                (controller.read(offset) & 0x00fe_0000) | (status & (1 << 9)),
-            );
-            let speed = ((controller.read(offset) >> 10) & 15) as u8;
-            match controller.enumerate(count, port as u8, speed, protocol, 0, 0) {
-                Ok(()) => (),
-                Err(Error::Unsupported) => {
-                    controller.report(format_args!("USB SKIP port={port}: unsupported device"));
-                    if let Some(device) = controller.devices[count].take() {
-                        controller.command(10, 0, device.slot)?;
-                        controller.dcbaa.address(device.slot as usize * 8, 0);
-                        controller.spare = Some(device);
+                if count == controller.max_slots as usize {
+                    if read_only {
+                        controller.report(format_args!("USB SKIP port={port}: device-slot limit"));
+                        continue;
                     }
+                    return Err(Error::Unsupported);
+                }
+                let mut status = status;
+                let mut attempt = 0;
+                let enumerated = loop {
+                    if protocol.revision == 2 || status & 2 == 0 {
+                        let reset = if protocol.revision == 3 {
+                            1 << 31
+                        } else {
+                            1 << 4
+                        };
+                        controller.write(offset, (status & (1 << 9)) | reset);
+                        if let Err(error) =
+                            controller.wait_register(offset, (1 << 31) | (1 << 4) | 3, 3)
+                        {
+                            controller.report(format_args!(
+                                "USB SKIP port={port}: reset failed ({error:?})"
+                            ));
+                            break false;
+                        }
+                        // Recovery time after reset: real devices need far longer than QEMU's.
+                        let recovery = Self::ticks() + 5;
+                        while Self::ticks() < recovery {
+                            core::hint::spin_loop();
+                        }
+                    }
+                    controller.write(
+                        offset,
+                        (controller.read(offset) & 0x00fe_0000) | (status & (1 << 9)),
+                    );
+                    let speed = ((controller.read(offset) >> 10) & 15) as u8;
+                    match controller.enumerate(count, port as u8, speed, protocol, 0, 0) {
+                        Ok(()) => break true,
+                        // A device that misbehaves or is unsupported must not hide
+                        // the remaining ports (the boot medium may be one of them).
+                        Err(
+                            error @ (Error::Unsupported
+                            | Error::Invalid
+                            | Error::Completion(_)
+                            | Error::Timeout),
+                        ) => {
+                            let stage = controller.stage;
+                            if read_only {
+                                if let Some(device) = controller.devices[count].as_ref() {
+                                    // Slot state: 1 default, 2 addressed, 3 configured.
+                                    // EP0 state: 1 running, 2 halted, 3 stopped, 4 error.
+                                    controller.report(format_args!(
+                                        "USB DBG port={port} slot={} ep0={} psc={:#010x}",
+                                        device.output.read(12) >> 27,
+                                        device.output.read(controller.context_size) & 7,
+                                        controller.read(offset)
+                                    ));
+                                }
+                            }
+                            if let Some(device) = controller.devices[count].take() {
+                                // Best effort: the failed slot is released if the
+                                // controller still answers commands.
+                                let _ = controller.command(10, 0, device.slot);
+                                controller.dcbaa.address(device.slot as usize * 8, 0);
+                                controller.spare = Some(device);
+                            }
+                            if attempt == 0
+                                && protocol.revision == 2
+                                && matches!(error, Error::Completion(_))
+                            {
+                                attempt = 1;
+                                controller.report(format_args!(
+                                    "USB RETRY port={port} {stage}: {error:?}"
+                                ));
+                                let settle = Self::ticks() + 5;
+                                while Self::ticks() < settle {
+                                    core::hint::spin_loop();
+                                }
+                                status = controller.read(offset);
+                                if status & 1 != 0 {
+                                    continue;
+                                }
+                            }
+                            controller
+                                .report(format_args!("USB SKIP port={port} {stage}: {error:?}"));
+                            break false;
+                        }
+                        Err(error) => {
+                            controller.report(format_args!("USB FAIL port={port}: {error:?}"));
+                            return Err(error);
+                        }
+                    }
+                };
+                if !enumerated {
                     continue;
                 }
-                Err(error) => {
-                    controller.report(format_args!("USB FAIL port={port}: {error:?}"));
-                    return Err(error);
+                if read_only
+                    && controller.devices[count].as_ref().unwrap().kind == Some(Kind::Storage)
+                {
+                    controller.storage = count;
+                    controller.initialize_disk()?;
                 }
+                count += 1;
             }
-            if read_only && controller.devices[count].as_ref().unwrap().kind == Some(Kind::Storage)
-            {
-                controller.storage = count;
-                controller.initialize_disk()?;
-            }
-            count += 1;
         }
         let mut hub = 0;
         while hub < count {
@@ -672,8 +752,10 @@ impl Controller {
         route: u32,
         tt: u32,
     ) -> Result<()> {
+        self.stage = "speed-id";
         let speed_kind = protocol.speed(speed)?;
         let packet = speed_kind.packet();
+        self.stage = "enable-slot";
         let physical = self
             .commands
             .push(0, 0, (9 << 10) | (protocol.slot_type as u32) << 16);
@@ -747,8 +829,10 @@ impl Controller {
         );
         let input = device.input.physical(0);
         self.devices[index] = Some(device);
+        self.stage = "address-device";
         self.command(11, input, slot)?;
         let mut descriptor = [0; 18];
+        self.stage = "get-descriptor-8";
         self.control(index, [0x80, 6, 0, 1, 0, 0, 8, 0], &mut descriptor[..8])?;
         if descriptor[0] != 18 || descriptor[1] != 1 {
             return Err(Error::Unsupported);
@@ -771,8 +855,10 @@ impl Controller {
                 2 * self.context_size + 4,
                 (actual_packet << 16) | (4 << 3) | 6,
             );
+            self.stage = "evaluate-context";
             self.command(13, input, slot)?;
         }
+        self.stage = "get-descriptor-18";
         self.control(index, [0x80, 6, 0, 1, 0, 0, 18, 0], &mut descriptor)?;
         self.report(format_args!(
             "USB DEVICE port={port} route={route:#x} speed-id={speed} {speed_kind:?}: {:04x}:{:04x}",
@@ -780,6 +866,7 @@ impl Controller {
             u16::from_le_bytes([descriptor[10], descriptor[11]])
         ));
         let mut bytes = [0; 512];
+        self.stage = "get-configuration";
         self.control(index, [0x80, 6, 0, 2, 0, 0, 9, 0], &mut bytes[..9])?;
         let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
         if !(9..=512).contains(&length) {
@@ -805,7 +892,9 @@ impl Controller {
         } else {
             0
         };
+        self.stage = "configure-endpoints";
         self.configure(index, &configuration)?;
+        self.stage = "set-configuration";
         self.control(index, [0, 9, configuration.value, 0, 0, 0, 0, 0], &mut [])?;
         if configuration.alternate != 0 {
             self.control(
@@ -1137,16 +1226,20 @@ impl Controller {
         } else {
             2
         };
-        device.control.push(
+        // Control stages never set the Chain bit (xHCI 6.4.1.2): Setup is IDT only,
+        // Data carries just its direction, and only Status requests an event.
+        device.control.push_in_td(
             u64::from_le_bytes(setup),
             8,
-            (2 << 10) | 64 | 16 | (trt << 16),
+            (2 << 10) | 64 | (trt << 16),
+            true,
         );
         if !bytes.is_empty() {
-            device.control.push(
+            device.control.push_in_td(
                 device.buffer.physical(0),
                 bytes.len() as u32,
-                (3 << 10) | 16 | if input { 1 << 16 } else { 0 },
+                (3 << 10) | if input { 1 << 16 } else { 0 },
+                true,
             );
         }
         let physical = device.control.push(

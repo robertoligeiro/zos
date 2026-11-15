@@ -76,16 +76,26 @@ pub fn speeds(revision: u8, slot_type: u8, entries: &[u32]) -> Result<Protocol> 
         let entry = entries[index];
         let id = (entry & 15) as usize;
         let rate = (entry >> 16) as u64 * 1000_u64.pow((entry >> 4) & 3);
+        if id == 0 || protocol.speeds[id].is_some() {
+            return Err(Error::Invalid);
+        }
         let speed = match (revision, rate) {
             (2, 1_500_000) => Speed::Low,
             (2, 12_000_000) => Speed::Full,
             (2, 480_000_000) => Speed::High,
             (3, 5_000_000_000 | 10_000_000_000 | 20_000_000_000) => Speed::Super,
-            _ => return Err(Error::Unsupported),
+            _ => {
+                // Vendor-defined rates (for example Intel's USB4-tunnel lane
+                // speeds) stay unmapped: only a device that actually attaches
+                // at such a speed ID is rejected, not the whole protocol.
+                index += if revision == 3 && (entry >> 6) & 3 == 2 {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
         };
-        if id == 0 || protocol.speeds[id].is_some() {
-            return Err(Error::Invalid);
-        }
         match (entry >> 6) & 3 {
             0 => (),
             2 if revision == 3 => {
@@ -176,6 +186,31 @@ mod tests {
         assert_eq!(protocol.speed(4), Err(Error::Unsupported));
         let full = speeds(2, 0, &[7 | (2 << 4) | (12 << 16)]).unwrap();
         assert_eq!(full.speed(7), Ok(Speed::Full));
+    }
+
+    #[test]
+    fn photographed_intel_table_keeps_standard_speeds_and_ignores_vendor_rates() {
+        // Raw PSI dwords photographed on the Intel 8086:4ded laptop controller.
+        let entries = [
+            327988, 655669, 81789222, 163578151, 327156008, 95486249, 191037738, 382075179,
+        ];
+        let usb3 = speeds(3, 0, &entries).unwrap();
+        assert_eq!(usb3.speed(4), Ok(Speed::Super));
+        assert_eq!(usb3.speed(5), Ok(Speed::Super));
+        for id in 6..=11 {
+            assert_eq!(usb3.speed(id), Err(Error::Unsupported));
+        }
+        assert_eq!(usb3.speed(1), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn unknown_paired_vendor_rates_skip_both_entries() {
+        let rx = 6 | (2 << 4) | (2 << 6) | (1248 << 16);
+        let tx = 6 | (2 << 4) | (3 << 6) | (1248 << 16);
+        let standard = 4 | (3 << 4) | (5 << 16);
+        let protocol = speeds(3, 0, &[rx, tx, standard]).unwrap();
+        assert_eq!(protocol.speed(6), Err(Error::Unsupported));
+        assert_eq!(protocol.speed(4), Ok(Speed::Super));
     }
 
     #[test]

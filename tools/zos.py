@@ -417,7 +417,7 @@ def diagnostic_command(disk: Path, firmware: str, case: str = "normal") -> list[
             index = command.index("-drive")
             del command[index:index + 2]
         # Bundled EDK2's USB mass-storage driver faults on a write-protected medium.
-        protection = "snapshot=on" if case == "normal" and firmware == "uefi" else "readonly=on"
+        protection = "snapshot=on" if firmware == "uefi" and case != "read-only-media" else "readonly=on"
         command += ["-drive", f"file={disk},format=raw,if=none,id=diagnostic-boot,{protection}"]
         if case in storage_cases and case != "read-only-media":
             command += ["-device", "usb-storage,id=zos-usb-disk,bus=xhci.0,port=3,drive=diagnostic-boot,bootindex=1"]
@@ -510,7 +510,7 @@ def diagnostic_case(disk: Path, firmware: str, timeout: int, case: str = "normal
                 if case == "no-ps2" and "INTEGRATED PS2 UNAVAILABLE:" not in text:
                     raise RuntimeError("Absent i8042 was not handled explicitly")
                 if case == "unsupported":
-                    wait_serial(process, log, "unsupported device", timeout)
+                    wait_serial(process, log, "get-configuration: Unsupported", timeout)
             text = log.read_text(encoding="utf-8")
             for marker in ("SHELL ready:", "FS ready:", "BLOCK ready:", "USER FAULT:", "KERNEL PANIC"):
                 if marker in text:
@@ -869,17 +869,27 @@ def usb_failure_case(disk: Path, firmware: str, timeout: int, case: str) -> None
                 before = hashlib.sha256(data.read_bytes()).hexdigest()
                 qmp.execute("device_del", {"id": "zos-usb-disk"})
                 expected = "USB RUNTIME FAILURE: Io"
+            elif case == "unsupported-hid":
+                # Generic-PC policy: an unsupported peripheral is skipped; the
+                # supported keyboard and storage must still reach the shell.
+                text = wait_serial(process, log, SHELL_READY, timeout)
+                if "USB INITIALIZATION FAILURE" in text:
+                    raise RuntimeError("Unsupported peripheral aborted USB initialization")
+                if "USB ENUM PASS" not in text or "Storage" not in text or "Keyboard" not in text:
+                    raise RuntimeError(f"Supported devices missing after skipping peripheral; inspect {log}")
+                expected = None
             else:
                 expected = "USB INITIALIZATION FAILURE: " + ("Io" if case == "no-controller" else "Unsupported")
-            deadline = time.monotonic() + timeout
-            while True:
-                text = log.read_text(encoding="utf-8") if log.exists() else ""
-                if expected in text and "USER EXIT: tid=2 status=" in text:
-                    break
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise RuntimeError(f"Missing expected USB failure {expected!r}; inspect {log}")
-                time.sleep(0.01)
-            if case != "unplug-disk" and SHELL_READY in text:
+            if expected is not None:
+                deadline = time.monotonic() + timeout
+                while True:
+                    text = log.read_text(encoding="utf-8") if log.exists() else ""
+                    if expected in text and "USER EXIT: tid=2 status=" in text:
+                        break
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError(f"Missing expected USB failure {expected!r}; inspect {log}")
+                    time.sleep(0.01)
+            if case not in ("unplug-disk", "unsupported-hid") and SHELL_READY in text:
                 raise RuntimeError("Unsupported USB configuration incorrectly reached the shell")
             if "USER FAULT: tid=2" in text:
                 raise RuntimeError("USB error handling faulted instead of exiting explicitly")
@@ -890,6 +900,9 @@ def usb_failure_case(disk: Path, firmware: str, timeout: int, case: str) -> None
             qmp.close()
             process.stdin.close()
             process.stdout.close()
+    if case == "unsupported-hid":
+        print(f"PASS {firmware}/usb-{case}: unsupported peripheral skipped; keyboard and storage reach the shell", flush=True)
+        return
     after = hashlib.sha256(data.read_bytes()).hexdigest()
     if before != after:
         raise RuntimeError(f"USB failure case changed its data volume: {case}")
@@ -1071,7 +1084,8 @@ def accept(timeout: int, *, usb: bool = False, diagnostic: bool = False) -> None
     if diagnostic:
         disk = image(build(diagnostic=True), "diagnostic")
         for firmware in ("bios", "uefi"):
-            for case in ("normal", "read-only-media", "no-storage", "empty", "unsupported", "no-controller"):
+            for case in ("normal", "read-only-media", "no-storage", "empty", "unsupported", "no-controller",
+                         "usb2", "superspeed", "nec", "hub", "integrated", "no-ps2"):
                 diagnostic_case(disk, firmware, timeout, case)
                 usb_cases.append(f"{firmware}/diagnostic-{case}")
     if any(hashlib.sha256((BUILD / name).read_bytes()).hexdigest() != digest
