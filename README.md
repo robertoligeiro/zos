@@ -734,11 +734,32 @@ pointer state machine) is a host-tested library (`zos_wm`); QEMU acceptance runs
 desktop with PS/2 and with USB keyboard, mouse and storage, in BIOS and UEFI, checking
 real framebuffer pixels. Not yet: more than one terminal session, application
 windows, resizing. The USB stick's boot menu offers **Desktop (GUI)** (default after 5
-seconds), **Command line** and **Diagnostic (show boot log)**; the QEMU test images
-boot straight to one entry. Diagnostic is the command line with no logo, the kernel's
-boot log kept on screen and the console drawing nothing, so a hang on real hardware
-shows exactly how far boot got (photograph the screen). It is selected by an extra
-boot module whose command line is `screenlog`; no special build is needed.
+seconds), **Command line**, **Diagnostic (show boot log)** and **Safe mode (no
+touchpad probe)**; the QEMU test images boot straight to one entry. Diagnostic is the
+command line with no logo, the kernel's boot log kept on screen and the console
+drawing nothing, so a hang on real hardware shows exactly how far boot got (photograph
+the screen). Safe mode skips the I2C touchpad probe described below. Both are selected
+by an extra boot module whose command line is `screenlog` or `no-i2c`; no special
+build is needed.
+
+To try the desktop in QEMU: `python tools\zos.py run --gui --firmware bios` (add
+`--usb` for a USB keyboard and mouse).
+
+### Built-in touchpads (I2C-HID)
+
+Most laptop touchpads are not PS/2 or USB but HID-over-I2C devices behind an Intel
+serial-IO (DesignWare) controller. `servers/console/src/i2c` implements the whole
+stack: the I2C master, the HID-over-I2C protocol, a HID report-descriptor parser and a
+decoder that understands both mouse-mode pads and Windows Precision Touchpad reports
+(finger tracking, tap to click, click button). The kernel only hands the input service
+the controller's register window (`I2cController` call, PCI vendor 8086 class
+0x118000, powered up from D3 if needed); everything else is user space and polled.
+ZOS does not read ACPI yet, so the touchpad's address is found by scanning each bus
+read-only and asking only the addresses touchpads are known to use for a HID
+descriptor. The driver is unit-tested against a simulated controller and touchpad;
+what it finds on real hardware (controllers, answering addresses, descriptor ids) goes
+to the boot log with `I2C` prefixes, which is the first thing to read if the pointer
+does not move.
 
 **Artwork.** `assets/zos-logo.png` and `assets/zos-logo-article.png` are AI-generated
 images, and `assets/zos-splash.bin` is the boot-screen bitmap derived from the logo
