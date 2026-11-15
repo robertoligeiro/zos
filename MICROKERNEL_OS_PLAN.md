@@ -1,4 +1,4 @@
-# ZOS - Zombie OS: Project Plan, Research and Execution Record
+﻿# ZOS - Zombie OS: Project Plan, Research and Execution Record
 
 Updated: **November 11, 2026 (Pacific time)**.
 
@@ -9,30 +9,26 @@ the complete previously researched roadmap are retained below.
 
 ## Read this status before executing any prompt
 
-- **Product:** ZOS - Zombie OS, an original Rust x86-64 microkernel.
-- **Repository:** the repository root; current integration branch:
-  `main`. No remote is configured and nothing has been published.
-- **Accepted source baseline:** `e5495c6`, following tags `phase-1` through
-  `phase-9`. Those tags are historical checkpoints, not claims that all
-  physical PCs work.
-- **Current source:** includes the unfinished generic-PC hardware work and
-  this consolidated plan, committed to `main` at the user's explicit request.
-  Saving that work does not promote it to a verified hardware checkpoint.
-- **Last generated USB package:** the previously accepted 34-scratchpad
-  diagnostic build, not the generic-PC draft. Its local binaries were later
-  removed at the user's cleanup request; metadata and test evidence remain.
-  There is currently no complete local boot image or USB staging package.
-- **Policy gate:** implementation, new boot-package generation and deployment
-  of the generic-PC work remain paused pending source/license and applicable
-  organizational policy clearance. The user separately authorized this local
-  documentation/consolidation commit; that is not compliance approval.
-- **Deferred:** Shell 2.0, windowing and desktop applications have not been
-  implemented or released for implementation.
+**Update, 14 November 2026.** The sections below are the historical execution
+record; where they describe paused work, missing images or an unresolved policy gate,
+this block supersedes them.
 
-The status and gates in this execution record supersede stale status statements
-in the historical plan below. In particular, the physical 34-scratchpad retest
-has now succeeded at controller initialization, but USB3 device enumeration and
-integrated laptop input have not been demonstrated on that laptop.
+- **Product:** ZOS - Zombie OS, an original Rust x86-64 microkernel, published at
+  `https://github.com/robertoligeiro/zos` (branch `main`) under MIT OR Apache-2.0.
+- **Verified:** 78 QEMU acceptance cases (BIOS and UEFI) pass, and on one real laptop
+  (Intel xHCI controller) ZOS boots from a USB stick into the interactive shell with
+  persistent files, using the built-in PS/2 keyboard. Tags `phase-1` .. `phase-9`,
+  `hw-usb-diagnostic-verified`, `usb-normal-mode-qemu` and `usb-keyboard-logs` mark
+  checkpoints. Support for other machines is unverified.
+- **Latest on hardware:** the first shell boot showed wrong characters and slow
+  keyboard response. Fixes (scancode set 2 with translation, IRQ1-driven reads) and
+  on-stick logs (`/boot.log`, `dmesg`, `tools\zosfs.py`) are committed and pass QEMU;
+  they await a laptop retest.
+- **Source and license gate:** lifted by the owner on 12 November 2026. Reusing
+  open-source code is allowed provided licenses are compatible and recorded; no
+  third-party source has been copied in so far (see `THIRD_PARTY.md`).
+- **Not implemented:** I2C/SPI keyboards and touchpads, USB3 hubs, UAS storage, a
+  filesystem larger than 16 MiB, Shell 2.0, windowing and desktop applications.
 
 ## Execution record: completed foundations
 

@@ -5,13 +5,16 @@ A single-core x86-64 microkernel project following the supplied
 
 ## Current checkpoint
 
-**Integration status:** `main` also preserves unfinished generic-PC USB/input
-work. Its host tests and targeted Clippy checks pass, but its native/hardware
-acceptance and source/license/organizational policy gate are unresolved. Do not treat
-it as an accepted replacement for the existing diagnostic USB package.
+**Status (November 2026):** ZOS boots from a USB stick into an interactive shell with
+persistent files. It is verified in QEMU (78 acceptance cases, BIOS and UEFI) and on
+one real laptop (Intel xHCI USB controller, built-in PS/2 keyboard). It is an
+experimental teaching/hobby kernel, not a general-purpose OS: the filesystem is 16 MiB
+(64 files, 24-character names, 64 KiB per file), only xHCI USB storage and
+PS/2/USB-HID input are supported, and I2C/SPI keyboards and touchpads are not.
 See the root [project plan and execution record](MICROKERNEL_OS_PLAN.md) for
-completed phases, all research, outstanding checks and deferred implementation
-prompts. The checkpoint descriptions below document the last accepted baseline.
+completed phases, research notes and deferred work, and the sections below for how
+to build, run and prepare a USB stick. Licensed under MIT OR Apache-2.0
+(see [License](#license)).
 
 Generated boot images, executables, USB staging binaries, and build caches were
 removed at the user's cleanup request. Source/Git history, portable tools, data
@@ -674,3 +677,15 @@ Before creating a later source bundle:
 git bundle create build\zos-source.bundle --all
 git bundle verify build\zos-source.bundle
 ```
+
+## License
+
+ZOS is dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you state otherwise, any contribution intentionally submitted
+for inclusion in ZOS by you, as defined in the Apache-2.0 license, is dual licensed as
+above, without any additional terms or conditions. Third-party components and their
+licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
