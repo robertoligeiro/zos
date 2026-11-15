@@ -7,6 +7,10 @@
 A single-core x86-64 microkernel project following the supplied
 `MICROKERNEL_OS_PLAN.md`. Rust, Limine, BIOS + UEFI, and serial-first debugging.
 
+<p align="center">
+  <img src="assets/zos-logo-article.png" alt="ZOS banner: the ZOS logo with a pixel-art zombie, the tagline 'Small OS. Long Stories.', a boot log, and a retro sunset landscape with a road sign reading 'So it goes.'" width="640">
+</p>
+
 ## Current checkpoint
 
 **Status (November 2026):** ZOS boots from a USB stick into an interactive shell with
@@ -694,5 +698,6 @@ for inclusion in ZOS by you, as defined in the Apache-2.0 license, is dual licen
 above, without any additional terms or conditions. Third-party components and their
 licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-**Logo.** `assets/zos-logo.png` is an AI-generated image. It carries its own notice
-("All rights reserved") and is not part of the MIT OR Apache-2.0 licensed source.
+**Artwork.** `assets/zos-logo.png` and `assets/zos-logo-article.png` are AI-generated
+images. They carry their own notice ("All rights reserved") and are not part of the
+MIT OR Apache-2.0 licensed source.
