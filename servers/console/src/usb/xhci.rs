@@ -1,5 +1,6 @@
 use super::{
     descriptors::{self, Configuration, Endpoint, Kind},
+    gpt::{self, Window},
     hid::BootKeyboard,
     policy::{self, Protocol, Speed},
     Error, Event, Result,
@@ -230,6 +231,8 @@ pub struct Controller {
     storage: usize,
     tag: u32,
     sectors: u64,
+    /// The only sectors ZOS may write; `None` until the volume is located.
+    window: Option<Window>,
     poisoned: bool,
     transfers: u64,
 }
@@ -351,6 +354,7 @@ impl Controller {
             storage: 0,
             tag: 0,
             sectors: 0,
+            window: None,
             poisoned: false,
             transfers: 0,
         };
@@ -1422,7 +1426,7 @@ impl Controller {
         Ok(())
     }
     fn scsi(&mut self, command: &[u8], input: bool, bytes: &mut [u8]) -> Result<()> {
-        policy::scsi(self.read_only, command, input, bytes.len())?;
+        policy::scsi(self.read_only, self.window, command, input, bytes.len())?;
         self.tag = self.tag.checked_add(1).ok_or(Error::Io)?;
         let mut cbw = [0; 31];
         cbw[..4].copy_from_slice(&0x43425355_u32.to_le_bytes());
@@ -1477,8 +1481,57 @@ impl Controller {
             }
             return Ok(());
         }
+        let window = self.locate_volume(sectors).inspect_err(|_| {
+            os::debug_write("USB WINDOW FAILURE: no usable ZOS partition").unwrap();
+        })?;
+        // From here on the filesystem sees only its own 32768 sectors, and the
+        // SCSI policy refuses writes anywhere else on the stick.
+        self.window = Some(window);
+        self.sectors = window.sectors;
         os::debug_write("USB SCSI PASS: inquiry, readiness, 32768 sectors of 512 bytes").unwrap();
+        crate::log(format_args!(
+            "USB WINDOW: base={} of {sectors} sectors",
+            window.base
+        ));
         Ok(())
+    }
+
+    fn read_sector(&mut self, sector: u64, bytes: &mut [u8; 512]) -> Result<()> {
+        let sector = u32::try_from(sector).map_err(|_| Error::Invalid)?;
+        let mut command = [0; 10];
+        command[0] = 0x28;
+        command[2..6].copy_from_slice(&sector.to_be_bytes());
+        command[8] = 1;
+        self.scsi(&command, true, bytes)
+    }
+
+    /// Finds where the ZOS volume lives. A bare 16 MiB disk that starts with the
+    /// ZOS superblock (the QEMU test volumes) is used whole; anything else must
+    /// carry a GPT with exactly one ZOS data partition. Nothing is written.
+    fn locate_volume(&mut self, disk_sectors: u64) -> Result<Window> {
+        let mut sector = [0; 512];
+        if disk_sectors == gpt::ZOS_SECTORS {
+            self.read_sector(0, &mut sector)?;
+            if &sector[..8] == b"ZOSFS001" {
+                return Window::new(0);
+            }
+        }
+        self.read_sector(1, &mut sector)?;
+        let header = gpt::Header::parse(&sector, disk_sectors)?;
+        let mut scan = gpt::Scan::new(header);
+        for index in 0..header.sectors_needed() {
+            self.read_sector(header.entries_lba + u64::from(index), &mut sector)?;
+            scan.feed(&sector)?;
+        }
+        let window = scan.finish(disk_sectors)?;
+        // The partition type alone is not enough: it must already hold a
+        // formatted ZOS volume (written by the preparation tool), so a blank or
+        // foreign partition is never written to.
+        self.read_sector(window.base, &mut sector)?;
+        if &sector[..8] != b"ZOSFS001" {
+            return Err(Error::Unsupported);
+        }
+        Ok(window)
     }
     pub fn disk_request(&mut self, request: &[u8], reply: &mut [u8; 512]) -> Result<usize> {
         if self.read_only {
@@ -1504,9 +1557,13 @@ impl Controller {
                 if u64::from(sector) >= self.sectors {
                     return Err(Error::Invalid);
                 }
+                // The filesystem's sector 0 is the first sector of the ZOS window.
+                let window = self.window.ok_or(Error::Io)?;
+                let disk_sector =
+                    u32::try_from(window.base + u64::from(sector)).map_err(|_| Error::Invalid)?;
                 let mut command = [0; 10];
                 command[0] = if input { 0x28 } else { 0x2a };
-                command[2..6].copy_from_slice(&sector.to_be_bytes());
+                command[2..6].copy_from_slice(&disk_sector.to_be_bytes());
                 command[8] = 1;
                 if !input {
                     reply.copy_from_slice(&address[4..]);

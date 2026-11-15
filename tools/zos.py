@@ -16,7 +16,8 @@ import sys
 import time
 
 from mkimage import BUILD, ROOT, create_image, image_path
-from mkfs import data_path, ensure_disk, format_disk, validate_disk
+from mkfs import (ZOS_PARTITION_TYPE, data_path, ensure_disk, format_disk, format_gpt_disk, outside_zos_sha256,
+                  validate_disk, volume_image)
 
 TOOLS = ROOT / ".tools"
 CASES = {
@@ -184,7 +185,35 @@ def image(kernel: Path, case: str | None = None) -> Path:
             "kind": "zos-usb-diagnostic", "storage_read_only": True, "files": hashes,
         }, indent=2) + "\n", encoding="utf-8")
         print(f"UEFI USB package: {package}", flush=True)
+    if case == "usb":
+        usb_normal_package(payloads)
     return destination
+
+
+def usb_normal_package(payloads: dict[str, bytes]) -> Path:
+    """The files for a bootable USB stick with the interactive shell and a writable ZOS
+    volume. prepare-usb.ps1 -Normal copies the boot files to a FAT32 partition and writes
+    zos-volume.img into a separate GPT partition of type ZOS_PARTITION_TYPE."""
+    package = BUILD / "usb-normal-files"
+    shutil.rmtree(package, ignore_errors=True)
+    hashes = {}
+    for name, data in payloads.items():
+        if name == "limine-bios.sys":
+            continue
+        target = package / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        hashes[name.replace("/", "\\")] = hashlib.sha256(data).hexdigest()
+    volume = volume_image()
+    (package / "zos-volume.img").write_bytes(volume)
+    (package / "manifest.json").write_text(json.dumps({
+        "kind": "zos-usb-normal", "storage_read_only": False, "files": hashes,
+        "volume": {"file": "zos-volume.img", "bytes": len(volume),
+                   "sha256": hashlib.sha256(volume).hexdigest(),
+                   "gpt_type": str(ZOS_PARTITION_TYPE)},
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"Normal USB package: {package}", flush=True)
+    return package
 
 
 def qemu_command(disk: Path, firmware: str, *, exit_on_shutdown: bool = False,
@@ -667,9 +696,12 @@ class ShellKeys:
         self.enter(statuses)
 
 
-def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) -> None:
-    flavor = "usb-shell" if usb else "shell"
-    data = format_disk(f"data-{flavor}-test-{firmware}.img", force=True)
+def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False, gpt: bool = False) -> None:
+    """With gpt, the USB disk is a 64 MiB stick: the ZOS volume sits inside a GPT
+    partition, and every byte outside that partition must come out unchanged."""
+    flavor = "usb-gpt-shell" if gpt else "usb-shell" if usb else "shell"
+    data = (format_gpt_disk if gpt else format_disk)(f"data-{flavor}-test-{firmware}.img", force=True)
+    outside = outside_zos_sha256(data) if gpt else None
     hashes = []
     for stage in ("session", "reboot"):
         log = BUILD / f"{firmware}-{flavor}-{stage}.serial.log"
@@ -791,8 +823,12 @@ def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) ->
                 process.stdin.close()
                 process.stdout.close()
         hashes.append(hashlib.sha256(data.read_bytes()).hexdigest())
+        if gpt and outside_zos_sha256(data) != outside:
+            raise RuntimeError(f"{flavor} wrote outside the ZOS partition during the {stage} stage")
         print(f"PASS {firmware}/{flavor}-{stage}: real keys, commands, process lifecycle and clean exit", flush=True)
-    shell_power_case(disk, firmware, data, timeout, usb=usb)
+    shell_power_case(disk, firmware, data, timeout, usb=usb, gpt=gpt)
+    if gpt and outside_zos_sha256(data) != outside:
+        raise RuntimeError(f"{flavor} wrote outside the ZOS partition during reboot/halt")
     (BUILD / f"{firmware}-{flavor}.data.json").write_text(json.dumps({
         "data_image": data.name, "session_sha256": hashes[0], "reboot_sha256": hashes[1],
         "full_qemu_exit_between_sessions": True,
@@ -801,8 +837,70 @@ def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) ->
     }, indent=2) + "\n", encoding="utf-8")
 
 
-def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int, *, usb: bool = False) -> None:
-    flavor = "usb-shell" if usb else "shell"
+def usb_ps2_case(disk: Path, firmware: str, timeout: int) -> None:
+    """USB storage on a GPT stick but no USB keyboard or mouse: the built-in i8042
+    keyboard and mouse (how most laptops are wired) must drive the shell."""
+    data = format_gpt_disk(f"data-usb-ps2-{firmware}.img", force=True)
+    outside = outside_zos_sha256(data)
+    log = BUILD / f"{firmware}-usb-ps2.serial.log"
+    log.unlink(missing_ok=True)
+    command = qemu_command(disk, firmware, exit_on_shutdown=True, data_disk=data, usb=True)
+    for prefix in ("usb-kbd,", "usb-mouse,"):
+        index = next(i for i, value in enumerate(command) if value.startswith(prefix))
+        del command[index - 1:index + 1]
+    command += ["-display", "none", "-monitor", "none", "-serial", f"file:{log}",
+                "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-qmp", "stdio"]
+    with (BUILD / f"{firmware}-usb-ps2.qemu.log").open("wb") as errors:
+        process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        qmp = Qmp(process, BUILD / f"{firmware}-usb-ps2.qmp.log", timeout)
+        try:
+            qmp.negotiate()
+            wait_serial(process, log, SHELL_READY, timeout)
+            text = log.read_text(encoding="utf-8")
+            if "INTEGRATED PS2: kbd=true mouse=true" not in text:
+                raise RuntimeError("Built-in PS/2 devices were not initialized in USB mode")
+            if "Keyboard" in "".join(re.findall(r"USB ENUM PASS:.*", text)):
+                raise RuntimeError("A USB keyboard was present; the PS/2 path was not isolated")
+            keys = ShellKeys(process, qmp, log, timeout)
+            keys.line("mkdir p; cd p; echo ps2 > f; cat f; pwd", [0] * 5)
+            keys.line("cp f g; cat g; ls", [0, 0, 0])
+            keys.type("echo abxc")
+            keys.key("left")
+            keys.key("left")
+            keys.key("delete")
+            keys.enter([0])
+            text = log.read_text(encoding="utf-8")
+            if "SHELL OUT: ps2\n" not in text or "SHELL OUT: abc\n" not in text:
+                raise RuntimeError("PS/2 keyboard input did not reach the shell")
+            qmp.execute("input-send-event", {"events": [
+                {"type": "rel", "data": {"axis": "x", "value": 80}},
+                {"type": "rel", "data": {"axis": "y", "value": -30}},
+                {"type": "btn", "data": {"button": "left", "down": True}},
+            ]})
+            mark = wait_serial(process, log, "buttons=1", timeout).rfind("buttons=1")
+            qmp.execute("input-send-event", {"events": [
+                {"type": "btn", "data": {"button": "left", "down": False}},
+            ]})
+            wait_serial(process, log, "buttons=0", timeout, start=mark)
+            keys.type("~finish")
+            keys.key("ret", wait=False)
+            if process.wait(timeout=timeout) != 33:
+                raise RuntimeError(f"PS/2 shell acceptance exit failed; inspect {log}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            qmp.close()
+            process.stdin.close()
+            process.stdout.close()
+    if outside_zos_sha256(data) != outside:
+        raise RuntimeError("PS/2 shell wrote outside the ZOS partition")
+    print(f"PASS {firmware}/usb-ps2: built-in keyboard and mouse drive the shell on USB storage", flush=True)
+
+
+def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int, *, usb: bool = False,
+                     gpt: bool = False) -> None:
+    flavor = "usb-gpt-shell" if gpt else "usb-shell" if usb else "shell"
     log = BUILD / f"{firmware}-{flavor}-power.serial.log"
     log.unlink(missing_ok=True)
     command = qemu_command(disk, firmware, data_disk=data, usb=usb) + [
@@ -845,7 +943,13 @@ def shell_power_case(disk: Path, firmware: str, data: Path, timeout: int, *, usb
 
 
 def usb_failure_case(disk: Path, firmware: str, timeout: int, case: str) -> None:
-    data = format_disk(f"data-usb-{case}-{firmware}.img", force=True)
+    # A stick without any ZOS partition must be refused without a single write.
+    if case == "no-zos-partition":
+        data = format_gpt_disk(f"data-usb-{case}-{firmware}.img", force=True, zos=False)
+    elif case == "unformatted-zos-partition":
+        data = format_gpt_disk(f"data-usb-{case}-{firmware}.img", force=True, formatted=False)
+    else:
+        data = format_disk(f"data-usb-{case}-{firmware}.img", force=True)
     log = BUILD / f"{firmware}-usb-{case}.serial.log"
     log.unlink(missing_ok=True)
     command = qemu_command(disk, firmware, data_disk=data, usb=case != "no-controller")
@@ -855,7 +959,7 @@ def usb_failure_case(disk: Path, firmware: str, timeout: int, case: str) -> None
     elif case == "unsupported-hid":
         index = next(i for i, part in enumerate(command) if part.startswith("usb-mouse,"))
         command[index] = "usb-tablet,id=zos-usb-mouse,bus=xhci.0,port=2"
-    elif case not in ("no-controller", "unplug-disk"):
+    elif case not in ("no-controller", "unplug-disk", "no-zos-partition", "unformatted-zos-partition"):
         raise ValueError(f"Unknown USB failure case: {case}")
     command += ["-display", "none", "-monitor", "none", "-serial", f"file:{log}", "-qmp", "stdio"]
     before = hashlib.sha256(data.read_bytes()).hexdigest()
@@ -1073,7 +1177,12 @@ def accept(timeout: int, *, usb: bool = False, diagnostic: bool = False) -> None
         for firmware in ("bios", "uefi"):
             shell_case(disk, firmware, timeout, usb=True)
             usb_cases.extend(f"{firmware}/usb-shell-{stage}" for stage in ("session", "reboot", "power"))
-            for case in ("no-controller", "missing-disk", "unsupported-hid", "unplug-disk"):
+            shell_case(disk, firmware, timeout, usb=True, gpt=True)
+            usb_cases.extend(f"{firmware}/usb-gpt-shell-{stage}" for stage in ("session", "reboot", "power"))
+            usb_ps2_case(disk, firmware, timeout)
+            usb_cases.append(f"{firmware}/usb-ps2")
+            for case in ("no-controller", "missing-disk", "unsupported-hid", "unplug-disk", "no-zos-partition",
+                         "unformatted-zos-partition"):
                 usb_failure_case(disk, firmware, timeout, case)
                 usb_cases.append(f"{firmware}/usb-{case}")
         normal_usb = image(build(usb=True), "usb")

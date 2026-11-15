@@ -33,7 +33,7 @@ def crc(data: bytes | bytearray) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-def gpt_header(current: int, backup: int, entries_lba: int, entries: bytes) -> bytes:
+def gpt_header(current: int, backup: int, entries_lba: int, entries: bytes, total: int = SECTORS) -> bytes:
     header = bytearray(SECTOR)
     struct.pack_into(
         "<8sIIIIQQQQ16sQIII",
@@ -47,7 +47,7 @@ def gpt_header(current: int, backup: int, entries_lba: int, entries: bytes) -> b
         current,
         backup,
         34,
-        SECTORS - 34,
+        total - 34,
         uuid.uuid5(uuid.NAMESPACE_DNS, "zos.disk").bytes_le,
         entries_lba,
         128,

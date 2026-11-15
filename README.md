@@ -275,6 +275,42 @@ $LASTEXITCODE
 Expect `USB SCRIPT PASS` and exit code 0. Phase 9 host/native acceptance is
 `python tools\zos.py test --diagnostic`; existing user data images are preserved.
 
+### Normal mode on a real USB stick (interactive shell, persistent files)
+
+`python tools\zos.py image --usb` (also produced by `test --diagnostic`) builds
+`build\usb-normal-files`: the boot files, a pre-formatted `zos-volume.img` and a
+manifest. Prepare a stick with the same guarded script plus `-Normal`:
+
+```powershell
+.\tools\prepare-usb.ps1 -List
+.\tools\prepare-usb.ps1 -Normal -DiskNumber N -Write -WhatIf
+.\tools\prepare-usb.ps1 -Normal -DiskNumber N -Write
+```
+
+The stick gets a **GPT** with two partitions: a 512 MiB FAT32 boot volume, and a
+16 MiB partition of type `f2ac67b5-91fa-4c46-a324-95b456c3829d` that receives
+`zos-volume.img` through a raw write to `\\.\PhysicalDriveN`, verified by readback.
+The rest of the stick stays unallocated.
+
+ZOS finds its volume through that GPT type (CRC-checked, exactly one match) and
+only if it already starts with the ZOS filesystem signature. All of its writes
+go through a window over that partition: the SCSI layer allows a short list of
+commands and `WRITE(10)` only to sectors inside the window, so the boot files and
+anything else on the stick are never touched. A stick without a ZOS partition, or
+with an unformatted one, is refused with no writes. A bare 16 MiB QEMU test
+volume that starts with the ZOS superblock is still used whole.
+
+In USB mode the input service also owns the i8042 ports (0x60/0x64) so a laptop's
+built-in PS/2 keyboard works alongside USB devices; ATA and all other legacy ports
+stay denied. I2C/SPI keyboards and touchpads are not implemented.
+
+QEMU acceptance covers the layout (`usb-gpt-shell`, which also checks that every
+byte outside the partition is unchanged), `usb-ps2` (no USB keyboard/mouse),
+`usb-no-zos-partition` and `usb-unformatted-zos-partition`. The raw volume write
+by `prepare-usb.ps1 -Normal` is only mock-tested
+(`powershell.exe -NoProfile -File .\tools\test_prepare_usb_normal.ps1`); a real
+stick is its first true test.
+
 ## Interactive shell and processes
 
 Run `python tools\zos.py run --firmware uefi` (or `bios`), click inside QEMU,

@@ -1037,11 +1037,9 @@ fn start_console() -> ! {
         (
             "input-server",
             1,
-            if cfg!(feature = "usb") && !cfg!(feature = "usb-diagnostic") {
-                0
-            } else {
-                6
-            },
+            // Ports 0x60 and 0x64 only: the laptop's built-in i8042 keyboard.
+            // ATA and every other legacy port stay denied in USB mode.
+            6,
             if cfg!(feature = "usb") {
                 1
             } else {

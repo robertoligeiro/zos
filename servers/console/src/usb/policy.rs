@@ -1,3 +1,4 @@
+use super::gpt::Window;
 use super::{Error, Result};
 
 pub const MAX_SCRATCHPADS: usize = zos_libos::USB_MAX_SCRATCHPADS;
@@ -117,7 +118,16 @@ pub fn speeds(revision: u8, slot_type: u8, entries: &[u32]) -> Result<Protocol> 
     Ok(protocol)
 }
 
-pub fn scsi(read_only: bool, command: &[u8], input: bool, length: usize) -> Result<()> {
+/// Gate for every SCSI command sent to the stick. Read-only mode (diagnostics,
+/// and volume discovery) never writes. Writable mode allows a short list of
+/// commands and lets WRITE(10) touch only sectors inside the ZOS `window`.
+pub fn scsi(
+    read_only: bool,
+    window: Option<Window>,
+    command: &[u8],
+    input: bool,
+    length: usize,
+) -> Result<()> {
     if read_only {
         let allowed = match command.first() {
             Some(0) => command.len() == 6 && !input && length == 0,
@@ -125,6 +135,36 @@ pub fn scsi(read_only: bool, command: &[u8], input: bool, length: usize) -> Resu
             Some(0x12) => command.len() == 6 && input && length == 36,
             Some(0x25) => command.len() == 10 && input && length == 8,
             Some(0x28) => command.len() == 10 && input && length == 512,
+            _ => false,
+        };
+        if !allowed {
+            return Err(Error::ReadOnly);
+        }
+    } else {
+        let one_block = command.len() == 10
+            && length == 512
+            && u16::from_be_bytes([command[7], command[8]]) == 1;
+        let allowed = match command.first() {
+            Some(0) => command.len() == 6 && !input && length == 0,
+            Some(3) => command.len() == 6 && input && length == 18,
+            Some(0x12) => command.len() == 6 && input && length == 36,
+            Some(0x25) => command.len() == 10 && input && length == 8,
+            Some(0x28) => one_block && input,
+            Some(0x2a) => {
+                one_block
+                    && !input
+                    && window.is_some_and(|window| {
+                        let sector = u32::from_be_bytes(command[2..6].try_into().unwrap());
+                        window.contains(u64::from(sector))
+                    })
+            }
+            // SYNCHRONIZE CACHE for the whole device: a flush, never a write.
+            Some(0x35) => {
+                command.len() == 10
+                    && !input
+                    && length == 0
+                    && command[2..9].iter().all(|&byte| byte == 0)
+            }
             _ => false,
         };
         if !allowed {
@@ -144,7 +184,9 @@ pub fn capacity(bytes: [u8; 8], read_only: bool) -> Result<(u64, u32)> {
         return Err(Error::Unsupported);
     }
     let sectors = last as u64 + 1;
-    if !read_only && (sectors != 32768 || block != 512) {
+    // Writable mode needs 512-byte blocks; the volume's place on the disk is
+    // decided separately (see gpt.rs), not by the disk's total size.
+    if !read_only && block != 512 {
         return Err(Error::Unsupported);
     }
     Ok((sectors, block))
@@ -234,19 +276,112 @@ mod tests {
             if matches!(opcode, 0x25 | 0x28) {
                 continue;
             }
-            assert_eq!(scsi(true, &command, false, 0), Err(Error::ReadOnly));
+            assert_eq!(scsi(true, None, &command, false, 0), Err(Error::ReadOnly));
         }
-        assert_eq!(scsi(true, &[0; 6], false, 0), Ok(()));
-        assert_eq!(scsi(true, &[0x12, 0, 0, 0, 36, 0], true, 36), Ok(()));
+        assert_eq!(scsi(true, None, &[0; 6], false, 0), Ok(()));
+        assert_eq!(scsi(true, None, &[0x12, 0, 0, 0, 36, 0], true, 36), Ok(()));
         let mut read = [0; 10];
         read[0] = 0x28;
-        assert_eq!(scsi(true, &read, true, 512), Ok(()));
-        assert_eq!(scsi(true, &read, false, 512), Err(Error::ReadOnly));
-        assert_eq!(scsi(true, &read, true, 513), Err(Error::ReadOnly));
+        assert_eq!(scsi(true, None, &read, true, 512), Ok(()));
+        assert_eq!(scsi(true, None, &read, false, 512), Err(Error::ReadOnly));
+        assert_eq!(scsi(true, None, &read, true, 513), Err(Error::ReadOnly));
         read[0] = 0x2a;
-        assert_eq!(scsi(true, &read, false, 512), Err(Error::ReadOnly));
-        assert_eq!(scsi(false, &read, false, 512), Ok(()));
-        assert_eq!(scsi(true, &[0x35; 10], false, 0), Err(Error::ReadOnly));
+        assert_eq!(scsi(true, None, &read, false, 512), Err(Error::ReadOnly));
+        let window = Window::new(1000).ok();
+        assert_eq!(scsi(true, window, &read, false, 512), Err(Error::ReadOnly));
+        assert_eq!(
+            scsi(true, None, &[0x35; 10], false, 0),
+            Err(Error::ReadOnly)
+        );
+    }
+
+    fn block_command(opcode: u8, sector: u32, count: u16) -> [u8; 10] {
+        let mut command = [0; 10];
+        command[0] = opcode;
+        command[2..6].copy_from_slice(&sector.to_be_bytes());
+        command[7..9].copy_from_slice(&count.to_be_bytes());
+        command
+    }
+
+    #[test]
+    fn writes_are_confined_to_the_zos_window() {
+        let window = Window::new(16384);
+        let write = |sector| {
+            scsi(
+                false,
+                window.ok(),
+                &block_command(0x2a, sector, 1),
+                false,
+                512,
+            )
+        };
+        assert_eq!(write(16384), Ok(()));
+        assert_eq!(write(16384 + 32767), Ok(()));
+        for outside in [0, 1, 2, 2048, 16383, 16384 + 32768, u32::MAX] {
+            assert_eq!(write(outside), Err(Error::ReadOnly), "sector {outside}");
+        }
+        // No window yet (volume discovery): nothing may be written.
+        let discovery = |sector| scsi(false, None, &block_command(0x2a, sector, 1), false, 512);
+        assert_eq!(discovery(16384), Err(Error::ReadOnly));
+        // Only single-block writes, in the right direction and size.
+        let multi = block_command(0x2a, 16384, 2);
+        assert_eq!(
+            scsi(false, window.ok(), &multi, false, 1024),
+            Err(Error::ReadOnly)
+        );
+        let single = block_command(0x2a, 16384, 1);
+        assert_eq!(
+            scsi(false, window.ok(), &single, true, 512),
+            Err(Error::ReadOnly)
+        );
+        assert_eq!(
+            scsi(false, window.ok(), &single, false, 0),
+            Err(Error::ReadOnly)
+        );
+        let zero = block_command(0x2a, 16384, 0);
+        assert_eq!(
+            scsi(false, window.ok(), &zero, false, 512),
+            Err(Error::ReadOnly)
+        );
+        // Reads may reach the partition table anywhere, one block at a time.
+        assert_eq!(
+            scsi(false, None, &block_command(0x28, 1, 1), true, 512),
+            Ok(())
+        );
+        assert_eq!(
+            scsi(false, None, &block_command(0x28, 1, 2), true, 1024),
+            Err(Error::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn writable_mode_allows_only_known_commands() {
+        let window = Window::new(16384).ok();
+        let allowed = [0x00, 0x03, 0x12, 0x25, 0x28, 0x2a, 0x35];
+        for opcode in 0..=255_u8 {
+            if allowed.contains(&opcode) {
+                continue;
+            }
+            // Includes FORMAT UNIT (04), WRITE(6) (0a), WRITE(16) (8a), UNMAP (42),
+            // WRITE SAME (41, 93) and VERIFY (2f): all must be refused.
+            for (length, input) in [(0, false), (512, false), (512, true), (8, true), (36, true)] {
+                for command in [
+                    &block_command(opcode, 16384, 1)[..],
+                    &[opcode, 0, 0, 0, 0, 0][..],
+                ] {
+                    assert_eq!(
+                        scsi(false, window, command, input, length),
+                        Err(Error::ReadOnly),
+                        "opcode {opcode:#x}"
+                    );
+                }
+            }
+        }
+        let flush = [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(scsi(false, window, &flush, false, 0), Ok(()));
+        // A ranged flush is not whole-device and is refused.
+        let ranged = block_command(0x35, 7, 0);
+        assert_eq!(scsi(false, window, &ranged, false, 0), Err(Error::ReadOnly));
     }
 
     #[test]
@@ -255,7 +390,11 @@ mod tests {
         bytes[..4].copy_from_slice(&67_108_863_u32.to_be_bytes());
         bytes[4..].copy_from_slice(&512_u32.to_be_bytes());
         assert_eq!(capacity(bytes, true), Ok((67_108_864, 512)));
+        // Writable mode accepts a large stick; the ZOS window is found by GPT.
+        assert_eq!(capacity(bytes, false), Ok((67_108_864, 512)));
+        bytes[4..].copy_from_slice(&4096_u32.to_be_bytes());
         assert_eq!(capacity(bytes, false), Err(Error::Unsupported));
+        bytes[4..].copy_from_slice(&512_u32.to_be_bytes());
         bytes[..4].copy_from_slice(&32767_u32.to_be_bytes());
         assert_eq!(capacity(bytes, false), Ok((32768, 512)));
         bytes[4..].fill(0);

@@ -1,4 +1,5 @@
 mod descriptors;
+mod gpt;
 mod hid;
 mod policy;
 mod xhci;

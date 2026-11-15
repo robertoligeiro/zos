@@ -282,15 +282,93 @@ fn diagnostic_key(key: keyboard::Key) {
     log(format_args!("DIAGNOSTIC KEY: {key:?}"));
 }
 
+/// Events from the built-in PS/2 devices waiting for the console or TTY to
+/// become ready. Bytes already read from the i8042 cannot be pushed back, so
+/// nothing more is drained until this queue is empty.
+struct Pending {
+    items: [Option<zos_console::usb::Event>; 32],
+    head: usize,
+    len: usize,
+}
+
+impl Pending {
+    const fn new() -> Self {
+        Self {
+            items: [None; 32],
+            head: 0,
+            len: 0,
+        }
+    }
+    fn push(&mut self, event: zos_console::usb::Event) {
+        // A full queue (a flood no human types) drops the newest event.
+        if self.len < self.items.len() {
+            let slot = (self.head + self.len) % self.items.len();
+            self.items[slot] = Some(event);
+            self.len += 1;
+        }
+    }
+    fn front(&self) -> Option<zos_console::usb::Event> {
+        if self.len == 0 {
+            None
+        } else {
+            self.items[self.head]
+        }
+    }
+    fn pop(&mut self) {
+        self.head = (self.head + 1) % self.items.len();
+        self.len -= 1;
+    }
+}
+
+fn deliver(event: zos_console::usb::Event) -> Result<(), os::Error> {
+    use zos_console::usb::Event;
+    match event {
+        Event::Key(key) => os::send_ready(TTY, &key.encode(), &mut []),
+        Event::Pointer { dx, dy, buttons } => {
+            let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
+            os::send_ready(
+                CONSOLE,
+                &[POINTER, x[0], x[1], y[0], y[1], buttons],
+                &mut [],
+            )
+        }
+    }
+    .map(|_| ())
+}
+
 fn usb_input(test: bool) -> ! {
     use zos_console::usb::{Controller, Error, Event};
-    assert_eq!(os::io_port_grant(0x60, 1), Err(os::Error::Denied));
-    assert_eq!(os::io_port_grant(0x64, 1), Err(os::Error::Denied));
     assert_eq!(os::io_port_grant(0x170, 8), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(INPUT, 1), Err(os::Error::Denied));
     assert_eq!(os::irq_attach(INPUT, 12), Err(os::Error::Denied));
+    // Most laptops wire the built-in keyboard to the legacy i8042 controller, so
+    // its two ports are granted. Without it (or without a USB keyboard) the
+    // machine would have no way to type.
+    os::io_port_grant(0x60, 1).unwrap();
+    os::io_port_grant(0x64, 1).unwrap();
+    let mut bus = LegacyBus;
+    let mut legacy = match ps2::initialize(&mut bus) {
+        Ok(devices) => {
+            log(format_args!(
+                "INTEGRATED PS2: kbd={} mouse={}",
+                devices.keyboard.is_ok(),
+                devices.mouse.is_ok()
+            ));
+            Some(devices)
+        }
+        Err(error) => {
+            log(format_args!("INTEGRATED PS2 UNAVAILABLE: {error:?}"));
+            None
+        }
+    };
+    let mut keyboard = Keyboard::default();
+    let mut mouse = Mouse::default();
+    let mut pending = Pending::new();
     let mut controller = Controller::new().unwrap_or_else(|error| {
         log(format_args!("USB INITIALIZATION FAILURE: {error:?}"));
+        diagnostic(format_args!(
+            "ZOS: USB storage unavailable ({error:?}); photograph this screen"
+        ));
         panic!("USB initialization failed");
     });
     assert_eq!(os::usb_controller().unwrap_err(), os::Error::Denied);
@@ -324,7 +402,7 @@ fn usb_input(test: bool) -> ! {
         os::debug_write("USB DMA CAPABILITY PASS: bad pointer, quota, NX MMIO").unwrap();
     }
     os::irq_attach(INPUT, 0).unwrap();
-    os::debug_write("USB CAPABILITIES PASS: controller/DMA only; no PS2/ATA ports").unwrap();
+    os::debug_write("USB CAPABILITIES PASS: controller/DMA + i8042; no ATA").unwrap();
     let mut ready = false;
     let mut backpressure = false;
     let mut request = [0; os::MAX_STORAGE_MESSAGE];
@@ -361,22 +439,51 @@ fn usb_input(test: bool) -> ! {
             log(format_args!("USB RUNTIME FAILURE: {error:?}"));
             panic!("USB controller failed");
         });
+        // Built-in PS/2 keyboard/mouse, polled on every wake-up (the 100 Hz tick).
+        let mut offline = false;
+        if let Some(devices) = &legacy {
+            if pending.len == 0 {
+                let result = ps2::drain(&mut bus, |auxiliary, byte| {
+                    if auxiliary {
+                        if devices.mouse.is_ok() {
+                            if let Some(motion) = mouse.feed(byte) {
+                                pending.push(Event::Pointer {
+                                    dx: motion.dx,
+                                    dy: motion.dy,
+                                    buttons: motion.buttons,
+                                });
+                            }
+                        }
+                    } else if devices.keyboard.is_ok() {
+                        if let Some(key) = keyboard.feed(byte) {
+                            pending.push(Event::Key(key));
+                        }
+                    }
+                });
+                offline = result.is_err();
+            }
+        }
+        if offline {
+            log(format_args!("INTEGRATED PS2 OFFLINE"));
+            legacy = None;
+        }
+        while let Some(event) = pending.front() {
+            if !ready {
+                pending.pop();
+                continue;
+            }
+            match deliver(event) {
+                Ok(()) => pending.pop(),
+                Err(os::Error::Busy) => break,
+                Err(error) => panic!("PS/2 input forwarding failed: {error:?}"),
+            }
+        }
         while let Some(event) = controller.event() {
             if !ready {
                 controller.consume_event();
                 continue;
             }
-            let sent = match event {
-                Event::Key(key) => os::send_ready(TTY, &key.encode(), &mut []),
-                Event::Pointer { dx, dy, buttons } => {
-                    let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
-                    os::send_ready(
-                        CONSOLE,
-                        &[POINTER, x[0], x[1], y[0], y[1], buttons],
-                        &mut [],
-                    )
-                }
-            };
+            let sent = deliver(event);
             match sent {
                 Ok(_) => controller.consume_event(),
                 Err(os::Error::Busy) => {
