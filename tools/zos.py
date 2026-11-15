@@ -153,6 +153,10 @@ def compact_elf(data: bytes) -> bytes:
 
 
 def image(kernel: Path, case: str | None = None) -> Path:
+    if case == "usb" and not kernel.name.startswith("zos-usb-"):
+        # The stick has no PS/2 controller: a kernel built without the usb feature would
+        # try to talk to one and the input service would fail at boot.
+        raise ValueError(f"The USB stick needs a kernel built with usb=True, not {kernel.name}")
     limine = TOOLS / "limine"
     destination = image_path(f"zos-{case}.img" if case else "zos.img")
     configuration = {"diagnostic": "limine-diagnostic.conf", "gui": "limine-gui.conf",
