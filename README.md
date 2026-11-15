@@ -1,5 +1,9 @@
 # ZOS - Zombie OS
 
+<p align="center">
+  <img src="assets/zos-logo.png" alt="ZOS - Zombie Operating System: a pixel-art zombie standing inside the O of the ZOS logo on a blue boot screen" width="420">
+</p>
+
 A single-core x86-64 microkernel project following the supplied
 `MICROKERNEL_OS_PLAN.md`. Rust, Limine, BIOS + UEFI, and serial-first debugging.
 
@@ -689,3 +693,6 @@ at your option. Unless you state otherwise, any contribution intentionally submi
 for inclusion in ZOS by you, as defined in the Apache-2.0 license, is dual licensed as
 above, without any additional terms or conditions. Third-party components and their
 licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+**Logo.** `assets/zos-logo.png` is an AI-generated image. It carries its own notice
+("All rights reserved") and is not part of the MIT OR Apache-2.0 licensed source.
