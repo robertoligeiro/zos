@@ -2,8 +2,10 @@
 //!
 //! Real systems learn the device's address from ACPI, which ZOS does not read yet, so
 //! the bus is scanned instead: every address that answers a one-byte read is logged
-//! (for diagnosis), and only addresses where touchpads are known to live are asked for
-//! a HID descriptor. Nothing is ever written to other devices.
+//! (for diagnosis). Addresses where touchpads are known to live, and any other address
+//! outside the ranges used by memory and power-management chips, are asked for a HID
+//! descriptor (a two-byte register write plus a read). The reserved ranges are never
+//! written to.
 
 use super::designware::DesignWare;
 use super::hid::{HidDevice, MAX_INPUT, MAX_REPORT_DESCRIPTOR};
@@ -15,6 +17,12 @@ use super::{say, Bus, Error, Regs};
 const TOUCHPAD_ADDRESSES: [u8; 13] = [
     0x10, 0x14, 0x15, 0x1a, 0x20, 0x24, 0x2a, 0x2c, 0x2d, 0x38, 0x3a, 0x4a, 0x5d,
 ];
+/// Addresses that are never written to: reserved ranges, SPD/EEPROM memory and
+/// smart-battery / power-management chips, where a stray write could do harm.
+fn off_limits(address: u8) -> bool {
+    matches!(address, 0x08..=0x0f | 0x30..=0x37 | 0x50..=0x57)
+}
+
 /// Consecutive failed polls before the device is declared gone.
 const MAX_FAILURES: u32 = 300;
 
@@ -104,7 +112,7 @@ pub fn probe_bus<B: Bus>(
     log(line.as_str());
     // 2. Ask the likely ones for a HID descriptor.
     for &address in &answering[..count.min(answering.len())] {
-        if !TOUCHPAD_ADDRESSES.contains(&address) {
+        if off_limits(address) && !TOUCHPAD_ADDRESSES.contains(&address) {
             continue;
         }
         let device = match HidDevice::identify(&mut bus, address) {
@@ -292,13 +300,13 @@ mod tests {
         assert!(text.contains("2c not HID"), "{text}");
         assert!(
             !text.contains("50 not HID"),
-            "addresses outside the touchpad list are left alone: {text}"
+            "memory-chip addresses are left alone: {text}"
         );
     }
 
     #[test]
-    fn devices_outside_the_touchpad_list_are_never_written_to() {
-        // A HID device at an address nobody uses for touchpads is not even asked.
+    fn memory_and_power_chip_addresses_are_never_written_to() {
+        // A HID device at an EEPROM / battery address is not even asked.
         let pad = HidTouchpad::new(0x50, BOOT_MOUSE.to_vec());
         let mut log = Vec::new();
         assert!(probe_with(vec![Box::new(pad)], &mut log).is_none());
@@ -359,5 +367,20 @@ mod tests {
         let mut log = Vec::new();
         assert!(probe_bus(1, Hung, &mut |line| log.push(line.to_string())).is_none());
         assert_eq!(log, ["I2C1: bus not responding, skipped"]);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::off_limits;
+
+    #[test]
+    fn only_memory_and_power_ranges_are_off_limits() {
+        for address in [0x08, 0x0b, 0x0f, 0x30, 0x37, 0x50, 0x57] {
+            assert!(off_limits(address), "{address:#x}");
+        }
+        for address in [0x10, 0x15, 0x2c, 0x38, 0x4a, 0x58, 0x5d, 0x77] {
+            assert!(!off_limits(address), "{address:#x}");
+        }
     }
 }

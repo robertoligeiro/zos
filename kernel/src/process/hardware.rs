@@ -178,8 +178,10 @@ fn power_on(device: u32) {
     }
 }
 
-/// The `index`th Intel serial-IO controller (vendor 8086, class 0x118000: the I2C, SPI
-/// and UART blocks; the driver recognizes I2C by its register signature). `Invalid`
+/// The `index`th Intel serial-IO candidate (vendor 8086, class 0x118000 "signal
+/// processing" as on Skylake-era chipsets, or 0x0c8000 "serial bus, other" as on
+/// newer ones: I2C, SPI, UART and other blocks; the driver recognizes I2C by its
+/// register signature and skips the rest). `Invalid`
 /// past the last one, `Denied` when that one has no usable register window.
 fn discover_i2c(index: usize) -> Result<(u32, u64, u64), Error> {
     let mut seen = 0;
@@ -197,14 +199,21 @@ fn discover_i2c(index: usize) -> Result<(u32, u64, u64), Error> {
             for function in 0..functions {
                 let device = device | function << 8;
                 let identity = read(device, 0);
-                if identity & 0xffff != 0x8086 || read(device, 8) >> 8 != 0x118000 {
+                let class = read(device, 8) >> 8;
+                if identity & 0xffff != 0x8086 || !matches!(class, 0x118000 | 0x0c8000) {
                     continue;
                 }
                 if seen != index {
                     seen += 1;
                     continue;
                 }
-                crate::logln!("PCI I2C {}: bdf={:#x} id={:#010x}", index, device, identity);
+                crate::logln!(
+                    "PCI I2C {}: bdf={:#x} id={:#010x} class={:#08x}",
+                    index,
+                    device,
+                    identity,
+                    class
+                );
                 power_on(device);
                 let (physical, length) = bar(device, "I2C")?;
                 return Ok((device, physical, length));

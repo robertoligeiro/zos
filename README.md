@@ -755,8 +755,8 @@ decoder that understands both mouse-mode pads and Windows Precision Touchpad rep
 the controller's register window (`I2cController` call, PCI vendor 8086 class
 0x118000, powered up from D3 if needed); everything else is user space and polled.
 ZOS does not read ACPI yet, so the touchpad's address is found by scanning each bus
-read-only and asking only the addresses touchpads are known to use for a HID
-descriptor. The driver is unit-tested against a simulated controller and touchpad;
+read-only and asking every answering address, except memory and power-chip ranges,
+for a HID descriptor. The driver is unit-tested against a simulated controller and touchpad;
 what it finds on real hardware (controllers, answering addresses, descriptor ids) goes
 to the boot log with `I2C` prefixes, which is the first thing to read if the pointer
 does not move.
