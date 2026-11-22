@@ -554,17 +554,18 @@ pub extern "C" fn _start(_: usize) -> ! {
         }
         // Windows the user closed leave their applications a Close event.
         desktop.reconcile();
-        // The user asked for an application (menu or shortcut): start it. This call
-        // can take a moment (the program is read from storage); input waits in the
-        // input service's queue meanwhile.
-        if let Some(Launch::App(index)) = desktop.manager.take_launch() {
-            launch(usize::from(index));
-        }
         if sender == INPUT {
             // The input service learns whether keys should go to an application.
             os::reply_live(token, &[desktop.focus_byte()]).unwrap();
         } else {
             os::reply_live(token, &[]).unwrap();
+        }
+        // The user asked for an application (menu or shortcut): start it. This must
+        // come AFTER the reply: starting a program reads it from storage, and the USB
+        // disk is served by the input service, which would still be waiting for this
+        // reply (a cycle the kernel rightly refuses). Input queues up meanwhile.
+        if let Some(Launch::App(index)) = desktop.manager.take_launch() {
+            launch(usize::from(index));
         }
     }
 }
