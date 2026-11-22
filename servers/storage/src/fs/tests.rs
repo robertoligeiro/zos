@@ -316,3 +316,228 @@ fn malformed_wire_requests_and_trailing_bytes_fail_explicitly() {
     );
     assert_eq!(request.bytes(), &[0]);
 }
+
+mod pipes {
+    use super::*;
+    use crate::vfs::{Io, PIPE_BUFFER};
+
+    fn vfs() -> Vfs<Filesystem<MemoryDisk>> {
+        Vfs::new(Filesystem::mount(MemoryDisk::formatted()).unwrap())
+    }
+
+    fn drain(vfs: &mut Vfs<Filesystem<MemoryDisk>>) -> Vec<vfs::Wake> {
+        std::iter::from_fn(|| vfs.next_wake()).collect()
+    }
+
+    #[test]
+    fn bytes_arrive_in_order_and_an_empty_read_waits_for_the_writer() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        assert_eq!(vfs.write_io(1, write, b"hello", 9), Ok(Io::Done(5)));
+        let mut bytes = [0; 8];
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 9), Ok(Io::Done(5)));
+        assert_eq!(&bytes[..5], b"hello");
+        // Nothing buffered and a writer still open: the reader's token is parked.
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 77), Ok(Io::Parked));
+        assert!(drain(&mut vfs).is_empty());
+        assert_eq!(vfs.write_io(1, write, b"xy", 9), Ok(Io::Done(2)));
+        let wakes = drain(&mut vfs);
+        assert_eq!(wakes.len(), 1);
+        assert_eq!((wakes[0].token, wakes[0].reading), (77, true));
+        assert_eq!(wakes[0].result, Ok(2));
+        assert_eq!(&wakes[0].data[..2], b"xy");
+        // A plain (non-parking) read of an empty pipe is refused, never silently parked.
+        assert_eq!(vfs.read(1, read, &mut bytes), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn end_of_file_only_after_every_writer_is_closed() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        let copy = vfs.dup(1, write).unwrap();
+        vfs.write(1, write, b"ab").unwrap();
+        vfs.close(1, write).unwrap();
+        let mut bytes = [0; 4];
+        // Data first, even though one end is closed; the duplicate keeps it open.
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 5), Ok(Io::Done(2)));
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 5), Ok(Io::Parked));
+        vfs.close(1, copy).unwrap();
+        let wakes = drain(&mut vfs);
+        assert_eq!(wakes.len(), 1);
+        assert_eq!((wakes[0].token, wakes[0].result), (5, Ok(0)));
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 5), Ok(Io::Done(0)));
+        vfs.close(1, read).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn writing_with_no_readers_is_a_broken_pipe_and_wakes_a_blocked_writer() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        // Fill the pipe, then park a writer on it.
+        let full = [7; PIPE_BUFFER];
+        assert_eq!(vfs.write_io(1, write, &full[..900], 1), Ok(Io::Done(900)));
+        assert_eq!(vfs.write_io(1, write, &full[..300], 42), Ok(Io::Parked));
+        vfs.close(1, read).unwrap();
+        let wakes = drain(&mut vfs);
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(
+            (wakes[0].token, wakes[0].result),
+            (42, Err(Error::BrokenPipe))
+        );
+        assert_eq!(vfs.write(1, write, b"x"), Err(Error::BrokenPipe));
+        vfs.close(1, write).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_stream_many_times_the_buffer_arrives_complete_and_in_order() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        let stream: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let (mut sent, mut received) = (0, Vec::new());
+        let mut writer_parked = false;
+        let mut bytes = [0u8; 300];
+        while received.len() < stream.len() {
+            // The writer produces a chunk whenever it is not blocked.
+            if !writer_parked && sent < stream.len() {
+                let end = (sent + 700).min(stream.len());
+                match vfs.write_io(1, write, &stream[sent..end], 100).unwrap() {
+                    Io::Done(count) => sent += count,
+                    Io::Parked => {
+                        sent = end;
+                        writer_parked = true;
+                    }
+                }
+            }
+            // The (slow) reader takes a small piece.
+            match vfs.read_io(1, read, &mut bytes, 200).unwrap() {
+                Io::Done(count) => received.extend_from_slice(&bytes[..count]),
+                Io::Parked => unreachable!("the writer always runs ahead of this reader"),
+            }
+            for wake in drain(&mut vfs) {
+                if wake.token == 100 {
+                    assert_eq!(wake.result, Ok(wake.result.unwrap()));
+                    writer_parked = false;
+                }
+            }
+        }
+        assert_eq!(received, stream);
+        vfs.close(1, write).unwrap();
+        let mut last = [0; 4];
+        assert_eq!(vfs.read_io(1, read, &mut last, 200), Ok(Io::Done(0)));
+        vfs.close(1, read).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_parked_writer_is_finished_in_pieces_as_the_reader_makes_room() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        assert_eq!(vfs.write_io(1, write, &data, 1), Ok(Io::Done(1000)));
+        assert_eq!(vfs.write_io(1, write, &data, 2), Ok(Io::Parked));
+        let mut got = Vec::new();
+        let mut bytes = [0u8; 400];
+        let mut finished = None;
+        for _ in 0..10 {
+            if let Io::Done(count) = vfs.read_io(1, read, &mut bytes, 3).unwrap() {
+                got.extend_from_slice(&bytes[..count]);
+            }
+            if let Some(wake) = drain(&mut vfs).into_iter().find(|wake| wake.token == 2) {
+                finished = Some(wake.result);
+            }
+            if got.len() >= 2000 {
+                break;
+            }
+        }
+        assert_eq!(finished, Some(Ok(1000)));
+        assert_eq!(&got[..1000], &data[..]);
+        assert_eq!(&got[1000..2000], &data[..]);
+    }
+
+    #[test]
+    fn descriptors_can_be_granted_to_a_child_and_only_the_owner_may_use_them() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        vfs.grant(1, write, 2).unwrap();
+        assert_eq!(vfs.write(1, write, b"no"), Err(Error::BadFd));
+        assert_eq!(vfs.grant(1, write, 3), Err(Error::BadFd));
+        assert_eq!(vfs.write(3, write, b"no"), Err(Error::BadFd));
+        vfs.write(2, write, b"child").unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(vfs.read(1, read, &mut bytes), Ok(5));
+        // The child exits: its end is closed for it, so the parent sees end of file.
+        vfs.close_owner(2);
+        assert_eq!(vfs.read_io(1, read, &mut bytes, 4), Ok(Io::Done(0)));
+        vfs.close(1, read).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_dead_process_loses_its_parked_request_without_a_reply() {
+        let mut vfs = vfs();
+        let (read, write) = vfs.pipe(1).unwrap();
+        vfs.grant(1, read, 2).unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(vfs.read_io(2, read, &mut bytes, 55), Ok(Io::Parked));
+        vfs.close_owner(2);
+        assert_eq!(vfs.write(1, write, b"data"), Err(Error::BrokenPipe));
+        assert!(
+            drain(&mut vfs).is_empty(),
+            "no reply may go to a dead process"
+        );
+        vfs.close(1, write).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+    }
+
+    #[test]
+    fn duplicated_file_descriptors_share_their_offset() {
+        let mut vfs = vfs();
+        let fd = vfs.open(1, b"/f", READ | WRITE | CREATE).unwrap();
+        vfs.write(1, fd, b"abcdef").unwrap();
+        vfs.close(1, fd).unwrap();
+        let first = vfs.open(1, b"/f", READ).unwrap();
+        let second = vfs.dup(1, first).unwrap();
+        let mut bytes = [0; 3];
+        assert_eq!(vfs.read(1, first, &mut bytes), Ok(3));
+        assert_eq!(&bytes, b"abc");
+        assert_eq!(vfs.read(1, second, &mut bytes), Ok(3));
+        assert_eq!(&bytes, b"def");
+        assert_eq!(vfs.counts().1, 1, "one open file behind both descriptors");
+        vfs.close(1, first).unwrap();
+        assert_eq!(vfs.read(1, second, &mut bytes), Ok(0));
+        vfs.close(1, second).unwrap();
+        assert_eq!(vfs.counts(), (0, 0, 0));
+        // A file that is held open (even through a dup) cannot be removed.
+        let again = vfs.open(1, b"/f", READ).unwrap();
+        let copy = vfs.dup(1, again).unwrap();
+        vfs.close(1, again).unwrap();
+        assert_eq!(vfs.remove(b"/f"), Err(Error::Denied));
+        vfs.close(1, copy).unwrap();
+        vfs.remove(b"/f").unwrap();
+    }
+
+    #[test]
+    fn exhausting_pipes_descriptors_and_wrong_directions_fail_cleanly() {
+        let mut vfs = vfs();
+        let mut ends = Vec::new();
+        let mut created = 0;
+        while let Ok(pair) = vfs.pipe(1) {
+            ends.push(pair);
+            created += 1;
+        }
+        assert_eq!(created, 8, "the pipe table is bounded");
+        let (read, write) = ends[0];
+        assert_eq!(vfs.write(1, read, b"x"), Err(Error::Denied));
+        assert_eq!(vfs.read(1, write, &mut [0; 1]), Err(Error::Denied));
+        assert_eq!(vfs.write_io(1, write, &[0; 2000], 1), Err(Error::TooLarge));
+        for (read, write) in ends {
+            vfs.close(1, read).unwrap();
+            vfs.close(1, write).unwrap();
+        }
+        assert_eq!(vfs.counts(), (0, 0, 0));
+        // And the table is usable again afterwards.
+        assert!(vfs.pipe(1).is_ok());
+    }
+}

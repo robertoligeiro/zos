@@ -19,6 +19,10 @@ struct Job {
     started_waiter: Option<usize>,
     startup_sent: bool,
     blocked_ready: bool,
+    /// The shell has finished preparing the process (descriptors granted); until
+    /// then its request for the startup packet is parked in `startup_waiter`.
+    released: bool,
+    startup_waiter: Option<usize>,
 }
 
 fn read_image(path: &[u8], image: &mut [u8]) -> Result<usize> {
@@ -149,6 +153,8 @@ fn handle(
                 started_waiter: None,
                 startup_sent: false,
                 blocked_ready: false,
+                released: false,
+                startup_waiter: None,
             });
             response[..8].copy_from_slice(&pid.to_le_bytes());
             Ok(Some(8))
@@ -226,10 +232,40 @@ fn handle(
                 .flatten()
                 .find(|j| j.pid & 255 == owner as u64 && j.status.is_none())
                 .ok_or(Error::Denied)?;
+            if !job.released {
+                // Not yet: the parent is still handing this process its descriptors.
+                if job.startup_waiter.is_some() {
+                    return Err(Error::Denied);
+                }
+                job.startup_waiter = Some(token);
+                return Ok(None);
+            }
             response[..job.startup.length]
                 .copy_from_slice(&job.startup.bytes[..job.startup.length]);
             job.startup_sent = true;
             Ok(Some(job.startup.length))
+        }
+        10 => {
+            if owner != 3 {
+                return Err(Error::Denied);
+            }
+            let pid = reader.u64()?;
+            reader.end()?;
+            let job = jobs
+                .iter_mut()
+                .flatten()
+                .find(|j| j.pid == pid)
+                .ok_or(Error::NotFound)?;
+            job.released = true;
+            if let Some(waiter) = job.startup_waiter.take() {
+                let mut packet = [0; 769];
+                packet[1..=job.startup.length]
+                    .copy_from_slice(&job.startup.bytes[..job.startup.length]);
+                job.startup_sent = true;
+                // The child may have been killed while waiting; that is not an error.
+                let _ = os::reply_live(waiter, &packet[..job.startup.length + 1]);
+            }
+            Ok(Some(0))
         }
         6 => {
             if owner != 3 {

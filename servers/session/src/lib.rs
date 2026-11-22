@@ -9,7 +9,13 @@ pub mod parser;
 use zos_storage::{vfs, Error, Result};
 pub const PROCMGR: usize = 7;
 pub const MANAGER_TID: usize = 8;
-pub const PROGRAMS: [&[u8]; 11] = [
+pub const PROGRAMS: [&[u8]; 17] = [
+    b"wc",
+    b"grep",
+    b"head",
+    b"seq",
+    b"yes",
+    b"uniq",
     b"echo",
     b"cat",
     b"cp",

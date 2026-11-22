@@ -201,6 +201,35 @@ pub fn close(fd: u64) -> Result<()> {
     request.u64(fd)?;
     rpc(VFS, request.bytes(), &mut [0]).map(|_| ())
 }
+/// A new pipe: (read end, write end), both owned by the caller.
+pub fn pipe() -> Result<(u64, u64)> {
+    let mut reply = [0; 17];
+    if rpc(VFS, &[11], &mut reply)? != 16 {
+        return Err(Error::Corrupt);
+    }
+    Ok((
+        u64::from_le_bytes(reply[1..9].try_into().unwrap()),
+        u64::from_le_bytes(reply[9..17].try_into().unwrap()),
+    ))
+}
+/// Another descriptor for the same open file or pipe end.
+pub fn dup(fd: u64) -> Result<u64> {
+    let mut request = Request::new(12);
+    request.u64(fd)?;
+    let mut reply = [0; 9];
+    if rpc(VFS, request.bytes(), &mut reply)? != 8 {
+        return Err(Error::Corrupt);
+    }
+    Ok(u64::from_le_bytes(reply[1..].try_into().unwrap()))
+}
+/// Hands `fd` to the process in slot `target` (a child that has not started running
+/// its program yet); the caller no longer owns it.
+pub fn grant(fd: u64, target: u8) -> Result<()> {
+    let mut request = Request::new(13);
+    request.u64(fd)?;
+    request.byte(target)?;
+    rpc(VFS, request.bytes(), &mut [0]).map(|_| ())
+}
 pub fn stat(path: &[u8]) -> Result<Entry> {
     let mut request = Request::new(4);
     request.push(path)?;

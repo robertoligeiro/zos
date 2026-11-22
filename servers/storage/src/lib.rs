@@ -39,6 +39,8 @@ pub enum Error {
     Io,
     Corrupt,
     TooLarge,
+    /// Writing to a pipe whose readers have all gone.
+    BrokenPipe,
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -57,6 +59,7 @@ impl Error {
             10 => Self::Io,
             11 => Self::Corrupt,
             12 => Self::TooLarge,
+            13 => Self::BrokenPipe,
             _ => return Err(Self::Corrupt),
         })
     }

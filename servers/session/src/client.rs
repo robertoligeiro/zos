@@ -22,6 +22,10 @@ pub struct Invocation<'a> {
     pub cwd: &'a [u8],
     pub output: &'a [u8],
     pub append: bool,
+    /// Descriptors the shell handed this process for its standard streams.
+    pub stdin: Option<u64>,
+    pub stdout: Option<u64>,
+    pub stderr: Option<u64>,
     pub argv: [&'a [u8]; 12],
     pub argc: usize,
     /// Exported shell variables as (name, value).
@@ -38,6 +42,8 @@ impl Startup {
         if argv.is_empty() || argv.len() > 12 || env.len() > ENV_MAX {
             return Err(Error::Invalid);
         }
+        // Flag bits: 0 append; 1, 2, 3 a stdin / stdout / stderr descriptor follows the
+        // environment (set by `with_descriptors`).
         let mut request = Request::new(output.is_some_and(|(_, a)| a) as u8);
         request.u16(cwd.len().try_into().map_err(|_| Error::TooLarge)?)?;
         request.u16(
@@ -73,16 +79,37 @@ impl Startup {
         startup.decode()?;
         Ok(startup)
     }
+    /// Adds the descriptors the child should use as stdin, stdout and stderr.
+    pub fn with_descriptors(
+        mut self,
+        stdin: Option<u64>,
+        stdout: Option<u64>,
+        stderr: Option<u64>,
+    ) -> Result<Self> {
+        self.decode()?;
+        for (bit, fd) in [(2, stdin), (4, stdout), (8, stderr)] {
+            let Some(fd) = fd else { continue };
+            let end = self.length + 8;
+            if end > self.bytes.len() {
+                return Err(Error::TooLarge);
+            }
+            self.bytes[self.length..end].copy_from_slice(&fd.to_le_bytes());
+            self.length = end;
+            self.bytes[0] |= bit;
+        }
+        self.decode()?;
+        Ok(self)
+    }
     pub fn decode(&self) -> Result<Invocation<'_>> {
         if self.length > self.bytes.len() {
             return Err(Error::TooLarge);
         }
         let mut reader = Reader::new(&self.bytes[..self.length]);
-        let append = match reader.byte()? {
-            0 => false,
-            1 => true,
-            _ => return Err(Error::Invalid),
-        };
+        let flags = reader.byte()?;
+        if flags & !15 != 0 {
+            return Err(Error::Invalid);
+        }
+        let append = flags & 1 != 0;
         let cwd_len = reader.u16()? as usize;
         let out_len = reader.u16()? as usize;
         let argc = reader.byte()? as usize;
@@ -118,11 +145,22 @@ impl Startup {
             }
             *entry = (name, value);
         }
+        let mut descriptor = |bit: u8| -> Result<Option<u64>> {
+            if flags & bit == 0 {
+                Ok(None)
+            } else {
+                reader.u64().map(Some)
+            }
+        };
+        let (stdin, stdout, stderr) = (descriptor(2)?, descriptor(4)?, descriptor(8)?);
         reader.end()?;
         Ok(Invocation {
             cwd,
             output,
             append,
+            stdin,
+            stdout,
+            stderr,
             argv,
             argc,
             env,
@@ -130,7 +168,9 @@ impl Startup {
         })
     }
 }
-pub fn spawn(path: &[u8], startup: &Startup) -> Result<u64> {
+/// Starts a program but keeps it from reading its startup packet until `release`, so
+/// the caller can first give it descriptors.
+pub fn spawn_held(path: &[u8], startup: &Startup) -> Result<u64> {
     startup.decode()?;
     let mut request = Request::new(0);
     request.u16(path.len().try_into().map_err(|_| Error::TooLarge)?)?;
@@ -141,6 +181,15 @@ pub fn spawn(path: &[u8], startup: &Startup) -> Result<u64> {
         return Err(Error::Corrupt);
     }
     Ok(u64::from_le_bytes(reply[1..].try_into().unwrap()))
+}
+/// Lets a held program continue (it will then read its startup packet).
+pub fn release(pid: u64) -> Result<()> {
+    pid_call(10, pid, &mut [0]).map(|_| ())
+}
+pub fn spawn(path: &[u8], startup: &Startup) -> Result<u64> {
+    let pid = spawn_held(path, startup)?;
+    release(pid)?;
+    Ok(pid)
 }
 fn pid_call(op: u8, pid: u64, reply: &mut [u8]) -> Result<usize> {
     let mut request = Request::new(op);
@@ -156,6 +205,15 @@ pub fn wait(pid: u64) -> Result<i64> {
 }
 pub fn kill(pid: u64) -> Result<()> {
     pid_call(2, pid, &mut [0]).map(|_| ())
+}
+/// How many (descriptors, open files, pipes) the VFS currently has, for leak checks.
+pub fn vfs_counts() -> Result<(usize, usize, usize)> {
+    let mut reply = [0; 7];
+    if rpc(zos_storage::VFS, &[14], &mut reply)? != 6 {
+        return Err(Error::Corrupt);
+    }
+    let value = |i: usize| u16::from_le_bytes([reply[1 + i * 2], reply[2 + i * 2]]) as usize;
+    Ok((value(0), value(1), value(2)))
 }
 pub fn started(pid: u64) -> Result<()> {
     pid_call(7, pid, &mut [0]).map(|_| ())
@@ -213,6 +271,54 @@ pub fn log(offset: u64, bytes: &mut [u8; 960]) -> Result<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn descriptors_round_trip_and_hostile_packets_are_refused() {
+        let base = Startup::new(b"/", None, &[b"wc", b"-l"], &[]).unwrap();
+        let none = base.decode().unwrap();
+        assert_eq!((none.stdin, none.stdout, none.stderr), (None, None, None));
+        let wired = base
+            .with_descriptors(Some(0x1_0203), None, Some(u64::MAX))
+            .unwrap();
+        let invocation = wired.decode().unwrap();
+        assert_eq!(
+            (invocation.stdin, invocation.stdout, invocation.stderr),
+            (Some(0x1_0203), None, Some(u64::MAX))
+        );
+        assert_eq!(wired.length, base.length + 16);
+        assert_eq!(
+            &invocation.argv[..invocation.argc],
+            [b"wc".as_slice(), b"-l"]
+        );
+        // Every truncation of a packet that carries descriptors fails; so does a
+        // trailing byte, and flag bits that mean nothing.
+        for length in 0..wired.length {
+            let mut cut = wired;
+            cut.length = length;
+            assert!(cut.decode().is_err(), "{length}");
+        }
+        let mut trailing = wired;
+        trailing.length += 1;
+        assert!(trailing.decode().is_err());
+        let mut flagged = base;
+        flagged.bytes[0] |= 16;
+        assert!(flagged.decode().is_err());
+        // A flag without its descriptor, and a descriptor without its flag.
+        let mut missing = base;
+        missing.bytes[0] |= 2;
+        assert!(missing.decode().is_err());
+        let mut extra = base.with_descriptors(Some(7), None, None).unwrap();
+        extra.bytes[0] &= !2;
+        assert!(extra.decode().is_err());
+        // The packet is bounded: descriptors cannot push it past 768 bytes.
+        let long = [b'a'; 60];
+        let argv: [&[u8]; 12] = [&long; 12];
+        let near = Startup::new(b"/", None, &argv, &[]).unwrap();
+        assert_eq!(
+            near.with_descriptors(Some(1), Some(2), Some(3)).err(),
+            Some(Error::TooLarge)
+        );
+    }
+
     #[test]
     fn invocation_round_trip_and_malformed_packets() {
         let env: [(&[u8], &[u8]); 2] = [(b"PATH", b"/bin"), (b"EMPTY", b"")];

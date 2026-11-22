@@ -67,7 +67,7 @@ SHELL_READY = "SHELL ready: interactive ZOS shell"
 SHELL_PROOFS = (
     "PROCESS CAPABILITIES PASS:", "PROCESS REUSE PASS:", "PROCESS STATUS PASS:",
     "PROCESS CLEANUP PASS: kill blocked IPC", "PATH SPAWN PASS:",
-    "SHELL SESSION PASS:", "SHELL CLEANUP PASS:",
+    "SHELL SESSION PASS:", "SHELL CLEANUP PASS:", "PIPE CLEANUP PASS:",
 )
 USB_MARKERS = (
     "PCI XHCI PASS:", "XHCI ready:", "USB ENUM PASS: slot=1 port=3 Storage",
@@ -795,8 +795,45 @@ def shell_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False, gp
                     keys.line("echo ${FOO}${FOO} > o; cat o", [0, 0])
                     if not shown("barbar\n"):
                         raise RuntimeError("${NAME} expansion is wrong")
-                    keys.line("echo a | cat", [])
-                    keys.line("echo hi < f", [])
+                    # Streams: real pipes between concurrently running programs, redirection and
+                    # descriptor duplication. Counts below are exact (computed, not typical).
+                    keys.line("echo a | cat > o; cat o", [0, 0])
+                    if not shown("a\n"):
+                        raise RuntimeError("A two-stage pipeline lost its data")
+                    keys.line("echo hi < f", [0])
+                    keys.line("seq 1 5 | cat > o; cat o", [0, 0])
+                    if not shown("1\n2\n3\n4\n5\n"):
+                        raise RuntimeError("seq | cat did not deliver the numbers in order")
+                    keys.line("seq 1 3000 | grep 7 | wc -l > o; cat o", [0, 0])
+                    expected = sum("7" in str(n) for n in range(1, 3001))
+                    if not shown(f"{expected}\n"):
+                        raise RuntimeError(f"A pipeline several times the pipe buffer lost data (want {expected})")
+                    keys.line("seq 1 100 | grep 1 | grep -v 0 | wc -l > o; cat o", [0, 0])
+                    expected = sum("1" in str(n) and "0" not in str(n) for n in range(1, 101))
+                    if not shown(f"{expected}\n"):
+                        raise RuntimeError(f"A four-stage pipeline gave the wrong count (want {expected})")
+                    keys.line("yes | head -n 3 > o; cat o", [0, 0])
+                    if not shown("y\ny\ny\n"):
+                        raise RuntimeError("An endless producer did not stop when its reader exited")
+                    keys.line("set -o pipefail; yes | head -n 1 > o; false | true; set +o pipefail; false | true",
+                              [0, 141, 1, 0, 0])
+                    keys.line("echo alpha > in; echo beta >> in; grep bet < in > o; cat o", [0, 0, 0, 0])
+                    if not shown("beta\n"):
+                        raise RuntimeError("Input redirection did not feed the program")
+                    keys.line("grep -c a < in; grep zzz < in", [0, 1])
+                    keys.line("pwd | cat > o; cat o", [0, 0])
+                    if not shown("/a\n"):
+                        raise RuntimeError("A builtin at the head of a pipeline did not reach its reader")
+                    keys.line("echo x | cd /; pwd; echo x | export LEAK=1; printenv LEAK", [0, 0, 0, 1])
+                    if shown("/\n") and not shown("/a\n"):
+                        raise RuntimeError("cd inside a pipeline changed the parent shell")
+                    failed_before = log.read_text(encoding="utf-8").count("command failed; see serial COMMAND ERROR")
+                    keys.line("cat nosuchfile > o 2>&1; cat o; cat nosuchfile 2> o; cat o", [1, 0, 1, 0])
+                    if log.read_text(encoding="utf-8").count("command failed; see serial COMMAND ERROR") != failed_before + 2:
+                        raise RuntimeError("Standard error redirection (2> / 2>&1) did not capture the message")
+                    keys.line("echo a | cat | cat | cat > o; cat o", [0, 0])
+                    keys.line("echo a | cat | cat | cat | cat", [])  # five stages exceed the documented limit of four
+                    keys.line("echo a | cat &", [])
                     keys.line("echo ${NOPE", [1])
                     # Environment: only exported variables (and per-command prefixes) are inherited.
                     keys.line("export X=1 Y; printenv X > o; printenv Y >> o; printenv FOO; cat o", [0, 0, 0, 1, 0])

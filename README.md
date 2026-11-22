@@ -707,9 +707,27 @@ per-command expansion. The shell understands `NAME=value` and `$NAME` / `${NAME}
 patterns stay literal), `$PATH` lookup, and the builtins `export`, `unset`, `env` and
 `set`. Spawned programs inherit exported variables (see `printenv`). Differences from
 Bash, on purpose: an expanded value stays one word (no word splitting), and there is
-no `$(...)`. Pipelines and the `<`, `2>`, `2>&1` redirections already parse, but the
-shell refuses to run them until real pipes land (checkpoint 10B), rather than
-pretending.
+no `$(...)`.
+
+Checkpoint 10B adds real streams. `cmd1 | cmd2 | cmd3` (up to four stages) starts every
+stage before waiting, connected by kernel-mediated pipes that block with backpressure
+(1 KiB buffer; a writer waits when the reader is slow, a reader waits when the writer
+is slow), report end of file when the last writer closes, and report a broken pipe
+(status 141, silently) when the reader goes away, so `yes | head -n 3` ends. `<`,
+`>`, `>>`, `2>` and `2>&1` work on any command. Pipes live in the VFS: descriptors
+are owned by one process, can be duplicated (shared offset) and handed to a child
+that is held back until it has them, and are closed when their process exits.
+Builtins inside a pipeline run on a copy of the shell, so `cd` or `export` there
+cannot change the parent; `set -o pipefail` makes a pipeline's status that of its
+last failing stage. Deliberate differences from Bash: `2>&1` duplicates the final
+standard output whatever its position on the line, shell diagnostics always go to the
+console, and a pipeline cannot run in the background yet. New tools that read
+standard input: `cat`, `wc [-lwc]`, `grep [-vc] TEXT` (literal text), `head [-n N]`,
+`uniq`, plus the generators `seq` and `yes`; lines are limited to 1024 bytes and
+longer ones are an error, not silently cut. Native tests prove streams 100 times the
+pipe buffer arrive complete and in order, early-exiting readers, a pipeline that
+fails to start halfway, and that descriptors, open files, pipes and process memory
+return to their exact baseline after repeated pipelines.
 
 ### Desktop (window manager)
 

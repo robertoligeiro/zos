@@ -30,6 +30,7 @@ const UNUSED: Var = Var {
     used: false,
 };
 
+#[derive(Clone)]
 pub struct Env {
     vars: [Var; VARS],
     /// Status of the last command (`$?`).

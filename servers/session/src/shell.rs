@@ -108,10 +108,68 @@ impl fmt::Write for Output {
     }
 }
 
+/// A command whose words and assignment values have been expanded.
+struct Prepared {
+    words: Words,
+    values: [[u8; env::VALUE]; parser::ASSIGNS],
+    lengths: [usize; parser::ASSIGNS],
+}
+impl Prepared {
+    fn args(&self) -> [&[u8]; WORDS] {
+        core::array::from_fn(|i| {
+            if i < self.words.count {
+                self.words.get(i)
+            } else {
+                b""
+            }
+        })
+    }
+}
+
+/// One started stage of a pipeline.
+enum Stage {
+    /// A program, already running.
+    Child(u64),
+    /// A builtin (or bare assignment) that runs in the shell after the programs start;
+    /// `stdout` is the descriptor it writes to (its command is kept beside the stages).
+    Builtin { stdout: Option<u64> },
+}
+
+/// The descriptors the shell has opened for one pipeline, so every one is closed
+/// however the pipeline ends. A descriptor already handed to a child refuses the close.
+struct Held {
+    fds: [u64; 24],
+    count: usize,
+}
+impl Held {
+    fn new() -> Self {
+        Self {
+            fds: [0; 24],
+            count: 0,
+        }
+    }
+    fn add(&mut self, fd: u64) -> u64 {
+        if self.count < self.fds.len() {
+            self.fds[self.count] = fd;
+            self.count += 1;
+        }
+        fd
+    }
+    fn close_all(&mut self) {
+        for &fd in &self.fds[..self.count] {
+            let _ = api::close(fd);
+        }
+        self.count = 0;
+    }
+}
+
+#[derive(Clone)]
 struct Shell {
     cwd: [u8; PATH],
     length: usize,
     env: Env,
+    /// `set -o pipefail`: a pipeline's status is that of its last failing stage.
+    pipefail: bool,
 }
 impl Shell {
     fn new() -> Self {
@@ -125,6 +183,7 @@ impl Shell {
             cwd,
             length: 1,
             env,
+            pipefail: false,
         }
     }
     fn cwd(&self) -> &[u8] {
@@ -142,7 +201,7 @@ impl Shell {
         match args[0] {
             b"help" => {
                 exact(1)?;
-                out.bytes(b"ZOS shell: quotes, escapes, $VAR, ${VAR}, $?, # comments, * ? [a-z] globs, ;, &&, ||, !, >, >> and &\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv free ps kill wait uname dmesg\nexport unset env set (printenv is a program); NAME=value cmd; reboot halt\ndmesg prints the system log; dmesg > /name saves it.\nPrograms are found through $PATH (default /bin) or an explicit path.\n")?;
+                out.bytes(b"ZOS shell: quotes, escapes, $VAR, ${VAR}, $?, # comments, * ? [a-z] globs, ;, &&, ||, !, |, <, >, >>, 2>, 2>&1 and &\nPipelines run all stages at once (up to 4); set -o pipefail. Tools reading stdin: cat wc grep head uniq; seq yes make data.\nhelp clear ls cd pwd mkdir rmdir touch cat echo rm cp mv free ps kill wait uname dmesg\nexport unset env set (printenv is a program); NAME=value cmd; reboot halt\ndmesg prints the system log; dmesg > /name saves it.\nPrograms are found through $PATH (default /bin) or an explicit path.\n")?;
             }
             b"clear" => {
                 exact(1)?;
@@ -194,6 +253,12 @@ impl Shell {
                     }
                     self.env.unset(arg);
                 }
+            }
+            b"set" if args.len() == 3 && matches!(args[1], b"-o" | b"+o") => {
+                if args[2] != b"pipefail" {
+                    return Err(Error::Invalid);
+                }
+                self.pipefail = args[1] == b"-o";
             }
             b"env" | b"set" => {
                 exact(1)?;
@@ -413,7 +478,8 @@ impl Shell {
         }
         Err(Error::NotFound)
     }
-    fn execute(&mut self, parsed: &Parsed, command: &Command, background: bool) -> Result<i64> {
+    /// Expands one command's words (with globbing) and assignment values.
+    fn prepare(&self, parsed: &Parsed, command: &Command) -> Result<Prepared> {
         let mut words = Words::new();
         for &word in &command.words[..command.count] {
             let raw = parsed.word(word);
@@ -428,17 +494,59 @@ impl Shell {
             words.push(&plain[..length])?;
         }
         let mut values = [[0u8; env::VALUE]; parser::ASSIGNS];
-        let mut value_lengths = [0usize; parser::ASSIGNS];
+        let mut lengths = [0usize; parser::ASSIGNS];
         for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
-            value_lengths[i] =
+            lengths[i] =
                 env::expand(parsed.word(assign.value), &self.env, &mut values[i], false)?.length;
         }
-        if words.count == 0 {
+        Ok(Prepared {
+            words,
+            values,
+            lengths,
+        })
+    }
+    /// The startup packet for a program: the exported variables, with this command's
+    /// own `NAME=value` prefixes applied on top.
+    fn startup_for(
+        &self,
+        parsed: &Parsed,
+        command: &Command,
+        prepared: &Prepared,
+        args: &[&[u8]],
+        output: Option<(&[u8], bool)>,
+    ) -> Result<Startup> {
+        let mut pairs: [(&[u8], &[u8]); ENV_MAX] = [(b"", b""); ENV_MAX];
+        let mut count = 0;
+        for (name, value, exported) in self.env.all() {
+            if exported {
+                *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
+                count += 1;
+            }
+        }
+        for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
+            let name = parsed.word(assign.name);
+            let value = &prepared.values[i][..prepared.lengths[i]];
+            match pairs[..count]
+                .iter_mut()
+                .find(|(existing, _)| *existing == name)
+            {
+                Some(entry) => entry.1 = value,
+                None => {
+                    *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
+                    count += 1;
+                }
+            }
+        }
+        Startup::new(self.cwd(), output, args, &pairs[..count])
+    }
+    fn execute(&mut self, parsed: &Parsed, command: &Command, background: bool) -> Result<i64> {
+        let prepared = self.prepare(parsed, command)?;
+        if prepared.words.count == 0 {
             // Only assignments: they set shell variables.
             for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
                 self.env.set(
                     parsed.word(assign.name),
-                    &values[i][..value_lengths[i]],
+                    &prepared.values[i][..prepared.lengths[i]],
                     None,
                 )?;
             }
@@ -453,9 +561,8 @@ impl Shell {
             }
             None => None,
         };
-        let args: [&[u8]; WORDS] =
-            core::array::from_fn(|i| if i < words.count { words.get(i) } else { b"" });
-        let args = &args[..words.count];
+        let args = prepared.args();
+        let args = &args[..prepared.words.count];
         if is_builtin(args[0]) {
             if background {
                 return Err(Error::Invalid);
@@ -474,35 +581,12 @@ impl Shell {
             return result.and_then(|_| closed.map(|_| 0));
         }
         let executable = self.find_executable(args[0])?;
-        // The child sees the exported variables, with this command's own
-        // `NAME=value` prefixes applied on top.
-        let mut pairs: [(&[u8], &[u8]); ENV_MAX] = [(b"", b""); ENV_MAX];
-        let mut count = 0;
-        for (name, value, exported) in self.env.all() {
-            if exported {
-                *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
-                count += 1;
-            }
-        }
-        for (i, assign) in command.assigns[..command.assign_count].iter().enumerate() {
-            let name = parsed.word(assign.name);
-            let value = &values[i][..value_lengths[i]];
-            match pairs[..count]
-                .iter_mut()
-                .find(|(existing, _)| *existing == name)
-            {
-                Some(entry) => entry.1 = value,
-                None => {
-                    *pairs.get_mut(count).ok_or(Error::TooLarge)? = (name, value);
-                    count += 1;
-                }
-            }
-        }
-        let startup = Startup::new(
-            self.cwd(),
-            output.as_ref().map(|(p, append)| (p.bytes(), *append)),
+        let startup = self.startup_for(
+            parsed,
+            command,
+            &prepared,
             args,
-            &pairs[..count],
+            output.as_ref().map(|(p, append)| (p.bytes(), *append)),
         )?;
         let pid = client::spawn(executable.bytes(), &startup)?;
         if background {
@@ -513,10 +597,184 @@ impl Shell {
             client::wait(pid)
         }
     }
-    /// Runs one pipeline (a single command at this checkpoint) and records `$?`.
+    fn open_target(&self, parsed: &Parsed, target: parser::Target) -> Result<u64> {
+        let mut buffer = [0u8; PATH];
+        let length = env::expand(parsed.word(target.path), &self.env, &mut buffer, false)?.length;
+        let file = path(self.cwd(), &buffer[..length])?;
+        api::open(
+            file.bytes(),
+            WRITE | CREATE | if target.append { APPEND } else { TRUNCATE },
+        )
+    }
+    fn open_input(&self, parsed: &Parsed, span: parser::Span) -> Result<u64> {
+        let mut buffer = [0u8; PATH];
+        let length = env::expand(parsed.word(span), &self.env, &mut buffer, false)?.length;
+        api::open(path(self.cwd(), &buffer[..length])?.bytes(), READ)
+    }
+    /// Runs a pipeline of one or more commands with real streams: pipes between the
+    /// stages, files for `<`, `>`, `>>`, `2>`, descriptor duplication for `2>&1`.
+    ///
+    /// Every program stage is started before anything is waited for. Builtins in a
+    /// pipeline run on a copy of the shell, so `cd` or `export` there cannot change
+    /// this shell; they run after the programs are started so a builtin that writes
+    /// more than a pipe holds finds its reader already running.
+    fn pipeline(&mut self, parsed: &Parsed, pipeline: &Pipeline) -> Result<i64> {
+        if pipeline.background && pipeline.count > 1 {
+            return Err(Error::Invalid);
+        }
+        let mut held = Held::new();
+        let mut pids = [None; parser::STAGES];
+        let result = self.pipeline_stages(parsed, pipeline, &mut held, &mut pids);
+        // Whatever the shell still owns must go, or a reader would wait for a writer
+        // that never finishes. Descriptors already handed to a child refuse the close.
+        held.close_all();
+        if result.is_err() {
+            for pid in pids.iter().flatten() {
+                let _ = client::kill(*pid);
+                let _ = client::wait(*pid);
+            }
+        }
+        result
+    }
+    fn pipeline_stages(
+        &mut self,
+        parsed: &Parsed,
+        pipeline: &Pipeline,
+        held: &mut Held,
+        pids: &mut [Option<u64>; parser::STAGES],
+    ) -> Result<i64> {
+        let count = pipeline.count;
+        let mut pipes = [(0u64, 0u64); parser::STAGES];
+        for pipe in pipes.iter_mut().take(count - 1) {
+            *pipe = api::pipe()?;
+            held.add(pipe.0);
+            held.add(pipe.1);
+        }
+        let mut stages: [Option<Stage>; parser::STAGES] = core::array::from_fn(|_| None);
+        let mut builtins: [Option<Prepared>; parser::STAGES] = core::array::from_fn(|_| None);
+        for index in 0..count {
+            let command = &pipeline.commands[index];
+            let prepared = self.prepare(parsed, command)?;
+            let mut stdin = (index > 0).then(|| pipes[index - 1].0);
+            let mut stdout = (index + 1 < count).then(|| pipes[index].1);
+            if let Some(span) = command.redirects.input {
+                // The file replaces the pipe; drop the pipe's end now so the stage
+                // upstream is told nobody reads it.
+                if let Some(fd) = stdin.take() {
+                    let _ = api::close(fd);
+                }
+                stdin = Some(held.add(self.open_input(parsed, span)?));
+            }
+            if let Some(target) = command.redirects.output {
+                if let Some(fd) = stdout.take() {
+                    let _ = api::close(fd);
+                }
+                stdout = Some(held.add(self.open_target(parsed, target)?));
+            }
+            let stderr = if let Some(target) = command.redirects.error {
+                Some(held.add(self.open_target(parsed, target)?))
+            } else if command.redirects.error_to_output {
+                match stdout {
+                    Some(fd) => Some(held.add(api::dup(fd)?)),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if prepared.words.count == 0 || is_builtin(prepared.args()[0]) {
+                // Builtins and bare assignments read nothing; close what they cannot use.
+                for fd in [stdin, stderr].into_iter().flatten() {
+                    let _ = api::close(fd);
+                }
+                builtins[index] = Some(prepared);
+                stages[index] = Some(Stage::Builtin { stdout });
+                continue;
+            }
+            let args = prepared.args();
+            let args = &args[..prepared.words.count];
+            let executable = self.find_executable(args[0])?;
+            let startup = self
+                .startup_for(parsed, command, &prepared, args, None)?
+                .with_descriptors(stdin, stdout, stderr)?;
+            let pid = client::spawn_held(executable.bytes(), &startup)?;
+            pids[index] = Some(pid);
+            let slot = (pid & 255) as u8;
+            for fd in [stdin, stdout, stderr].into_iter().flatten() {
+                api::grant(fd, slot)?;
+            }
+            client::release(pid)?;
+            stages[index] = Some(Stage::Child(pid));
+        }
+        let mut statuses = [0i64; parser::STAGES];
+        for index in 0..count {
+            let (prepared, stdout) = match stages[index].take() {
+                Some(Stage::Builtin { stdout }) => (builtins[index].take().unwrap(), stdout),
+                other => {
+                    // A running program: leave it for the wait pass below.
+                    stages[index] = other;
+                    continue;
+                }
+            };
+            let command = &pipeline.commands[index];
+            statuses[index] = if prepared.words.count == 0 {
+                0
+            } else {
+                let args = prepared.args();
+                let args = &args[..prepared.words.count];
+                let mut output = Output(stdout);
+                let result = if count == 1 {
+                    self.builtin(args, &mut output)
+                } else {
+                    self.clone().builtin(args, &mut output)
+                };
+                match result {
+                    Ok(_) => 0,
+                    Err(Error::BrokenPipe) => 141,
+                    Err(error) => {
+                        let mut name = [0u8; 32];
+                        let length = parsed.plain(command.words[0], &mut name);
+                        let name = core::str::from_utf8(&name[..length]).unwrap_or("?");
+                        writeln!(Output(None), "shell: {name}: {error:?}").unwrap();
+                        1
+                    }
+                }
+            };
+            if let Some(fd) = stdout {
+                let _ = api::close(fd);
+            }
+        }
+        for index in 0..count {
+            if let Some(Stage::Child(pid)) = stages[index] {
+                statuses[index] = client::wait(pid)?;
+                pids[index] = None;
+            }
+        }
+        let statuses = &statuses[..count];
+        Ok(if self.pipefail {
+            statuses
+                .iter()
+                .rev()
+                .copied()
+                .find(|&status| status != 0)
+                .unwrap_or(0)
+        } else {
+            statuses[count - 1]
+        })
+    }
+    /// Runs one pipeline and records `$?`.
     fn run(&mut self, parsed: &Parsed, pipeline: &Pipeline) {
         let command = &pipeline.commands[0];
-        let status = match self.execute(parsed, command, pipeline.background) {
+        let redirects = &command.redirects;
+        let simple = pipeline.count == 1
+            && redirects.input.is_none()
+            && redirects.error.is_none()
+            && !redirects.error_to_output;
+        let outcome = if simple {
+            self.execute(parsed, command, pipeline.background)
+        } else {
+            self.pipeline(parsed, pipeline)
+        };
+        let status = match outcome {
             Ok(status) => status,
             Err(error) => {
                 let mut name = [0u8; 32];
@@ -548,20 +806,17 @@ impl Shell {
             }
         };
         // Refuse what this build cannot run before running any part of the line.
-        for pipeline in parsed.pipelines() {
-            let redirects = pipeline.commands[..pipeline.count].iter().any(|c| {
-                c.redirects.input.is_some()
-                    || c.redirects.error.is_some()
-                    || c.redirects.error_to_output
-            });
-            if pipeline.count > 1 || redirects {
-                writeln!(
-                    Output(None),
-                    "shell: pipes, <, 2> and 2>&1 are not supported yet"
-                )
-                .unwrap();
-                return;
-            }
+        if parsed
+            .pipelines()
+            .iter()
+            .any(|pipeline| pipeline.background && pipeline.count > 1)
+        {
+            writeln!(
+                Output(None),
+                "shell: a pipeline in the background (&) is not supported yet"
+            )
+            .unwrap();
+            return;
         }
         let mut previous = Connector::Seq;
         for pipeline in parsed.pipelines() {
@@ -668,6 +923,50 @@ fn self_test() {
     assert_eq!(client::wait(pid), Ok(0));
     api::unlink(b"/custom").unwrap();
     os::debug_write("PATH SPAWN PASS: executable copied to filesystem path").unwrap();
+    pipe_self_test();
+}
+
+/// Repeated pipelines, early-exit readers and a pipeline that fails to start must
+/// leave the VFS (descriptors, open files, pipes) and process memory exactly as they
+/// were, and the data must arrive intact.
+fn pipe_self_test() {
+    let mut shell = Shell::new();
+    let counts_before = client::vfs_counts().unwrap();
+    let memory_before = client::memory().unwrap();
+    for _ in 0..8 {
+        shell.line(b"seq 1 2500 | grep 7 | wc -l > /pipe-out");
+        shell.line(b"yes | head -n 2 > /pipe-out");
+        shell.line(b"seq 1 40 | cat | cat | wc -c > /pipe-out");
+    }
+    let mut bytes = [0; 16];
+    let fd = api::open(b"/pipe-out", READ).unwrap();
+    let count = api::read(fd, &mut bytes).unwrap();
+    api::close(fd).unwrap();
+    assert_eq!(
+        &bytes[..count],
+        b"111\n",
+        "the numbers 1 to 40 are 111 bytes of text"
+    );
+    // A stage that cannot be started after earlier stages already were.
+    let parsed = parser::parse(b"seq 1 20000 | nosuchprogram | cat > /pipe-out").unwrap();
+    assert_eq!(
+        shell.pipeline(&parsed, &parsed.pipelines[0]),
+        Err(Error::NotFound)
+    );
+    let parsed = parser::parse(b"seq 1 20000 | cat | cat | wc -l > /pipe-out").unwrap();
+    assert_eq!(shell.pipeline(&parsed, &parsed.pipelines[0]), Ok(0));
+    let fd = api::open(b"/pipe-out", READ).unwrap();
+    let count = api::read(fd, &mut bytes).unwrap();
+    api::close(fd).unwrap();
+    assert_eq!(
+        &bytes[..count],
+        b"20000\n",
+        "a stream 100 times the pipe buffer"
+    );
+    api::unlink(b"/pipe-out").unwrap();
+    assert_eq!(client::vfs_counts().unwrap(), counts_before);
+    assert_eq!(client::memory().unwrap(), memory_before);
+    os::debug_write("PIPE CLEANUP PASS: 24 pipelines, failed start, exact baselines").unwrap();
 }
 
 /// Writes the log collected so far to `path`, replacing any previous copy.
