@@ -545,11 +545,16 @@ fn usb_input(test: bool) -> ! {
         if timer_tick {
             if let Some(pad) = touchpad.as_mut() {
                 if let Some(motion) = pad.poll() {
+                    // HID motion has Y growing downward; pointer events (as from PS/2
+                    // and the USB mouse path) have Y growing upward.
                     pending.push(Event::Pointer {
                         dx: motion.dx,
-                        dy: motion.dy,
+                        dy: motion.dy.saturating_neg(),
                         buttons: motion.buttons,
                     });
+                }
+                if let Some(note) = pad.take_note() {
+                    let _ = os::debug_write(note.as_str());
                 }
                 if pad.dead() {
                     log(format_args!("I2C touchpad stopped answering"));

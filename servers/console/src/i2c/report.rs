@@ -244,6 +244,9 @@ pub fn extract(report: &[u8], field: &Field) -> i32 {
     value as i64 as i32
 }
 
+/// Pointer motion as HID defines it: positive `dy` is down the screen. (The pointer
+/// events the rest of ZOS passes around use the PS/2 convention, up is positive; the
+/// input service flips it.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Motion {
     pub dx: i16,

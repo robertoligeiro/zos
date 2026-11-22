@@ -10,7 +10,7 @@
 use super::designware::DesignWare;
 use super::hid::{HidDevice, MAX_INPUT, MAX_REPORT_DESCRIPTOR};
 use super::report::{Decoder, Layout, Motion};
-use super::{say, Bus, Error, Regs};
+use super::{say, Bus, Error, Line, Regs};
 
 /// 7-bit addresses used by touchpads and touchscreens (Elan, Synaptics, ALPS, Goodix,
 /// Cirque, Hynitron, Microsoft) in Linux's device tables.
@@ -23,14 +23,19 @@ fn off_limits(address: u8) -> bool {
     matches!(address, 0x08..=0x0f | 0x30..=0x37 | 0x50..=0x57)
 }
 
-/// Consecutive failed polls before the device is declared gone.
+/// Consecutive failed polls (errors, not "nothing to say") before the device is
+/// declared gone.
 const MAX_FAILURES: u32 = 300;
+/// How many raw reports are copied to the log.
+const SAMPLES: u32 = 6;
 
 pub struct Touchpad<B: Bus> {
     bus: B,
     device: HidDevice,
     decoder: Decoder,
     failures: u32,
+    seen: u32,
+    note: Option<Line>,
 }
 
 impl<B: Bus> Touchpad<B> {
@@ -44,23 +49,37 @@ impl<B: Bus> Touchpad<B> {
         match self.device.poll(&mut self.bus, &mut buffer) {
             Ok(Some(report)) => {
                 self.failures = 0;
+                self.seen += 1;
+                if self.seen <= SAMPLES {
+                    // The first few raw reports go to the log: what a real device
+                    // sends is the one thing a simulation cannot tell us.
+                    use core::fmt::Write;
+                    let mut line = Line::new();
+                    let _ = write!(line, "I2C pad #{} len={}", self.seen, report.len());
+                    for byte in report.iter().take(13) {
+                        let _ = write!(line, " {byte:02x}");
+                    }
+                    self.note = Some(line);
+                }
                 self.decoder.decode(report, now)
             }
             Ok(None) => {
                 self.failures = 0;
                 self.decoder.idle()
             }
-            Err(Error::Protocol) | Err(Error::TooLarge) => {
-                self.failures += 1;
-                self.decoder.idle()
-            }
+            // No acknowledge: many devices answer a read with nothing to send this
+            // way, so it is not counted as a failure.
+            Err(Error::Nack) => self.decoder.idle(),
             Err(_) => {
-                // No acknowledge: many devices answer a read with nothing to send
-                // this way. Keep going; give up only after a long silence.
                 self.failures += 1;
                 self.decoder.idle()
             }
         }
+    }
+
+    /// A log line about one of the first reports, once, if there is one.
+    pub fn take_note(&mut self) -> Option<Line> {
+        self.note.take()
     }
 
     pub fn dead(&self) -> bool {
@@ -172,6 +191,8 @@ pub fn probe_bus<B: Bus>(
             device,
             decoder: Decoder::new(layout),
             failures: 0,
+            seen: 0,
+            note: None,
         });
     }
     None
@@ -184,7 +205,9 @@ pub fn probe<R: Regs>(
     log: &mut dyn FnMut(&str),
 ) -> Option<Touchpad<DesignWare<R>>> {
     // The component-type register is the signature; what a rejected window returns
-    // tells whether it is unpowered/unrouted (all ones) or some other device.
+    // tells whether it is unpowered/unrouted (all ones) or some other device. The
+    // Intel reset register must be released first, or it reads as zero.
+    regs.write(0x204, 3);
     let signature = regs.read(0xfc);
     if signature != 0x4457_0140 {
         say(
@@ -339,7 +362,7 @@ mod tests {
         struct Silent(u64);
         impl Bus for Silent {
             fn transfer(&mut self, _: u8, _: &[u8], _: &mut [u8]) -> super::super::Result<()> {
-                Err(Error::Nack)
+                Err(Error::Timeout)
             }
             fn ticks(&self) -> u64 {
                 self.0
@@ -353,6 +376,8 @@ mod tests {
             device: touchpad.device,
             decoder: touchpad.decoder,
             failures: 0,
+            seen: 0,
+            note: None,
         };
         for _ in 0..MAX_FAILURES {
             assert!(!dead.dead());
@@ -391,5 +416,41 @@ mod range_tests {
         for address in [0x10, 0x15, 0x2c, 0x38, 0x4a, 0x58, 0x5d, 0x77] {
             assert!(!off_limits(address), "{address:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::super::report::tests::{report, touchpad_descriptor};
+    use super::super::simulation::{Device, HidTouchpad, Simulation};
+    use super::*;
+    use std::boxed::Box;
+    use std::vec::Vec;
+
+    #[test]
+    fn the_first_reports_are_noted_for_the_log_and_nacks_never_kill_the_device() {
+        let mut pad = HidTouchpad::new(0x15, touchpad_descriptor());
+        pad.reports.push_back(Vec::new()); // eaten by the address scan
+        for _ in 0..8 {
+            pad.reports
+                .push_back(report(Some((1, 600, 400)), false).to_vec());
+        }
+        let devices: Vec<Box<dyn Device>> = std::vec![Box::new(pad)];
+        let mut touchpad = probe(0, Simulation::new(devices), &mut |_| ()).unwrap();
+        let mut notes = Vec::new();
+        for _ in 0..10 {
+            touchpad.poll();
+            if let Some(note) = touchpad.take_note() {
+                notes.push(std::string::String::from(note.as_str()));
+            }
+        }
+        assert_eq!(notes.len(), SAMPLES as usize);
+        assert!(
+            notes[0].starts_with("I2C pad #1 len=14 01 01 01"),
+            "{}",
+            notes[0]
+        );
+        assert!(notes[0].len() <= 60);
+        assert!(!touchpad.dead());
     }
 }
