@@ -7,14 +7,24 @@
 #![no_std]
 #![no_main]
 
-use zos_console::{ALT, CLEAR, COLORS, CONSOLE, LINE, POINTER, SCROLLS, WRITE};
+use zos_console::{
+    gui::{self, Event},
+    keyboard::Key,
+    ALT, CLEAR, COLORS, CONSOLE, FOCUS, FOCUS_APP, INPUT, KEY, LINE, POINTER, SCROLLS, TTY, WRITE,
+};
 use zos_libos as os;
 use zos_wm::{
+    apps::{Apps, Waited},
     draw::{Cursor, Surface, GLYPH_H, GLYPH_W},
     geometry::Rect,
     grid::{Grid, COLS, ROWS},
-    windows::{Effects, Kind, Manager, State, BORDER, MAX_WINDOWS, TITLE_HEIGHT},
+    windows::{
+        Effects, Hit, Kind, Launch, Manager, Part, State, BORDER, MAX_WINDOWS, MENU, TITLE_HEIGHT,
+    },
 };
+
+/// The process manager's channel; the window manager asks it to start applications.
+const PROCMGR: usize = 7;
 
 const DESKTOP: u32 = 0x1c3f6e;
 const FRAME: u32 = 0xc8c8c8;
@@ -26,9 +36,12 @@ const TEXT: u32 = 0x000000;
 const DIMMED: u32 = 0x909090;
 const HELP_BACKGROUND: u32 = 0xf4f4e8;
 
-const HELP: [&[u8]; 11] = [
+const HELP: [&[u8]; 15] = [
     b"ZOS window manager",
     b"",
+    b"Alt+L          launcher menu (Alt+Up/Down, Alt+L)",
+    b"Alt+B          browser",
+    b"Alt+C          calculator",
     b"Alt+Tab        next window",
     b"Alt+`          previous window",
     b"Alt+Arrows     move the window",
@@ -37,12 +50,18 @@ const HELP: [&[u8]; 11] = [
     b"Alt+W          close (not the terminal)",
     b"Alt+H          show / hide this help",
     b"",
-    b"Mouse: drag a title bar; use its buttons.",
+    b"Mouse: the ZOS button opens the launcher;",
+    b"drag a title bar; use its buttons.",
 ];
+
+/// Desktop application windows. Large (a drawing list per window), so it lives in
+/// static storage rather than on the 64 KiB stack.
+static mut APPS: Apps = Apps::new();
 
 struct Desktop<'a> {
     surface: Surface<'a>,
     manager: Manager,
+    apps: &'a mut Apps,
     grid: Grid,
     cursor: Cursor,
     /// The drag outline currently drawn on screen (XOR), if any.
@@ -77,6 +96,67 @@ impl Desktop<'_> {
             self.paint_window(slot, clip);
         }
         self.paint_taskbar(clip);
+        self.paint_menu(clip);
+    }
+
+    /// An application window: its background, then its drawing list in order.
+    fn paint_app(&mut self, content: Rect, clip: Rect, index: usize) {
+        if clip.is_empty() {
+            return;
+        }
+        let Some(app) = self.apps.app(index) else {
+            return;
+        };
+        self.surface.fill(content, clip, app.background);
+        for op in app.ops() {
+            if op.is_text {
+                self.surface.text(
+                    content.x + i32::from(op.x),
+                    content.y + i32::from(op.y),
+                    op.text(),
+                    op.color,
+                    None,
+                    clip,
+                );
+            } else {
+                let rect = Rect::new(
+                    content.x + i32::from(op.x),
+                    content.y + i32::from(op.y),
+                    i32::from(op.width),
+                    i32::from(op.height),
+                );
+                self.surface.fill(rect, clip.intersect(rect), op.color);
+            }
+        }
+    }
+
+    /// The launcher popup, drawn over everything else while it is open.
+    fn paint_menu(&mut self, clip: Rect) {
+        if !self.manager.menu_open() {
+            return;
+        }
+        let menu = self.manager.menu_rect();
+        let area = clip.intersect(menu);
+        if area.is_empty() {
+            return;
+        }
+        self.surface.fill(menu, area, FRAME);
+        self.surface.bevel(menu, true, area, LIGHT, DARK);
+        let selected = self.manager.menu_selected();
+        for (item, (label, _)) in MENU.iter().enumerate() {
+            let row = self.manager.menu_item_rect(item);
+            if selected == Some(item) {
+                self.surface.fill(row, area, TITLE_ACTIVE);
+            }
+            self.surface.text(
+                row.x + 8,
+                row.y + (row.h - GLYPH_H) / 2,
+                label,
+                if selected == Some(item) { LIGHT } else { TEXT },
+                None,
+                area.intersect(row),
+            );
+        }
     }
 
     fn paint_window(&mut self, slot: usize, clip: Rect) {
@@ -139,6 +219,7 @@ impl Desktop<'_> {
         let content = self.manager.content_rect(slot);
         match window.kind {
             Kind::Terminal => self.paint_terminal(content, clip.intersect(content), active),
+            Kind::App(index) => self.paint_app(content, clip.intersect(content), index as usize),
             Kind::Help => {
                 self.surface.fill(content, clip, HELP_BACKGROUND);
                 for (line, text) in HELP.iter().enumerate() {
@@ -349,9 +430,12 @@ pub extern "C" fn _start(_: usize) -> ! {
         .expect("Unusable framebuffer");
     let manager =
         Manager::new(fb.width as i32, fb.height as i32).expect("Screen too small for a desktop");
+    // SAFETY: this server is single-threaded and this is the only reference to APPS.
+    let apps = unsafe { &mut *core::ptr::addr_of_mut!(APPS) };
     let mut desktop = Desktop {
         surface,
         manager,
+        apps,
         grid: Grid::new(),
         cursor: Cursor::new(),
         outline: None,
@@ -376,10 +460,27 @@ pub extern "C" fn _start(_: usize) -> ! {
         desktop.apply(&fx);
     }
     let mut bytes = [0; 128];
+    let mut last_buttons = 0u8;
     loop {
         let (token, length) = os::receive(CONSOLE, &mut bytes).unwrap();
         assert!(token != 0 && length > 0);
+        let sender = token & 0xffff;
         let message = &bytes[..length];
+        // Desktop applications speak the `gui` protocol; they are neither the input
+        // service nor the shell, and are told apart by the sender the kernel reports.
+        if message[0] >= gui::CREATE {
+            if sender == INPUT || sender == TTY {
+                panic!("Invalid console protocol");
+            }
+            match desktop.app_request(token, sender, message) {
+                Reply::Parked => (),
+                Reply::Bytes(bytes, length) => {
+                    let _ = os::reply_live(token, &bytes[..length]);
+                }
+            }
+            desktop.reconcile();
+            continue;
+        }
         let pointer = matches!(message, [POINTER, ..]);
         let query = matches!(message, [SCROLLS]);
         // Anything but pointer motion or a query is real output (the shell banner,
@@ -416,8 +517,12 @@ pub extern "C" fn _start(_: usize) -> ! {
                     if !fx.is_empty() {
                         describe(&desktop.manager);
                     }
+                    if buttons & 1 != 0 && last_buttons & 1 == 0 {
+                        desktop.click_event(*buttons);
+                    }
+                    last_buttons = *buttons;
                 } else {
-                    os::reply_live(token, &[]).unwrap();
+                    os::reply_live(token, &[0]).unwrap();
                     continue;
                 }
             }
@@ -426,6 +531,13 @@ pub extern "C" fn _start(_: usize) -> ! {
                     let fx = desktop.manager.alt(*key);
                     desktop.apply(&fx);
                     describe(&desktop.manager);
+                }
+            }
+            // Nothing to do: the reply to every input-service message carries the focus.
+            [FOCUS] => (),
+            [KEY, a, b] => {
+                if let Some(key) = Key::decode(&[*a, *b]) {
+                    desktop.key_event(key);
                 }
             }
             [SCROLLS] => {
@@ -440,10 +552,249 @@ pub extern "C" fn _start(_: usize) -> ! {
         if (desktop.manager.focused(), desktop.manager.window_count()) != before && pointer {
             describe(&desktop.manager);
         }
-        os::reply_live(token, &[]).unwrap();
+        // Windows the user closed leave their applications a Close event.
+        desktop.reconcile();
+        // The user asked for an application (menu or shortcut): start it. This call
+        // can take a moment (the program is read from storage); input waits in the
+        // input service's queue meanwhile.
+        if let Some(Launch::App(index)) = desktop.manager.take_launch() {
+            launch(usize::from(index));
+        }
+        if sender == INPUT {
+            // The input service learns whether keys should go to an application.
+            os::reply_live(token, &[desktop.focus_byte()]).unwrap();
+        } else {
+            os::reply_live(token, &[]).unwrap();
+        }
     }
 }
 
+/// What the display server answers an application request with.
+enum Reply {
+    /// The caller waits (a `WAIT` with no event yet); its token is kept.
+    Parked,
+    Bytes([u8; 8], usize),
+}
+
+fn status(code: u8) -> Reply {
+    Reply::Bytes([code, 0, 0, 0, 0, 0, 0, 0], 1)
+}
+
+/// Asks the process manager to start desktop program `index` (`gui::APPS`).
+fn launch(index: usize) {
+    let Some(name) = gui::APPS.get(index) else {
+        return;
+    };
+    let mut message = [0u8; 32];
+    message[0] = 11;
+    message[1..1 + name.len()].copy_from_slice(name);
+    let mut reply = [0u8; 9];
+    let ok = matches!(
+        os::send(PROCMGR, &message[..1 + name.len()], &mut reply),
+        Ok(length) if length >= 1 && reply[0] == 0
+    );
+    zos_console::log(format_args!(
+        "WM LAUNCH: {} {}",
+        core::str::from_utf8(name).unwrap_or("?"),
+        if ok { "started" } else { "failed" }
+    ));
+}
+
+impl Desktop<'_> {
+    /// 1 when the focused window is an application's (keys go to it), else 0.
+    fn focus_byte(&self) -> u8 {
+        let focused = self
+            .manager
+            .focused()
+            .and_then(|slot| self.manager.window(slot));
+        match focused.map(|window| window.kind) {
+            Some(Kind::App(_)) => FOCUS_APP,
+            _ => 0,
+        }
+    }
+
+    fn answer(token: usize, event: Event) {
+        let mut bytes = [0u8; 8];
+        bytes[0] = gui::OK;
+        bytes[1..7].copy_from_slice(&event.encode());
+        // The application may have died meanwhile; a refused reply is not an error.
+        let _ = os::reply_live(token, &bytes[..7]);
+    }
+
+    fn app_index_of_focus(&self) -> Option<usize> {
+        let slot = self.manager.focused()?;
+        match self.manager.window(slot)?.kind {
+            Kind::App(index) => Some(usize::from(index)),
+            _ => None,
+        }
+    }
+
+    fn key_event(&mut self, key: Key) {
+        let Some(index) = self.app_index_of_focus() else {
+            return;
+        };
+        if let Some((token, event)) = self
+            .apps
+            .app_mut(index)
+            .and_then(|app| app.push_event(Event::Key(key)))
+        {
+            Self::answer(token, event);
+        }
+    }
+
+    /// A left click: if it landed in an application's content, tell the application
+    /// where, relative to the top-left of its content.
+    fn click_event(&mut self, buttons: u8) {
+        let (x, y) = self.manager.pointer();
+        let Hit::Window(slot, Part::Content) = self.manager.hit(x, y) else {
+            return;
+        };
+        let Some(Kind::App(index)) = self.manager.window(slot).map(|window| window.kind) else {
+            return;
+        };
+        let content = self.manager.content_rect(slot);
+        let event = Event::Click {
+            x: (x - content.x) as i16,
+            y: (y - content.y) as i16,
+            buttons,
+        };
+        if let Some((token, event)) = self
+            .apps
+            .app_mut(usize::from(index))
+            .and_then(|app| app.push_event(event))
+        {
+            Self::answer(token, event);
+        }
+    }
+
+    /// Applications whose window the user closed (title-bar button, Alt+W) are told
+    /// with a Close event and forgotten; their handle stops working.
+    fn reconcile(&mut self) {
+        for index in 0..zos_wm::apps::MAX_APPS {
+            let Some(app) = self.apps.app(index) else {
+                continue;
+            };
+            if self.manager.resolve(app.handle) == Some(app.slot) {
+                continue;
+            }
+            zos_console::log(format_args!("WM APP closed: {index}"));
+            if let Some(token) = self.apps.close(index) {
+                Self::answer(token, Event::Close);
+            }
+        }
+    }
+
+    fn app_request(&mut self, token: usize, sender: usize, message: &[u8]) -> Reply {
+        match message {
+            [gui::CREATE, w0, w1, h0, h1, title @ ..] => {
+                let (width, height) = (
+                    u16::from_le_bytes([*w0, *w1]),
+                    u16::from_le_bytes([*h0, *h1]),
+                );
+                if !Apps::size_ok(width, height) {
+                    return status(gui::INVALID);
+                }
+                let index = match self.apps.reserve(sender) {
+                    Ok(index) => index,
+                    Err(code) => return status(code),
+                };
+                let mut name = [b'?'; gui::TITLE];
+                let length = title.len().min(gui::TITLE);
+                for (to, &from) in name.iter_mut().zip(&title[..length]) {
+                    *to = if (32..=126).contains(&from) {
+                        from
+                    } else {
+                        b'?'
+                    };
+                }
+                let outer = Rect::new(
+                    120 + 28 * index as i32,
+                    40 + 28 * index as i32,
+                    i32::from(width) + 2 * BORDER,
+                    i32::from(height) + TITLE_HEIGHT + 2 * BORDER,
+                );
+                let Some((handle, fx)) =
+                    self.manager
+                        .create(Kind::App(index as u8), &name[..length], outer, true)
+                else {
+                    return status(gui::NO_WINDOW);
+                };
+                let Some(slot) = self.manager.resolve(handle) else {
+                    return status(gui::NO_WINDOW);
+                };
+                let id = self.apps.open(index, sender, handle, slot, width, height);
+                zos_console::log(format_args!("WM APP open: index={index} owner={sender}"));
+                self.apply(&fx);
+                Reply::Bytes([gui::OK, id, 0, 0, 0, 0, 0, 0], 2)
+            }
+            [gui::CLEAR, id, r, g, b] => match self.apps.find(sender, *id) {
+                Ok(index) => {
+                    let color = u32::from_be_bytes([0, *r, *g, *b]);
+                    self.apps.app_mut(index).unwrap().clear(color);
+                    status(gui::OK)
+                }
+                Err(code) => status(code),
+            },
+            [gui::RECT, id, x0, x1, y0, y1, w0, w1, h0, h1, r, g, b] => {
+                match self.apps.find(sender, *id) {
+                    Ok(index) => status(self.apps.app_mut(index).unwrap().rect(
+                        i16::from_le_bytes([*x0, *x1]),
+                        i16::from_le_bytes([*y0, *y1]),
+                        u16::from_le_bytes([*w0, *w1]),
+                        u16::from_le_bytes([*h0, *h1]),
+                        u32::from_be_bytes([0, *r, *g, *b]),
+                    )),
+                    Err(code) => status(code),
+                }
+            }
+            [gui::TEXT, id, x0, x1, y0, y1, r, g, b, text @ ..] => {
+                match self.apps.find(sender, *id) {
+                    Ok(index) => status(self.apps.app_mut(index).unwrap().text(
+                        i16::from_le_bytes([*x0, *x1]),
+                        i16::from_le_bytes([*y0, *y1]),
+                        u32::from_be_bytes([0, *r, *g, *b]),
+                        text,
+                    )),
+                    Err(code) => status(code),
+                }
+            }
+            [gui::PRESENT, id] => match self.apps.find(sender, *id) {
+                Ok(index) => {
+                    let slot = self.apps.app(index).unwrap().slot;
+                    let mut fx = Effects::default();
+                    fx.add(self.manager.content_rect(slot));
+                    self.apply(&fx);
+                    status(gui::OK)
+                }
+                Err(code) => status(code),
+            },
+            [gui::WAIT, id] => match self.apps.find(sender, *id) {
+                Ok(index) => match self.apps.app_mut(index).unwrap().wait(token) {
+                    Ok(Waited::Event(event)) => {
+                        let mut bytes = [0u8; 8];
+                        bytes[0] = gui::OK;
+                        bytes[1..7].copy_from_slice(&event.encode());
+                        Reply::Bytes(bytes, 7)
+                    }
+                    Ok(Waited::Parked) => Reply::Parked,
+                    Err(code) => status(code),
+                },
+                Err(code) => status(code),
+            },
+            [gui::CLOSE, id] => match self.apps.find(sender, *id) {
+                Ok(index) => {
+                    let slot = self.apps.app(index).unwrap().slot;
+                    let fx = self.manager.close(slot);
+                    self.apps.close(index);
+                    self.apply(&fx);
+                    status(gui::OK)
+                }
+                Err(code) => status(code),
+            },
+            _ => status(gui::INVALID),
+        }
+    }
+}
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     zos_console::fail(info)

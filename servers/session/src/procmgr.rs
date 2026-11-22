@@ -23,6 +23,9 @@ struct Job {
     /// then its request for the startup packet is parked in `startup_waiter`.
     released: bool,
     startup_waiter: Option<usize>,
+    /// Started by the display server for the desktop: nobody waits for it, so its
+    /// slot is freed as soon as it has exited.
+    detached: bool,
 }
 
 fn read_image(path: &[u8], image: &mut [u8]) -> Result<usize> {
@@ -47,29 +50,99 @@ fn read_image(path: &[u8], image: &mut [u8]) -> Result<usize> {
     result.and_then(|length| closed.map(|_| length))
 }
 
+/// A short log-free text writer for the install stamp.
+struct Stamp {
+    bytes: [u8; 320],
+    length: usize,
+}
+impl core::fmt::Write for Stamp {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.length + text.len();
+        if end > self.bytes.len() {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.length..end].copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+/// Installs the bundled programs into /bin: the multi-call command binary under each
+/// of its names, and the desktop applications. A stamp file records what was
+/// installed (size and checksum of each bundled program), so a newer build replaces
+/// the old copies and an unchanged one writes nothing.
 fn install(image: &mut [u8]) -> Result<()> {
+    use core::fmt::Write;
     match api::stat(b"/bin") {
         Ok(entry) if entry.kind == 1 => (),
         Ok(_) => return Err(Error::NotDir),
         Err(Error::NotFound) => api::mkdir(b"/bin")?,
         Err(error) => return Err(error),
     }
-    let length = os::boot_program(image).map_err(kernel)?;
-    for name in PROGRAMS {
-        let executable = path(b"/bin", name)?;
-        match api::stat(executable.bytes()) {
-            Ok(_) => continue,
-            Err(Error::NotFound) => (),
-            Err(error) => return Err(error),
+    // Programs this boot image carries: 0 is the command binary, 1.. the applications
+    // (a boot entry from before the applications existed lacks their modules).
+    let mut stamp = Stamp {
+        bytes: [0; 320],
+        length: 0,
+    };
+    let mut present = [false; 1 + zos_console::gui::APPS.len()];
+    for (index, slot) in present.iter_mut().enumerate() {
+        if let Ok(length) = os::boot_program_at(index, image) {
+            *slot = true;
+            writeln!(
+                stamp,
+                "{index}:{length}:{:08x}",
+                zos_storage::crc32(&image[..length])
+            )
+            .map_err(|_| Error::TooLarge)?;
         }
-        let fd = api::open(executable.bytes(), WRITE | CREATE)?;
-        let result = write_all(fd, &image[..length]);
-        let closed = api::close(fd);
-        result.and(closed)?;
     }
+    let stamp_path = b"/bin/.stamp";
+    let mut current = [0u8; 320];
+    let current_length = match api::stat(stamp_path) {
+        Ok(entry) if entry.size as usize <= current.len() => {
+            let fd = api::open(stamp_path, READ)?;
+            let count = api::read(fd, &mut current);
+            api::close(fd)?;
+            count?
+        }
+        _ => usize::MAX,
+    };
+    let complete = PROGRAMS
+        .iter()
+        .chain(zos_console::gui::APPS.iter())
+        .zip(core::iter::repeat(()))
+        .all(|(name, _)| path(b"/bin", name).is_ok_and(|p| api::stat(p.bytes()).is_ok()));
+    if current_length == stamp.length
+        && current[..current_length] == stamp.bytes[..stamp.length]
+        && complete
+    {
+        return Ok(());
+    }
+    for (index, &here) in present.iter().enumerate() {
+        if !here {
+            continue;
+        }
+        let length = os::boot_program_at(index, image).map_err(kernel)?;
+        let names: &[&[u8]] = if index == 0 {
+            &PROGRAMS
+        } else {
+            core::slice::from_ref(&zos_console::gui::APPS[index - 1])
+        };
+        for name in names {
+            let executable = path(b"/bin", name)?;
+            let fd = api::open(executable.bytes(), WRITE | CREATE | TRUNCATE)?;
+            let result = write_all(fd, &image[..length]);
+            let closed = api::close(fd);
+            result.and(closed)?;
+        }
+    }
+    let fd = api::open(stamp_path, WRITE | CREATE | TRUNCATE)?;
+    let result = write_all(fd, &stamp.bytes[..stamp.length]);
+    let closed = api::close(fd);
+    result.and(closed)?;
     api::sync()
 }
-
 fn status_reply(token: usize, status: i64) {
     let mut bytes = [0; 9];
     bytes[1..].copy_from_slice(&status.to_le_bytes());
@@ -103,9 +176,45 @@ fn poll(jobs: &mut [Option<Job>; 24]) -> Result<()> {
         if let (Some(status), Some(token)) = (current.status, current.waiter) {
             status_reply(token, status);
             *job = None;
+        } else if current.status.is_some() && current.detached {
+            *job = None;
         }
     }
     Ok(())
+}
+
+/// Reads an executable and starts it; its startup packet is released at once when
+/// `detached` (no parent is preparing descriptors for it).
+fn start(
+    jobs: &mut [Option<Job>; 24],
+    image: &mut [u8],
+    executable: &[u8],
+    startup: Startup,
+    detached: bool,
+) -> Result<u64> {
+    let slot = jobs
+        .iter()
+        .position(Option::is_none)
+        .ok_or(Error::NoSpace)?;
+    let length = read_image(executable, image)?;
+    let name = executable
+        .rsplit(|&b| b == b'/')
+        .next()
+        .ok_or(Error::Invalid)?;
+    let pid = os::process_spawn(&image[..length], name).map_err(kernel)?;
+    jobs[slot] = Some(Job {
+        pid,
+        startup,
+        status: None,
+        waiter: None,
+        started_waiter: None,
+        startup_sent: false,
+        blocked_ready: false,
+        released: detached,
+        startup_waiter: None,
+        detached,
+    });
+    Ok(pid)
 }
 
 fn handle(
@@ -134,28 +243,23 @@ fn handle(
             };
             startup.bytes[..data.len()].copy_from_slice(data);
             startup.decode()?;
-            let slot = jobs
-                .iter()
-                .position(Option::is_none)
-                .ok_or(Error::NoSpace)?;
-            let length = read_image(executable.bytes(), image)?;
-            let name = executable
-                .bytes()
-                .rsplit(|&b| b == b'/')
-                .next()
-                .ok_or(Error::Invalid)?;
-            let pid = os::process_spawn(&image[..length], name).map_err(kernel)?;
-            jobs[slot] = Some(Job {
-                pid,
-                startup,
-                status: None,
-                waiter: None,
-                started_waiter: None,
-                startup_sent: false,
-                blocked_ready: false,
-                released: false,
-                startup_waiter: None,
-            });
+            let pid = start(jobs, image, executable.bytes(), startup, false)?;
+            response[..8].copy_from_slice(&pid.to_le_bytes());
+            Ok(Some(8))
+        }
+        // launch NAME: the display server (tid 1) starts a desktop application. Only
+        // the programs of `gui::APPS`, from /bin, with no arguments or environment.
+        11 => {
+            if owner != 1 {
+                return Err(Error::Denied);
+            }
+            let name = reader.rest();
+            if !zos_console::gui::APPS.contains(&name) {
+                return Err(Error::Denied);
+            }
+            let executable = path(b"/bin", name)?;
+            let startup = Startup::new(b"/", None, &[name], &[])?;
+            let pid = start(jobs, image, executable.bytes(), startup, true)?;
             response[..8].copy_from_slice(&pid.to_le_bytes());
             Ok(Some(8))
         }

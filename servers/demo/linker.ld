@@ -12,6 +12,8 @@ SECTIONS {
     .rodata : { *(.rodata .rodata.*) } :rodata
     . = ALIGN(0x1000);
     .data : { *(.data .data.*) } :data
+    /* Keep written-to tables ahead of .bss: placed after it, they make the zero-filled\n       region part of the file. */
+    .got : { *(.got .got.plt) } :data
     .bss : { *(.bss .bss.*) *(COMMON) } :data
     /DISCARD/ : { *(.eh_frame*) *(.note*) }
 }

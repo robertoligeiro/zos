@@ -5,6 +5,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod apps;
 pub mod draw;
 pub mod geometry;
 pub mod grid;

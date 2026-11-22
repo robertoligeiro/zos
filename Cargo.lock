@@ -81,6 +81,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zos-apps"
+version = "0.1.0"
+dependencies = [
+ "zos-console",
+ "zos-libos",
+ "zos-storage",
+]
+
+[[package]]
 name = "zos-console"
 version = "0.1.0"
 dependencies = [

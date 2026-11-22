@@ -55,7 +55,9 @@ IPC_MARKERS = (
 USER_PROGRAMS = ("echo-server", "echo-client", "fault-probe",
                  "console-server", "input-server", "tty-server",
                  "blkdev-server", "fs-simple-server", "vfs-server", "storage-probe",
-                 "procmgr-server", "shell-server", "zos-command")
+                 "procmgr-server", "shell-server", "zos-command", "app-browser", "app-calc")
+# Desktop programs: separate bundled programs installed into /bin by the process manager.
+APPS = ("app-browser", "app-calc")
 READY_MARKER = "ZOS ready: console checkpoint"
 CONSOLE_MARKERS = ("CONSOLE PASS: cursor, colors, backspace, scrolling",
                    "PS2 ready: set-1 keyboard IRQ1, 3-byte mouse IRQ12",
@@ -117,10 +119,11 @@ def build(case: str | None = None, *, usb: bool = False, diagnostic: bool = Fals
     if diagnostic and case:
         raise ValueError("Diagnostics cannot be combined with another boot test")
     cargo("build", "--locked", "--release", "--package", "zos-demo",
-          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", "--package", "zos-wm", user=True)
+          "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session", "--package", "zos-wm", "--package", "zos-apps", user=True)
     BUILD.mkdir(exist_ok=True)
-    program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / "zos-command"
-    (BUILD / "zos-command.elf").write_bytes(compact_elf(program.read_bytes()))
+    for name in ("zos-command", *APPS):
+        program = ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / name
+        (BUILD / f"{name}.elf").write_bytes(compact_elf(program.read_bytes()))
     args = ["build", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
     features = ([CASES[case][0]] if case else []) + (
         ["usb-diagnostic"] if diagnostic else ["usb"] if usb else [])
@@ -134,6 +137,10 @@ def build(case: str | None = None, *, usb: bool = False, diagnostic: bool = Fals
 
 
 def compact_elf(data: bytes) -> bytes:
+    """Keeps only the bytes the loader maps. A segment that contains a zero-filled
+    section (.bss) is given the file size of its stored sections alone: the linker
+    reports the whole segment as file-backed, which would store the zeroed buffers (and
+    whatever follows them in the file) in the program."""
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
         raise ValueError("Invalid bundled program ELF")
     offset = struct.unpack_from("<Q", data, 32)[0]
@@ -141,19 +148,40 @@ def compact_elf(data: bytes) -> bytes:
     end = offset + count * 56
     if count == 0 or end > len(data):
         raise ValueError("Invalid program header table")
+    section_offset = struct.unpack_from("<Q", data, 40)[0]
+    section_size, section_count = struct.unpack_from("<HH", data, 58)
+    sections = []
+    if section_offset and section_size == 64 and section_offset + section_count * 64 <= len(data):
+        for i in range(section_count):
+            at = section_offset + i * 64
+            kind, flags = struct.unpack_from("<IQ", data, at + 4)
+            address, _, size = struct.unpack_from("<QQQ", data, at + 16)
+            if flags & 2:  # SHF_ALLOC
+                sections.append((kind, address, size))
+    result = bytearray(data)
     for i in range(count):
         location = offset + i * 56
-        if struct.unpack_from("<I", data, location)[0] == 1:
-            file_offset = struct.unpack_from("<Q", data, location + 8)[0]
-            size = struct.unpack_from("<Q", data, location + 32)[0]
-            end = max(end, file_offset + size)
-    if end > len(data) or end > 65536:
+        if struct.unpack_from("<I", data, location)[0] != 1:
+            continue
+        file_offset = struct.unpack_from("<Q", data, location + 8)[0]
+        address = struct.unpack_from("<Q", data, location + 16)[0]
+        size = struct.unpack_from("<Q", data, location + 32)[0]
+        memory = struct.unpack_from("<Q", data, location + 40)[0]
+        inside = [s for s in sections if address <= s[1] < address + max(memory, size)]
+        if any(kind == 8 for kind, _, _ in inside):  # a NOBITS section lives here
+            size = max(
+                (a + n - address for kind, a, n in inside if kind != 8 and n), default=0
+            )
+            struct.pack_into("<Q", result, location + 32, size)
+        if file_offset + size > len(data):
+            raise ValueError("Invalid program header table")
+        end = max(end, file_offset + size)
+    if end > 65536:
         raise ValueError("Bundled executable exceeds the filesystem's 64 KiB file limit")
-    result = bytearray(data[:end])
+    result = result[:end]
     result[40:48] = bytes(8)
     result[58:64] = bytes(6)
     return bytes(result)
-
 
 def image(kernel: Path, case: str | None = None) -> Path:
     if case == "usb" and not kernel.name.startswith("zos-usb-"):
@@ -175,7 +203,7 @@ def image(kernel: Path, case: str | None = None) -> Path:
         tuple(p for p in USER_PROGRAMS if p != "console-server") + ("wm-server",) if case in ("gui", "usb-gui")
         else USER_PROGRAMS)
     for program in programs:
-        source = BUILD / "zos-command.elf" if program == "zos-command" else (
+        source = BUILD / f"{program}.elf" if program == "zos-command" or program in APPS else (
             ROOT / "target" / "user" / "x86_64-unknown-none" / "release" / program
         )
         payloads[f"boot/{program}.elf"] = source.read_bytes()
@@ -1386,6 +1414,102 @@ def gui_case(disk: Path, firmware: str, timeout: int, *, usb: bool = False) -> N
                 raise RuntimeError(f"A maximized window does not fill the work area: {box}")
             alt("x", wait_for="WM WIN 0 Normal")
 
+            # 8a. The launcher menu and desktop applications (the browser and the calculator),
+            # started from the menu, driven by real keys and mouse, and closed again.
+            def press(key: str, *, shift: bool = False) -> None:
+                codes = ([{"type": "qcode", "data": "shift"}] if shift else []) + [{"type": "qcode", "data": key}]
+                qmp.execute("send-key", {"keys": codes, "hold-time": 5})
+                time.sleep(0.25)
+
+            def alt_quiet(key: str) -> None:
+                qmp.execute("send-key", {"keys": [{"type": "qcode", "data": "alt"},
+                                                  {"type": "qcode", "data": key}], "hold-time": 5})
+                time.sleep(0.4)
+
+            def type_text(text: str) -> None:
+                special = {":": ("semicolon", True), "/": ("slash", False), ".": ("dot", False),
+                           "+": ("equal", True), "*": ("8", True), "=": ("equal", False)}
+                for char in text:
+                    key, shifted = special.get(char, (char, False))
+                    press(key, shift=shifted)
+
+            def text_now() -> str:
+                return log.read_text(encoding="utf-8", errors="replace")
+
+            def at(pixels: bytes, width: int, x: int, y: int) -> tuple[int, int, int]:
+                return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+
+            def is_color(got: tuple[int, int, int], rgb: int) -> bool:
+                return all(abs(a - b) <= 2 for a, b in zip(got, ((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255)))
+
+            shell_keys = text_now().count("SHELL KEY:")
+            alt_quiet("l")
+            width, height, pixels = shot("menu")
+            if count_color_in(width, pixels, (4, 664, 171, 737), WM_FRAME) < 3000:
+                raise RuntimeError("Alt+L did not draw the launcher menu above the taskbar")
+            if count_color_in(width, pixels, (8, 668, 166, 689), WM_TITLE_ACTIVE) < 500:
+                raise RuntimeError("The first launcher entry is not highlighted")
+            alt_quiet("down")
+            width, height, pixels = shot("menu-down")
+            if count_color_in(width, pixels, (8, 690, 166, 711), WM_TITLE_ACTIVE) < 500:
+                raise RuntimeError("Alt+Down did not move the launcher highlight to Browser")
+            mark = len(text_now())
+            alt("l", wait_for="BROWSER ready")
+            wait_serial(process, log, "BROWSER loaded about:home", timeout, start=mark)
+            if "WM LAUNCH: browser started" not in text_now() or "WM APP open:" not in text_now():
+                raise RuntimeError("The launcher did not start the browser through the process manager")
+            time.sleep(1.0)
+            width, height, pixels = shot("browser")
+            # The window content area is 720x520 with its top-left at screen (123, 63).
+            if not is_color(at(pixels, width, 523, 463), 0xfdfdf8):
+                raise RuntimeError(f"The browser page background is {at(pixels, width, 523, 463)}")
+            if not is_color(at(pixels, width, 128, 68), 0xd8d8d8):
+                raise RuntimeError("The browser address bar is not drawn")
+            if count_color(pixels, 0x7a1a1a) < 100 or count_color(pixels, 0x0b3fb5) < 200:
+                raise RuntimeError("The browser page has no heading or link text")
+            # Keyboard: Tab selects the first link (about:help), Enter follows it, Backspace returns.
+            press("tab")
+            press("ret")
+            wait_serial(process, log, "BROWSER loaded about:help", timeout, start=mark)
+            mark = len(text_now())
+            press("backspace")
+            wait_serial(process, log, "BROWSER loaded about:home", timeout, start=mark)
+            # Mouse: clicking the address bar (its border turns blue), then typing an address.
+            pointer_to(300, 77)
+            button(True)
+            button(False)
+            time.sleep(0.5)
+            width, height, pixels = shot("browser-address")
+            if not is_color(at(pixels, width, 323, 66), 0x0b3fb5):
+                raise RuntimeError("Clicking the address bar did not start editing it")
+            mark = len(text_now())
+            type_text("about:zos")
+            press("ret")
+            wait_serial(process, log, "BROWSER loaded about:zos", timeout, start=mark)
+            if text_now().count("SHELL KEY:") != shell_keys:
+                raise RuntimeError("Keys typed into the browser also reached the shell")
+            # Closing the window tells the application and frees its handle.
+            alt("w", wait_for="WM APP closed")
+            time.sleep(0.5)
+            width, height, pixels = shot("browser-closed")
+            if is_color(at(pixels, width, 523, 463), 0xfdfdf8):
+                raise RuntimeError("The browser window is still drawn after Alt+W")
+            # Alt+C starts the calculator; keyboard arithmetic and mouse buttons both work.
+            mark = len(text_now())
+            alt("c", wait_for="CALC ready")
+            time.sleep(0.5)
+            type_text("12+30")
+            press("ret")
+            wait_serial(process, log, "CALC 12+30 = 42", timeout, start=mark)
+            for x, y in ((266, 169), (320, 217), (266, 169), (320, 361)):  # 9 * 9 =
+                pointer_to(x, y)
+                button(True)
+                button(False)
+            wait_serial(process, log, "CALC 429*9 = 3861", timeout, start=mark)
+            alt("w", wait_for="WM APP closed")
+            if "SERVICE FAILURE" in text_now() or "APP failure" in text_now():
+                raise RuntimeError("A desktop application failed")
+
             # 8. The terminal still takes keystrokes after all that.
             keys.line("cat o", [0])
             keys.type("~finish")
@@ -1517,10 +1641,10 @@ def check() -> None:
     cargo("fmt", "--all", "--", "--check")
     cargo("test", "--locked", "--package", "zos-console", "--lib",
           "--package", "zos-storage", "--package", "zos-session", "--package", "zos-wm",
-          "--target", "x86_64-pc-windows-gnu")
+          "--package", "zos-apps", "--target", "x86_64-pc-windows-gnu")
     cargo("clippy", "--locked", "--release", "--package", "zos-demo",
           "--package", "zos-console", "--package", "zos-storage", "--package", "zos-session",
-          "--package", "zos-wm", "--", "-D", "warnings", user=True)
+          "--package", "zos-wm", "--package", "zos-apps", "--", "-D", "warnings", user=True)
     for case in [None, *CASES]:
         args = ["clippy", "--locked", "--release", "--package", "zos-kernel", "--no-default-features"]
         if case:

@@ -746,12 +746,14 @@ laptop touchpads are not supported yet:
 | Alt+M, Alt+X | minimize, maximize / restore |
 | Alt+W | close (the shell terminal cannot be closed) |
 | Alt+H | show / hide the help window |
+| Alt+L | open the launcher menu (Alt+Up/Down choose, Alt+L starts, Alt+W cancels) |
+| Alt+B, Alt+C | start the browser, the calculator |
 
 The logic (geometry, clipped drawing, the text grid, windows, focus, hit testing, the
 pointer state machine) is a host-tested library (`zos_wm`); QEMU acceptance runs the
 desktop with PS/2 and with USB keyboard, mouse and storage, in BIOS and UEFI, checking
-real framebuffer pixels. Not yet: more than one terminal session, application
-windows, resizing. The USB stick's boot menu offers **Desktop (GUI)** (default after 5
+real framebuffer pixels. Not yet: more than one terminal session, resizing. The
+USB stick's boot menu offers **Desktop (GUI)** (default after 5
 seconds), **Command line**, **Diagnostic (show boot log)** and **Safe mode (no
 touchpad probe)**; the QEMU test images boot straight to one entry. Diagnostic is the
 command line with no logo, the kernel's boot log kept on screen and the console
@@ -762,6 +764,38 @@ build is needed.
 
 To try the desktop in QEMU: `python tools\zos.py run --gui --firmware bios` (add
 `--usb` for a USB keyboard and mouse).
+
+### Desktop applications and the launcher
+
+The **ZOS** button in the taskbar (or Alt+L) opens a launcher menu: Help, Browser and
+Calculator. Applications are ordinary programs, installed as `/bin/browser` and
+`/bin/calc`, started by the process manager when the display server asks for one
+from a fixed list; they get a window by speaking a small bounded protocol to the
+window manager (`servers/console/src/gui.rs`):
+
+* requests are at most 64 bytes, and the manager identifies the sender from the
+  kernel's reply token, never from the message; window handles carry a generation, so
+  a closed window's handle never works again; one window per program, four
+  application windows at once;
+* the manager keeps a bounded drawing list per window (rectangles and 8x16 text, 256
+  operations) and repaints it whenever the window is exposed, so applications need no
+  frame buffer; `WAIT` is a parked reply that returns the next key or click;
+* keys go to the focused application instead of the shell: the input service asks
+  the manager who has the focus before routing each key, and the manager tells the
+  application when the user closes its window.
+
+The **browser** (`servers/apps`) shows HTML from the ZOS filesystem: headings,
+paragraphs, lists, links, preformatted text, bold/italic/code, rules, the page title,
+entities and comments (anything else is ignored); other files appear as plain text and
+directories as listings. Type an address and press Enter; Tab switches between the
+address bar and the page, where Tab selects the next link, Enter follows it, arrows or
+j/k scroll, Space/b page, Backspace goes back, and links can be clicked.
+`about:home`, `about:help` and `about:zos` are built in. `http://` and `https://`
+addresses are recognized but need a network stack, which ZOS does not have yet.
+The **calculator** does integer arithmetic (`+ - * / %`, parentheses) with checked
+64-bit math and explicit errors; click the buttons or type. Page layout and
+arithmetic are host-tested; QEMU acceptance starts both from the launcher with real
+keyboard and mouse input and checks the rendered pixels.
 
 ### Built-in touchpads (I2C-HID)
 

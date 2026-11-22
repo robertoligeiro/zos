@@ -1,5 +1,6 @@
 [workspace]
-members = ["kernel", "libos", "servers/demo", "servers/console", "servers/storage", "servers/session", "servers/wm"]
+members = ["kernel", "libos", "servers/demo", "servers/console", "servers/storage", "servers/session", "servers/wm",
+    "servers/apps"]
 resolver = "2"
 
 [workspace.package]
@@ -14,3 +15,17 @@ panic = "abort"
 debug = true
 lto = true
 codegen-units = 1
+
+# User-space programs are installed many times over (every /bin command is its own copy of the multi-call binary), so they are built for size.
+[profile.release.package.zos-session]
+opt-level = "s"
+[profile.release.package.zos-storage]
+opt-level = "s"
+[profile.release.package.zos-console]
+opt-level = "s"
+[profile.release.package.zos-libos]
+opt-level = "s"
+[profile.release.package.zos-apps]
+opt-level = "s"
+[profile.release.package.zos-wm]
+opt-level = "s"

@@ -394,12 +394,24 @@ pub fn memory_stats() -> Result<[u64; 4], Error> {
         u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
     }))
 }
-pub fn boot_program(bytes: &mut [u8]) -> Result<usize, Error> {
+/// Copies bundled program `index` (0 is the multi-call command binary, 1 and up the
+/// desktop applications) into `bytes`; `Invalid` when there is no such program (an
+/// older boot menu entry without the application modules).
+pub fn boot_program_at(index: usize, bytes: &mut [u8]) -> Result<usize, Error> {
     call(
         Call::BootProgram,
-        [bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0],
+        [
+            bytes.as_mut_ptr() as u64,
+            bytes.len() as u64,
+            index as u64,
+            0,
+            0,
+        ],
     )
     .map(|r| r.0)
+}
+pub fn boot_program(bytes: &mut [u8]) -> Result<usize, Error> {
+    boot_program_at(0, bytes)
 }
 pub fn system_control(action: u64) -> Result<(), Error> {
     call(Call::SystemControl, [action, 0, 0, 0, 0]).map(|_| ())

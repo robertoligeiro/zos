@@ -4,6 +4,7 @@
 extern crate std;
 
 pub mod editor;
+pub mod gui;
 pub mod i2c;
 pub mod keyboard;
 pub mod mouse;
@@ -24,6 +25,17 @@ pub const SCROLLS: u8 = 5;
 /// `[ALT, key]`: an Alt+key shortcut (see `keyboard::Key::Alt`), sent by the input
 /// service to the console channel for the window manager. The text console ignores it.
 pub const ALT: u8 = 6;
+/// `[KEY, a, b]`: a typed key (`keyboard::Key::encode`) for the focused desktop
+/// application. The input service sends it only when the window manager says an
+/// application has the focus (see `FOCUS_APP`); otherwise keys go to the shell.
+pub const KEY: u8 = 7;
+/// What the window manager answers to `POINTER`, `ALT` and `KEY` messages: one byte,
+/// non-zero when a desktop application (not the terminal) has the keyboard focus.
+pub const FOCUS_APP: u8 = 1;
+/// `[FOCUS]`: "who has the keyboard focus?" The window manager answers with the same
+/// one byte; the input service asks before routing each ordinary key, because an
+/// application window can appear (and take the focus) at any time.
+pub const FOCUS: u8 = 8;
 
 pub fn output(text: &[u8]) {
     for part in text.chunks(63) {

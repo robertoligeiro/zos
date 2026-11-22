@@ -32,7 +32,27 @@ pub enum Kind {
     Terminal,
     /// The key-binding help window.
     Help,
+    /// A desktop application's window (`index` into the application table).
+    App(u8),
 }
+
+/// What a launcher menu entry does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Launch {
+    /// Show or hide the help window (the window manager does it itself).
+    Help,
+    /// Start program `n` of `zos_console::gui::APPS`.
+    App(u8),
+}
+
+/// The launcher menu, top to bottom. Entries 1.. are `gui::APPS` in order.
+pub const MENU: [(&[u8], Launch); 3] = [
+    (b"Help", Launch::Help),
+    (b"Browser", Launch::App(0)),
+    (b"Calculator", Launch::App(1)),
+];
+pub const MENU_ITEM_HEIGHT: i32 = 22;
+pub const MENU_WIDTH: i32 = 168;
 
 /// Names a window; the generation makes a stale handle fail after its slot is reused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +92,8 @@ pub enum Hit {
     Desktop,
     Taskbar,
     Launcher,
+    /// An entry of the open launcher menu.
+    MenuItem(usize),
     Task(usize),
     Window(usize, Part),
 }
@@ -134,6 +156,10 @@ pub struct Manager {
     pointer_y: i32,
     buttons: u8,
     drag: Option<Drag>,
+    /// The highlighted entry while the launcher menu is open.
+    menu: Option<usize>,
+    /// An application the user asked for; the display server starts it.
+    launch: Option<Launch>,
 }
 
 impl Manager {
@@ -153,6 +179,8 @@ impl Manager {
             pointer_y: height / 2,
             buttons: 0,
             drag: None,
+            menu: None,
+            launch: None,
         })
     }
 
@@ -174,6 +202,64 @@ impl Manager {
     pub fn launcher_rect(&self) -> Rect {
         let bar = self.taskbar();
         Rect::new(4, bar.y + 3, 48, TASKBAR_HEIGHT - 6)
+    }
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+    pub fn menu_selected(&self) -> Option<usize> {
+        self.menu
+    }
+    /// The popup above the launcher button (meaningful while the menu is open).
+    pub fn menu_rect(&self) -> Rect {
+        let height = MENU.len() as i32 * MENU_ITEM_HEIGHT + 8;
+        Rect::new(4, self.taskbar().y - height - 2, MENU_WIDTH, height)
+    }
+    pub fn menu_item_rect(&self, item: usize) -> Rect {
+        let menu = self.menu_rect();
+        Rect::new(
+            menu.x + 4,
+            menu.y + 4 + item as i32 * MENU_ITEM_HEIGHT,
+            menu.w - 8,
+            MENU_ITEM_HEIGHT,
+        )
+    }
+    /// The application the user asked to start since the last call, if any.
+    pub fn take_launch(&mut self) -> Option<Launch> {
+        self.launch.take()
+    }
+    fn toggle_menu(&mut self) -> Effects {
+        let mut fx = Effects::default();
+        fx.add(self.menu_rect());
+        self.menu = match self.menu {
+            Some(_) => None,
+            None => Some(0),
+        };
+        fx
+    }
+    fn close_menu(&mut self) -> Effects {
+        let mut fx = Effects::default();
+        if self.menu.take().is_some() {
+            fx.add(self.menu_rect());
+        }
+        fx
+    }
+    fn menu_activate(&mut self, item: usize) -> Effects {
+        let mut fx = self.close_menu();
+        match MENU.get(item).map(|entry| entry.1) {
+            Some(Launch::Help) => fx.merge(self.toggle_help()),
+            Some(app @ Launch::App(_)) => self.launch = Some(app),
+            None => (),
+        }
+        fx
+    }
+    fn menu_move(&mut self, step: isize) -> Effects {
+        let mut fx = Effects::default();
+        if let Some(selected) = self.menu {
+            let next = (selected as isize + step).rem_euclid(MENU.len() as isize) as usize;
+            self.menu = Some(next);
+            fx.add(self.menu_rect());
+        }
+        fx
     }
     /// The taskbar button of each window, in slot order, as (slot, rectangle). Buttons
     /// that would not fit on screen are left out.
@@ -261,6 +347,11 @@ impl Manager {
 
     // ---- Hit testing -------------------------------------------------------
     pub fn hit(&self, x: i32, y: i32) -> Hit {
+        if self.menu.is_some() && self.menu_rect().contains(x, y) {
+            let item =
+                ((y - self.menu_rect().y - 4) / MENU_ITEM_HEIGHT).clamp(0, MENU.len() as i32 - 1);
+            return Hit::MenuItem(item as usize);
+        }
         if self.taskbar().contains(x, y) {
             if self.launcher_rect().contains(x, y) {
                 return Hit::Launcher;
@@ -486,7 +577,27 @@ impl Manager {
     /// Applies an Alt+key shortcut from the keyboard.
     pub fn alt(&mut self, key: u8) -> Effects {
         let focused = self.focus;
+        if self.menu.is_some() {
+            // With the launcher open its keys come first.
+            match key {
+                ALT_UP => return self.menu_move(-1),
+                ALT_DOWN => return self.menu_move(1),
+                b'l' => return self.menu_activate(self.menu.unwrap_or(0)),
+                b'w' => return self.close_menu(),
+                _ => (),
+            }
+        }
         match key {
+            b'l' => self.toggle_menu(),
+            // Direct shortcuts for the applications.
+            b'b' => {
+                self.launch = Some(Launch::App(0));
+                Effects::default()
+            }
+            b'c' => {
+                self.launch = Some(Launch::App(1));
+                Effects::default()
+            }
             b'\t' => self.cycle(true),
             b'`' => self.cycle(false),
             b'h' => self.toggle_help(),
@@ -556,8 +667,21 @@ impl Manager {
     }
 
     fn click(&mut self, x: i32, y: i32) -> Effects {
-        match self.hit(x, y) {
-            Hit::Launcher => self.toggle_help(),
+        let hit = self.hit(x, y);
+        let mut closed = Effects::default();
+        if self.menu.is_some() && !matches!(hit, Hit::MenuItem(_) | Hit::Launcher) {
+            // A click anywhere else dismisses the menu and then does its normal job.
+            closed = self.close_menu();
+        }
+        let mut fx = self.click_on(hit, x, y);
+        fx.merge(closed);
+        fx
+    }
+
+    fn click_on(&mut self, hit: Hit, x: i32, y: i32) -> Effects {
+        match hit {
+            Hit::MenuItem(item) => self.menu_activate(item),
+            Hit::Launcher => self.toggle_menu(),
             Hit::Task(slot) => {
                 if self.focus == Some(slot)
                     && self
@@ -1070,7 +1194,7 @@ mod tests {
             m.alt(b'm').is_empty() && m.alt(b'x').is_empty(),
             "nothing focused: nothing to act on"
         );
-        // Help opens, and closes again (also from the launcher button).
+        // Help opens, and closes again (also from the launcher menu).
         m.alt(b'h');
         let help = m.help_slot().unwrap();
         assert_eq!(m.focused(), Some(help));
@@ -1078,11 +1202,94 @@ mod tests {
         assert!(m.help_slot().is_none());
         let launcher = m.launcher_rect();
         click(&mut m, launcher.x + 5, launcher.y + 5);
-        assert!(m.help_slot().is_some());
+        assert!(m.menu_open() && m.help_slot().is_none());
+        let item = m.menu_item_rect(0);
+        click(&mut m, item.x + 5, item.y + 5);
+        assert!(m.help_slot().is_some() && !m.menu_open());
         click(&mut m, launcher.x + 5, launcher.y + 5);
+        let item = m.menu_item_rect(0);
+        click(&mut m, item.x + 5, item.y + 5);
         assert!(m.help_slot().is_none());
         // Unknown keys do nothing.
         assert!(m.alt(b'q').is_empty() && m.alt(0).is_empty() && m.alt(255).is_empty());
+    }
+
+    #[test]
+    fn the_launcher_menu_starts_applications_from_the_mouse_and_the_keyboard() {
+        let mut m = manager();
+        let t = open(&mut m, Kind::Terminal, "t", 100, 100, 400, 300);
+        assert_eq!(m.take_launch(), None);
+        // Mouse: open, choose "Browser" (entry 1), and the display server is told.
+        let launcher = m.launcher_rect();
+        let fx = click(&mut m, launcher.x + 5, launcher.y + 5);
+        assert!(m.menu_open() && covered(&fx, m.menu_rect()));
+        assert!(
+            m.menu_rect().bottom() <= m.taskbar().y,
+            "the popup sits above the taskbar"
+        );
+        let browser = m.menu_item_rect(1);
+        assert_eq!(m.hit(browser.x + 3, browser.y + 3), Hit::MenuItem(1));
+        let fx = click(&mut m, browser.x + 3, browser.y + 3);
+        assert!(!m.menu_open() && covered(&fx, m.menu_rect()));
+        assert_eq!(m.take_launch(), Some(Launch::App(0)));
+        assert_eq!(m.take_launch(), None, "a request is delivered once");
+        assert_eq!(
+            m.window_count(),
+            1,
+            "the manager does not create the application window"
+        );
+        // Keyboard: Alt+L opens, Alt+Down moves (wrapping), Alt+L starts the highlighted.
+        m.alt(b'l');
+        assert_eq!(m.menu_selected(), Some(0));
+        m.alt(ALT_DOWN);
+        m.alt(ALT_DOWN);
+        assert_eq!(m.menu_selected(), Some(2));
+        m.alt(ALT_DOWN);
+        assert_eq!(m.menu_selected(), Some(0), "the selection wraps");
+        m.alt(ALT_UP);
+        assert_eq!(m.menu_selected(), Some(2));
+        m.alt(b'l');
+        assert_eq!(m.take_launch(), Some(Launch::App(1)));
+        assert!(!m.menu_open());
+        // While the menu is open Alt+Up/Down choose an entry instead of moving the
+        // window, and Alt+W cancels the menu instead of closing the window.
+        let before = m.window(t).unwrap().rect;
+        m.alt(b'l');
+        m.alt(ALT_DOWN);
+        m.alt(ALT_UP);
+        assert_eq!(m.window(t).unwrap().rect, before);
+        m.alt(b'w');
+        assert!(!m.menu_open() && m.window(t).is_some() && m.take_launch().is_none());
+        // Direct shortcuts.
+        m.alt(b'b');
+        assert_eq!(m.take_launch(), Some(Launch::App(0)));
+        m.alt(b'c');
+        assert_eq!(m.take_launch(), Some(Launch::App(1)));
+        // A click elsewhere dismisses the menu and still does its own job.
+        m.alt(b'h');
+        let help = m.help_slot().unwrap();
+        m.activate(t);
+        m.alt(b'l');
+        let c = m.visible_rect(help);
+        let fx = click(&mut m, c.x + c.w / 2, c.y + c.h / 2);
+        assert!(!m.menu_open() && covered(&fx, m.menu_rect()));
+        assert_eq!(
+            m.focused(),
+            Some(help),
+            "the click that closed the menu also focused the window"
+        );
+        assert_eq!(m.take_launch(), None);
+    }
+
+    #[test]
+    fn application_windows_are_ordinary_windows_with_their_own_kind() {
+        let mut m = manager();
+        let a = open(&mut m, Kind::App(2), "app", 80, 80, 300, 200);
+        assert_eq!(m.window(a).unwrap().kind, Kind::App(2));
+        assert_eq!(m.focused(), Some(a));
+        let (close, _, _) = m.buttons(a);
+        click(&mut m, close.x + 2, close.y + 2);
+        assert!(m.window(a).is_none(), "an application window is closable");
     }
 
     #[test]

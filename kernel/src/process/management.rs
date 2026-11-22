@@ -191,12 +191,16 @@ impl Scheduler {
                 Ok(Some(8 + count))
             }
             x if x == Call::BootProgram as u64 => {
+                // The bundled programs the process manager installs into /bin: the
+                // multi-call command binary (0) and the desktop applications.
+                const PROGRAMS: [&str; 3] = ["zos-command", "app-browser", "app-calc"];
+                let name = PROGRAMS.get(frame.rdx as usize).ok_or(Error::Invalid)?;
                 let file = crate::boot::MODULES
                     .response()
                     .unwrap()
                     .modules()
                     .iter()
-                    .find(|file| file.cmdline() == "zos-command")
+                    .find(|file| file.cmdline() == *name)
                     .ok_or(Error::Invalid)?;
                 if file.data().len() > frame.rsi as usize {
                     return Err(Error::TooLarge);

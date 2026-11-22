@@ -7,7 +7,8 @@ $null = New-Item -ItemType Directory -Path $script:ZosNormalPackage -Force
 $null = New-Item -ItemType Directory -Path $script:Destination -Force
 $names = @('EFI\BOOT\BOOTX64.EFI', 'limine.conf', 'boot\zos.elf', 'boot\console-server.elf', 'boot\input-server.elf',
     'boot\tty-server.elf', 'boot\blkdev-server.elf', 'boot\fs-simple-server.elf', 'boot\vfs-server.elf',
-    'boot\procmgr-server.elf', 'boot\shell-server.elf', 'boot\zos-command.elf', 'boot\wm-server.elf')
+    'boot\procmgr-server.elf', 'boot\shell-server.elf', 'boot\zos-command.elf', 'boot\wm-server.elf',
+    'boot\app-browser.elf', 'boot\app-calc.elf')
 $hashes = @{}
 foreach ($name in $names) {
     $file = Join-Path $script:ZosNormalPackage $name

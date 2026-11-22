@@ -1,0 +1,25 @@
+[package]
+name = "zos-apps"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "zos_apps"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-browser"
+path = "src/browser.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "app-calc"
+path = "src/calculator.rs"
+test = false
+bench = false
+
+[dependencies]
+zos-libos = { path = "../../libos" }
+zos-console = { path = "../console" }
+zos-storage = { path = "../storage" }

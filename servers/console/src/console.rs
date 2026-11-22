@@ -101,6 +101,9 @@ pub extern "C" fn _start(role: usize) -> ! {
             }
             // Window-manager shortcuts mean nothing to the plain text console.
             [ALT, _] => (),
+            // The input service asks who has the focus before routing a key; with no
+            // desktop there are no applications, and the empty reply says so.
+            [FOCUS] | [KEY, ..] => (),
             _ => panic!("Invalid console protocol"),
         }
         if !quiet_screen {

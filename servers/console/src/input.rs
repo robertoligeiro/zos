@@ -4,6 +4,29 @@
 use zos_console::{keyboard::Keyboard, mouse::Mouse, *};
 use zos_libos as os;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use zos_console::{FOCUS, KEY};
+
+/// Whether the window manager last said a desktop application has the keyboard focus.
+static APP_FOCUS: AtomicBool = AtomicBool::new(false);
+
+/// Sends to the console channel (the window manager in the desktop entry). Its
+/// one-byte reply says whether an application has the focus; the plain text console
+/// replies with nothing, which means no.
+fn console_send(message: &[u8], ready: bool) -> Result<usize, os::Error> {
+    let mut reply = [0u8; 1];
+    let length = if ready {
+        os::send_ready(CONSOLE, message, &mut reply)?
+    } else {
+        os::send(CONSOLE, message, &mut reply)?
+    };
+    APP_FOCUS.store(
+        length == 1 && reply[0] == zos_console::FOCUS_APP,
+        Ordering::Relaxed,
+    );
+    Ok(length)
+}
+
 fn read(port: u16) -> u8 {
     let value;
     // SAFETY: only this server can request and receive these two port grants.
@@ -136,21 +159,29 @@ pub extern "C" fn _start(role: usize) -> ! {
                     if ready {
                         let x = motion.dx.to_le_bytes();
                         let y = motion.dy.to_le_bytes();
-                        os::send(
-                            CONSOLE,
-                            &[POINTER, x[0], x[1], y[0], y[1], motion.buttons],
-                            &mut [],
-                        )
-                        .unwrap();
+                        console_send(&[POINTER, x[0], x[1], y[0], y[1], motion.buttons], false)
+                            .unwrap();
                     }
                 }
             } else if let Some(key) = keyboard.feed(byte) {
                 if ready {
                     match key {
                         zos_console::keyboard::Key::Alt(ch) => {
-                            os::send(CONSOLE, &[ALT, ch], &mut []).unwrap()
+                            console_send(&[ALT, ch], false).unwrap();
                         }
-                        _ => os::send(TTY, &key.encode(), &mut []).unwrap(),
+                        _ if {
+                            // An application window may have appeared since the last
+                            // message: ask who has the focus before choosing.
+                            let _ = console_send(&[FOCUS], false);
+                            APP_FOCUS.load(Ordering::Relaxed)
+                        } =>
+                        {
+                            let [a, b] = key.encode();
+                            console_send(&[KEY, a, b], false).unwrap();
+                        }
+                        _ => {
+                            os::send(TTY, &key.encode(), &mut []).unwrap();
+                        }
                     };
                 }
             }
@@ -330,15 +361,23 @@ fn deliver(event: zos_console::usb::Event) -> Result<(), os::Error> {
     match event {
         // Alt shortcuts go to the window manager (the console channel); everything
         // else is typing for the shell.
-        Event::Key(Key::Alt(ch)) => os::send_ready(CONSOLE, &[ALT, ch], &mut []),
+        Event::Key(Key::Alt(ch)) => console_send(&[ALT, ch], true),
+        // When a desktop application has the focus its keys go there instead.
+        Event::Key(key)
+            if {
+                // Ask first: an application window may have appeared since the last
+                // message (if the manager is busy the last answer stands).
+                let _ = console_send(&[FOCUS], true);
+                APP_FOCUS.load(Ordering::Relaxed)
+            } =>
+        {
+            let [a, b] = key.encode();
+            console_send(&[KEY, a, b], true)
+        }
         Event::Key(key) => os::send_ready(TTY, &key.encode(), &mut []),
         Event::Pointer { dx, dy, buttons } => {
             let (x, y) = (dx.to_le_bytes(), dy.to_le_bytes());
-            os::send_ready(
-                CONSOLE,
-                &[POINTER, x[0], x[1], y[0], y[1], buttons],
-                &mut [],
-            )
+            console_send(&[POINTER, x[0], x[1], y[0], y[1], buttons], true)
         }
     }
     .map(|_| ())
@@ -503,6 +542,8 @@ fn usb_input(test: bool) -> ! {
                     count + 1
                 }
                 Err(error) => {
+                    // The cause is otherwise lost behind a generic block error.
+                    log(format_args!("USB DISK ERROR: {error:?}"));
                     reply[0] = if error == Error::Invalid { 1 } else { 10 };
                     1
                 }
