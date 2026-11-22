@@ -90,12 +90,110 @@ fn discover() -> Result<(u32, u64, u64), Error> {
         }
     }
     let device = found.ok_or(Error::Invalid)?;
-    let (physical, length) = bar(device, "XHCI")?;
+    let (physical, length) = bar(device, "XHCI", false)?;
     Ok((device, physical, length))
 }
 
-/// Sizes and validates BAR0 of a type-0 device and leaves memory decoding disabled.
-fn bar(device: u32, label: &str) -> Result<(u64, u64), Error> {
+/// Calls `visit` with the address of every PCI function that exists.
+fn functions(mut visit: impl FnMut(u32)) {
+    for bus in 0..256 {
+        for slot in 0..32 {
+            let device = bus << 16 | slot << 11;
+            if read(device, 0) & 0xffff == 0xffff {
+                continue;
+            }
+            let count = if read(device, 12) & 0x800000 != 0 {
+                8
+            } else {
+                1
+            };
+            for function in 0..count {
+                let device = device | function << 8;
+                if read(device, 0) & 0xffff != 0xffff {
+                    visit(device);
+                }
+            }
+        }
+    }
+}
+
+/// Base of the memory BAR at `offset` (64-bit if its type says so); 0 for I/O or empty.
+fn bar_base(device: u32, offset: u32) -> u64 {
+    let value = read(device, offset);
+    if value & 1 != 0 {
+        return 0;
+    }
+    let high = if value & 6 == 4 && offset < 0x24 {
+        read(device, offset + 4) as u64
+    } else {
+        0
+    };
+    high << 32 | (value & !15) as u64
+}
+
+/// The highest 64-bit memory BAR (at or above 4 GiB) any device already uses; 0 if none.
+fn highest_high_bar() -> u64 {
+    let mut highest = 0;
+    functions(|device| {
+        let bars = match read(device, 12) >> 16 & 0x7f {
+            0 => 6,
+            1 => 2,
+            _ => 0,
+        };
+        let mut index = 0;
+        while index < bars {
+            let value = read(device, 16 + 4 * index);
+            let wide = value & 1 == 0 && value & 6 == 4;
+            let base = bar_base(device, 16 + 4 * index);
+            if (1 << 32..1 << 44).contains(&base) {
+                highest = highest.max(base);
+            }
+            index += if wide { 2 } else { 1 };
+        }
+    });
+    highest
+}
+
+/// One line per PCI function for the boot log: where firmware put everything, which
+/// is what is needed to place a device it left unassigned.
+fn log_pci_map() {
+    functions(|device| {
+        let identity = read(device, 0);
+        let class = read(device, 8) >> 8;
+        let kind = read(device, 12) >> 16 & 0x7f;
+        if kind == 1 {
+            crate::logln!(
+                "PCI {:02x}:{:02x}.{} {:04x}:{:04x} {:06x} bridge mem={:08x} pf={:08x}{:08x}",
+                device >> 16,
+                device >> 11 & 31,
+                device >> 8 & 7,
+                identity & 0xffff,
+                identity >> 16,
+                class,
+                read(device, 0x20),
+                read(device, 0x28),
+                read(device, 0x24)
+            );
+        } else {
+            crate::logln!(
+                "PCI {:02x}:{:02x}.{} {:04x}:{:04x} {:06x} b0={:#x} b2={:#x}",
+                device >> 16,
+                device >> 11 & 31,
+                device >> 8 & 7,
+                identity & 0xffff,
+                identity >> 16,
+                class,
+                bar_base(device, 16),
+                bar_base(device, 24)
+            );
+        }
+    });
+}
+
+/// Sizes and validates BAR0 of a type-0 device and leaves memory decoding disabled. With
+/// `assign`, a 64-bit BAR the firmware left empty is given an address: 1 GiB above the
+/// highest 64-bit BAR in use, in the high MMIO space the firmware reserved for devices.
+fn bar(device: u32, label: &str, assign: bool) -> Result<(u64, u64), Error> {
     if read(device, 12) & 0x7f0000 != 0 {
         return Err(Error::Denied);
     }
@@ -118,9 +216,30 @@ fn bar(device: u32, label: &str) -> Result<(u64, u64), Error> {
     if wide {
         write(device, 20, high);
     }
-    let physical = (high as u64) << 32 | (low & !15) as u64;
+    let mut physical = (high as u64) << 32 | (low & !15) as u64;
     let length = (!((mask_high as u64) << 32 | mask_low as u64)).wrapping_add(1);
     crate::logln!("PCI {} BAR: base={:#x} bytes={}", label, physical, length);
+    let mut assigned = false;
+    if physical == 0
+        && assign
+        && wide
+        && length.is_power_of_two()
+        && (PAGE_SIZE..=65536).contains(&length)
+    {
+        let highest = highest_high_bar();
+        if highest != 0 {
+            physical = (highest + (1 << 30) + 0xf_ffff) & !0xf_ffff;
+            write(device, 16, (physical as u32 & !15) | (low & 15));
+            write(device, 20, (physical >> 32) as u32);
+            assigned = true;
+            crate::logln!(
+                "PCI {} BAR unassigned: placed at {:#x} (highest BAR {:#x})",
+                label,
+                physical,
+                highest
+            );
+        }
+    }
     let Some(end) = physical.checked_add(length) else {
         command(device, saved);
         return Err(Error::Invalid);
@@ -140,6 +259,10 @@ fn bar(device: u32, label: &str) -> Result<(u64, u64), Error> {
                     && entry.base < end
             })
     {
+        if assigned {
+            write(device, 16, low);
+            write(device, 20, high);
+        }
         command(device, saved);
         return Err(Error::Denied);
     }
@@ -184,6 +307,9 @@ fn power_on(device: u32) {
 /// register signature and skips the rest). `Invalid`
 /// past the last one, `Denied` when that one has no usable register window.
 fn discover_i2c(index: usize) -> Result<(u32, u64, u64), Error> {
+    if index == 0 {
+        log_pci_map();
+    }
     let mut seen = 0;
     for bus in 0..256 {
         for slot in 0..32 {
@@ -215,7 +341,7 @@ fn discover_i2c(index: usize) -> Result<(u32, u64, u64), Error> {
                     class
                 );
                 power_on(device);
-                let (physical, length) = bar(device, "I2C")?;
+                let (physical, length) = bar(device, "I2C", true)?;
                 return Ok((device, physical, length));
             }
         }

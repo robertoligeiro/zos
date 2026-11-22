@@ -180,9 +180,18 @@ pub fn probe_bus<B: Bus>(
 /// Opens controller `index` (register window `regs`) and looks for a touchpad on it.
 pub fn probe<R: Regs>(
     index: usize,
-    regs: R,
+    mut regs: R,
     log: &mut dyn FnMut(&str),
 ) -> Option<Touchpad<DesignWare<R>>> {
+    // The component-type register is the signature; what a rejected window returns
+    // tells whether it is unpowered/unrouted (all ones) or some other device.
+    let signature = regs.read(0xfc);
+    if signature != 0x4457_0140 {
+        say(
+            log,
+            format_args!("I2C{index}: id register reads {signature:#010x}"),
+        );
+    }
     match DesignWare::new(regs) {
         Ok((controller, _, timing)) => {
             say(
