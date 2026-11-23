@@ -58,10 +58,24 @@ pub extern "C" fn _start(role: usize) -> ! {
     if !splash_up && !quiet_screen {
         terminal.render(pixels, fb);
     }
+    // The boot animation runs on the timer tick (IRQ0) while the system loads.
+    let mut ticks = 0u32;
+    if splash_up && os::irq_attach(CONSOLE, 0).is_err() {
+        os::debug_write("CONSOLE: no timer for the boot animation").unwrap();
+    }
     let mut bytes = [0; 128];
     loop {
         let (token, length) = os::receive(CONSOLE, &mut bytes).unwrap();
-        assert!(token != 0 && length > 0);
+        if token == 0 {
+            if splash_up {
+                if ticks % zos_console::splash::TICKS_PER_FRAME == 0 {
+                    zos_console::splash::animate(pixels, fb, ticks);
+                }
+                ticks = ticks.wrapping_add(1);
+            }
+            continue;
+        }
+        assert!(length > 0);
         let message = &bytes[..length];
         // Anything but pointer motion or a scroll-count query is real output (the
         // shell banner, a diagnostic, an error): replace the logo with the text.

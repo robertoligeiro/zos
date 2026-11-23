@@ -453,6 +453,11 @@ pub extern "C" fn _start(_: usize) -> ! {
         .expect("Cannot create the terminal window");
     os::debug_write("WM ready: desktop, terminal window and window manager").unwrap();
     let mut splash_up = splash;
+    // The boot animation runs on the timer tick (IRQ0) while the system loads.
+    let mut ticks = 0u32;
+    if splash_up && os::irq_attach(CONSOLE, 0).is_err() {
+        os::debug_write("WM: no timer for the boot animation").unwrap();
+    }
     if !splash_up {
         let full = desktop.surface.bounds();
         let mut fx = Effects::default();
@@ -463,7 +468,22 @@ pub extern "C" fn _start(_: usize) -> ! {
     let mut last_buttons = 0u8;
     loop {
         let (token, length) = os::receive(CONSOLE, &mut bytes).unwrap();
-        assert!(token != 0 && length > 0);
+        if token == 0 {
+            // A timer notification (the only one attached): advance the boot animation.
+            if splash_up {
+                if ticks % zos_console::splash::TICKS_PER_FRAME == 0 {
+                    // SAFETY: the display server is single-threaded; `desktop.surface` does
+                    // not draw while the splash is up, and this slice is only written here.
+                    let pixels = unsafe {
+                        core::slice::from_raw_parts_mut(fb.address as *mut u32, fb.length / 4)
+                    };
+                    zos_console::splash::animate(pixels, fb, ticks);
+                }
+                ticks = ticks.wrapping_add(1);
+            }
+            continue;
+        }
+        assert!(length > 0);
         let sender = token & 0xffff;
         let message = &bytes[..length];
         // Desktop applications speak the `gui` protocol; they are neither the input

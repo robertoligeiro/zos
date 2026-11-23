@@ -99,6 +99,148 @@ fn draw_image(data: &[u8], pixels: &mut [u32], fb: Framebuffer) -> bool {
     true
 }
 
+/// Timer ticks (100 Hz) per animation frame.
+pub const TICKS_PER_FRAME: u32 = 12;
+
+/// The palm and wrist of the zombie hand, 16 columns by rows 5..=15 (`#` is a pixel).
+const PALM: [&[u8]; 11] = [
+    b".###########...",
+    b".############..",
+    b".#############.",
+    b".#############.",
+    b"..############.",
+    b"..###########..",
+    b"...#########...",
+    b"...#########...",
+    b"....#######....",
+    b"....#######....",
+    b"....#######....",
+];
+
+/// The 16x16 zombie hand at `openness` 0 (fingers spread) to 3 (closed fist), one
+/// `u16` per row with the leftmost pixel in the top bit.
+pub fn hand(openness: usize) -> [u16; 16] {
+    let openness = openness.min(3);
+    let mut rows = [0u16; 16];
+    for (i, palm) in PALM.iter().enumerate() {
+        for (x, &c) in palm.iter().enumerate() {
+            if c == b'#' {
+                rows[5 + i] |= 0x8000 >> x;
+            }
+        }
+    }
+    // Four fingers, two pixels wide; they shorten into the palm as the hand closes.
+    for (x0, open_top) in [(1usize, 2usize), (4, 0), (7, 0), (10, 2)] {
+        let top = open_top + (4 - open_top) * openness / 3;
+        for row in rows.iter_mut().take(5).skip(top) {
+            *row |= (0xc000u16) >> x0;
+        }
+    }
+    rows
+}
+
+/// Draws one frame of the "OS Loading" animation (a zombie hand opening and closing,
+/// then the text) over the logo. `step` counts timer ticks. Returns false, drawing
+/// nothing, when the image or the framebuffer is unusable.
+pub fn animate(pixels: &mut [u32], fb: Framebuffer, step: u32) -> bool {
+    use font8x8::{UnicodeFonts, BASIC_FONTS};
+    let Some(image) = Image::parse(IMAGE) else {
+        return false;
+    };
+    let stride = fb.pitch / 4;
+    if fb.width == 0
+        || fb.height == 0
+        || fb.pitch % 4 != 0
+        || stride < fb.width
+        || pixels.len() < stride * fb.height
+        || fb.shifts.iter().any(|&shift| shift > 24)
+    {
+        return false;
+    }
+    let pack = |rgb: u32| {
+        ((rgb >> 16 & 255) << fb.shifts[0])
+            | ((rgb >> 8 & 255) << fb.shifts[1])
+            | ((rgb & 255) << fb.shifts[2])
+    };
+    let mut put = |x: usize, y: usize, value: u32| {
+        if x < fb.width && y < fb.height {
+            // SAFETY: inside width x height, which the slice length covers (checked above).
+            unsafe { core::ptr::write_volatile(&mut pixels[y * stride + x], value) };
+        }
+    };
+    let size = fb.width.min(fb.height).min(image.width);
+    let frame = (step / TICKS_PER_FRAME) as usize;
+    let openness = [0, 1, 2, 3, 2, 1][frame % 6];
+    let dots = (frame / 2) % 4;
+    let hand_scale = (size / 192).max(1);
+    let text_scale = (size / 384).max(1);
+    let gap = 3 * text_scale;
+    let pad = 4 * text_scale;
+    let text_width = 13 * 8 * text_scale; // "OS Loading..." at its widest
+    let hand_size = 16 * hand_scale;
+    let panel_width = hand_size + gap * 3 + text_width + 2 * pad;
+    let panel_height = hand_size + 2 * pad;
+    // The logo picture's fake boot list (57% to 81% of its height) makes way for the
+    // animation, which is centered in that band.
+    let (logo_left, logo_top) = ((fb.width - size) / 2, (fb.height - size) / 2);
+    let (band_left, band_top) = (logo_left + size * 3 / 100, logo_top + size * 565 / 1000);
+    let (band_width, band_height) = (size * 94 / 100, size * 245 / 1000);
+    let left = band_left + band_width.saturating_sub(panel_width) / 2;
+    let top = band_top + band_height.saturating_sub(panel_height) / 2;
+    let (background, white, green) = (
+        pack(image.palette[0]),
+        pack(image.palette[3]),
+        pack(0x7ed957),
+    );
+    for y in band_top..band_top + band_height {
+        for x in band_left..band_left + band_width {
+            put(x, y, background);
+        }
+    }
+    let rows = hand(openness);
+    for (row, bits) in rows.iter().enumerate() {
+        for column in 0..16 {
+            if bits & (0x8000 >> column) == 0 {
+                continue;
+            }
+            for dy in 0..hand_scale {
+                for dx in 0..hand_scale {
+                    put(
+                        left + pad + column * hand_scale + dx,
+                        top + pad + row * hand_scale + dy,
+                        green,
+                    );
+                }
+            }
+        }
+    }
+    let text_left = left + pad + hand_size + gap * 3;
+    let text_top = top + pad + (hand_size.saturating_sub(8 * text_scale)) / 2;
+    let mut text = [b'.'; 13];
+    text[..10].copy_from_slice(b"OS Loading");
+    let length = 10 + dots;
+    for (index, &byte) in text[..length].iter().enumerate() {
+        let glyph = BASIC_FONTS.get(byte as char).unwrap_or([0; 8]);
+        for (gy, bits) in glyph.iter().enumerate() {
+            for gx in 0..8 {
+                if bits & (1 << gx) == 0 {
+                    continue;
+                }
+                for dy in 0..text_scale {
+                    for dx in 0..text_scale {
+                        put(
+                            text_left + (index * 8 + gx) * text_scale + dx,
+                            text_top + gy * text_scale + dy,
+                            white,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -199,6 +341,59 @@ mod tests {
         assert_eq!(pixels[0], PALETTE[0]);
         assert_eq!(pixels[1], PALETTE[2]);
         assert_eq!(pixels[4 + 1], PALETTE[0]);
+    }
+
+    #[test]
+    fn the_hand_opens_and_closes() {
+        let count = |rows: [u16; 16]| rows.iter().map(|r| r.count_ones()).sum::<u32>();
+        let open = hand(0);
+        let fist = hand(3);
+        assert_ne!(open, fist);
+        assert!(count(open) > count(fist), "fingers are spread when open");
+        // The first frame has fingertips on the top row; the fist has none above row 4.
+        assert_ne!(open[0], 0);
+        assert!(fist[..4].iter().all(|&r| r == 0));
+        // Frames in between are monotone, and out-of-range openness means closed.
+        assert!(count(hand(1)) >= count(hand(2)) && count(hand(2)) >= count(hand(3)));
+        assert_eq!(hand(9), fist);
+    }
+
+    #[test]
+    fn the_loading_animation_changes_each_frame_and_stays_on_screen() {
+        // The embedded logo is 768 wide, so use screens around it, including odd ones.
+        for (width, height) in [
+            (1024, 768),
+            (1920, 1080),
+            (768, 768),
+            (640, 480),
+            (5, 3),
+            (1, 1),
+        ] {
+            let fb = framebuffer(width, height, width * 4);
+            let mut previous: Option<Vec<u32>> = None;
+            for frame in 0..8u32 {
+                let mut pixels = std::vec![0xdead_beef; width * height];
+                assert!(
+                    animate(&mut pixels, fb, frame * TICKS_PER_FRAME),
+                    "{width}x{height}"
+                );
+                if width >= 640 {
+                    // Outside the band, nothing is touched.
+                    assert_eq!(pixels[0], 0xdead_beef);
+                    assert_eq!(pixels[width * height - 1], 0xdead_beef);
+                    if let Some(old) = &previous {
+                        assert_ne!(old, &pixels, "{width}x{height} frame {frame}");
+                    }
+                }
+                previous = Some(pixels);
+            }
+        }
+        let mut pixels = std::vec![0; 16];
+        let bad = Framebuffer {
+            pitch: 6,
+            ..framebuffer(4, 4, 16)
+        };
+        assert!(!animate(&mut pixels, bad, 0));
     }
 
     #[test]

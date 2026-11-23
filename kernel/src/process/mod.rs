@@ -1039,7 +1039,8 @@ fn start_console() -> ! {
         baseline: memory::stats(),
     };
     for (name, priority, ports, irqs, framebuffer) in [
-        ("console-server", 0, 0, 0, true),
+        // IRQ0 (timer): the boot screen animation ticks while everything else loads.
+        ("console-server", 0, 0, 1, true),
         (
             "input-server",
             1,
